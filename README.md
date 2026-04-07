@@ -65,7 +65,7 @@ python run_wearcast.py --model_path <model-image-path> --cloth_path <cloth-image
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=levihsu/WearCast&type=Date)](https://star-history.com/#levihsu/WearCast&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=levihsu/OOTDiffusion&type=Date)](https://star-history.com/#levihsu/OOTDiffusion&Date)
 
 ## TODO List
 - [x] Paper
