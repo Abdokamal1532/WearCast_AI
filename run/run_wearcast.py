@@ -15,6 +15,14 @@ from wearcast.inference_wearcast_hd import WearCastHD
 
 
 import argparse
+parser = argparse.ArgumentParser(description='run wearcast')
+parser.add_argument('--gpu_id', '-g', type=int, default=0, required=False)
+parser.add_argument('--model_path', type=str, default="", required=True)
+parser.add_argument('--cloth_path', type=str, default="", required=True)
+parser.add_argument('--scale', type=float, default=2.0, required=False)
+parser.add_argument('--step', type=int, default=20, required=False)
+parser.add_argument('--sample', type=int, default=4, required=False)
+parser.add_argument('--seed', type=int, default=-1, required=False)
 parser.add_argument('--category', type=int, default=0, required=False, help='category (0: upperbody, 1: lowerbody, 2: dress)')
 args = parser.parse_args()
 
