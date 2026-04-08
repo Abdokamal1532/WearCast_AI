@@ -1,21 +1,16 @@
-import pdb
 from pathlib import Path
 import sys
-PROJECT_ROOT = Path(__file__).absolute().parents[0].absolute()
-sys.path.insert(0, str(PROJECT_ROOT))
 import os
 import torch
 import numpy as np
 from PIL import Image
 import cv2
-
 import random
 import time
-import pdb
 
-from pipelines_wearcast.pipeline_wearcast import WearCastPipeline
-from pipelines_wearcast.unet_garm_2d_condition import UNetGarm2DConditionModel
-from pipelines_wearcast.unet_vton_2d_condition import UNetVton2DConditionModel
+from wearcast.pipelines_wearcast.pipeline_wearcast import WearCastPipeline
+from wearcast.pipelines_wearcast.unet_garm_2d_condition import UNetGarm2DConditionModel
+from wearcast.pipelines_wearcast.unet_vton_2d_condition import UNetVton2DConditionModel
 from diffusers import UniPCMultistepScheduler
 from diffusers import AutoencoderKL
 
@@ -24,10 +19,10 @@ import torch.nn.functional as F
 from transformers import AutoProcessor, CLIPVisionModelWithProjection
 from transformers import CLIPTextModel, CLIPTokenizer
 
-VIT_PATH = "../checkpoints/clip-vit-large-patch14"
-VAE_PATH = "../checkpoints/wearcast"
-UNET_PATH = "../checkpoints/wearcast/wearcast_hd/checkpoint-36000"
-MODEL_PATH = "../checkpoints/wearcast"
+# Absolute Pathing to avoid HF Repo confusion
+PROJECT_ROOT = Path(__file__).absolute().parents[1].absolute() # WearCast_AI root
+VIT_PATH = os.path.join(PROJECT_ROOT, "checkpoints/clip-vit-large-patch14")
+MODEL_PATH = os.path.join(PROJECT_ROOT, "checkpoints/ootd")
 
 class WearCastHD:
 
@@ -35,22 +30,20 @@ class WearCastHD:
         self.gpu_id = 'cuda:' + str(gpu_id)
 
         vae = AutoencoderKL.from_pretrained(
-            VAE_PATH,
+            MODEL_PATH,
             subfolder="vae",
             torch_dtype=torch.float16,
         )
 
         unet_garm = UNetGarm2DConditionModel.from_pretrained(
-            UNET_PATH,
-            subfolder="unet_garm",
+            MODEL_PATH,
             torch_dtype=torch.float16,
-            use_safetensors=True,
+            use_safetensors=False, 
         )
         unet_vton = UNetVton2DConditionModel.from_pretrained(
-            UNET_PATH,
-            subfolder="unet_vton",
+            MODEL_PATH,
             torch_dtype=torch.float16,
-            use_safetensors=True,
+            use_safetensors=False,
         )
 
         self.pipe = WearCastPipeline.from_pretrained(
@@ -60,7 +53,7 @@ class WearCastHD:
             vae=vae,
             torch_dtype=torch.float16,
             variant="fp16",
-            use_safetensors=True,
+            use_safetensors=False,
             safety_checker=None,
             requires_safety_checker=False,
         ).to(self.gpu_id)
@@ -109,14 +102,10 @@ class WearCastHD:
             prompt_image = self.auto_processor(images=image_garm, return_tensors="pt").to(self.gpu_id)
             prompt_image = self.image_encoder(prompt_image.data['pixel_values']).image_embeds
             prompt_image = prompt_image.unsqueeze(1)
-            if model_type == 'hd':
-                prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0]
-                prompt_embeds[:, 1:] = prompt_image[:]
-            elif model_type == 'dc':
-                prompt_embeds = self.text_encoder(self.tokenize_captions([category], 3).to(self.gpu_id))[0]
-                prompt_embeds = torch.cat([prompt_embeds, prompt_image], dim=1)
-            else:
-                raise ValueError("model_type must be \'hd\' or \'dc\'!")
+            
+            # Simplified for Men's Half-body (HD)
+            prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0]
+            prompt_embeds[:, 1:] = prompt_image[:]
 
             images = self.pipe(prompt_embeds=prompt_embeds,
                         image_garm=image_garm,
