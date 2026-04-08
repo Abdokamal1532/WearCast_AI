@@ -1,137 +1,125 @@
-import gradio as gr
+import os
 import sys
+from pathlib import Path
+
+# --- KAGGLE COMPATIBILITY PATCHES ---
 import huggingface_hub
 if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
-import os
-from pathlib import Path
-import sys
-import torch
-from PIL import Image, ImageOps
 
-from utils_wearcast import get_mask_location
+try:
+    import transformers
+    if not hasattr(transformers, "EncoderDecoderCache"):
+        class EncoderDecoderCache: pass
+        transformers.EncoderDecoderCache = EncoderDecoderCache
+except ImportError:
+    pass
 
+# Ensure PROJECT_ROOT is in path
 PROJECT_ROOT = Path(__file__).absolute().parents[1].absolute()
-sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-import time
-from preprocess.openpose.run_openpose import OpenPose
-from preprocess.humanparsing.run_parsing import Parsing
+import gradio as gr
+import torch
+from PIL import Image
 from wearcast.inference_wearcast_hd import WearCastHD
 
-
-openpose_model_hd = OpenPose(0)
-parsing_model_hd = Parsing(0)
+# Initialize the model once (Memory Efficient)
+print("[Gradio] Initializing WearCast Engine...")
 wearcast_model = WearCastHD(0)
 
-
-category_dict = ['upperbody', 'lowerbody', 'dress']
-category_dict_utils = ['upper_body', 'lower_body', 'dresses']
-
-
-example_path = os.path.join(os.path.dirname(__file__), 'examples')
-model_hd = os.path.join(example_path, 'model/model_1.png')
-garment_hd = os.path.join(example_path, 'garment/03244_00.jpg')
-
-def process_hd(vton_img, garm_img, n_samples, n_steps, image_scale, seed):
-    model_type = 'hd'
-    category = 0 # 0:upperbody; 1:lowerbody; 2:dress
-
-    with torch.no_grad():
-        garm_img = Image.open(garm_img).resize((768, 1024))
-        vton_img = Image.open(vton_img).resize((768, 1024))
-        keypoints = openpose_model_hd(vton_img.resize((384, 512)))
-        model_parse, _ = parsing_model_hd(vton_img.resize((384, 512)))
-
-        mask, mask_gray = get_mask_location(model_type, category_dict_utils[category], model_parse, keypoints)
-        mask = mask.resize((768, 1024), Image.NEAREST)
-        mask_gray = mask_gray.resize((768, 1024), Image.NEAREST)
+def process_hd(vton_img_path, garm_img_path, n_samples, n_steps, image_scale, seed):
+    if vton_img_path is None or garm_img_path is None:
+        return None
+    
+    try:
+        # Load images
+        vton_img = Image.open(vton_img_path).convert("RGB").resize((768, 1024))
+        garm_img = Image.open(garm_img_path).convert("RGB").resize((768, 1024))
         
-        masked_vton_img = Image.composite(mask_gray, vton_img, mask)
+        print(f"[Gradio] Processing Request: Steps={n_steps}, Scale={image_scale}, Seed={seed}")
+        
+        # Run inference using the stabilized pipeline
+        # WearCastHD now handles all preprocessing (OpenPose, Parsing, Masking) internally
+        with torch.no_grad():
+            images = wearcast_model(
+                model_type='hd',
+                category='upperbody',
+                image_garm=garm_img,
+                image_vton=vton_img,
+                mask=None, # Automated masking internally
+                image_ori=vton_img,
+                num_samples=n_samples,
+                num_steps=n_steps,
+                image_scale=image_scale,
+                seed=seed,
+            )
+        
+        return images
+    except Exception as e:
+        print(f"[Gradio ERROR] {str(e)}")
+        # Return an error indicator or a placeholder
+        return []
 
-        images = wearcast_model(
-            model_type=model_type,
-            category=category_dict[category],
-            image_garm=garm_img,
-            image_vton=masked_vton_img,
-            mask=mask,
-            image_ori=vton_img,
-            num_samples=n_samples,
-            num_steps=n_steps,
-            image_scale=image_scale,
-            seed=seed,
-        )
+# --- UI DEFINITION ---
+example_path = os.path.join(PROJECT_ROOT, 'run/examples')
 
-    return images
-
-
-
-
-block = gr.Blocks().queue()
-with block:
+with gr.Blocks(title="WearCast AI: Premium Virtual Try-On", theme=gr.themes.Soft()) as block:
+    gr.Markdown("""
+    # 👕 WearCast AI: Professional Virtual Try-On
+    ### Men's Half-Body High-Definition Pipeline
+    *Upload a photo of a person and a garment to see the magic. Currently optimized for upper-body garments.*
+    """)
+    
     with gr.Row():
-        gr.Markdown("# WearCast: Men's Virtual Try-On")
-    with gr.Row():
-        gr.Markdown("## Men's Half-body")
-    with gr.Row():
-        gr.Markdown("***Support upper-body garments***")
-    with gr.Row():
-        with gr.Column():
-            vton_img = gr.Image(label="Model", sources='upload', type="filepath", height=384, value=model_hd)
-            example = gr.Examples(
-                inputs=vton_img,
-                examples_per_page=14,
+        with gr.Column(scale=1):
+            gr.Markdown("### 1. Model / Person")
+            vton_input = gr.Image(label="Person Image", type="filepath", height=512)
+            gr.Examples(
                 examples=[
                     os.path.join(example_path, 'model/model_1.png'),
                     os.path.join(example_path, 'model/model_2.png'),
                     os.path.join(example_path, 'model/model_3.png'),
                     os.path.join(example_path, 'model/model_4.png'),
                     os.path.join(example_path, 'model/model_5.png'),
-                    os.path.join(example_path, 'model/model_6.png'),
-                    os.path.join(example_path, 'model/model_7.png'),
-                    os.path.join(example_path, 'model/01008_00.jpg'),
-                    os.path.join(example_path, 'model/07966_00.jpg'),
-                    os.path.join(example_path, 'model/05997_00.jpg'),
-                    os.path.join(example_path, 'model/02849_00.jpg'),
-                    os.path.join(example_path, 'model/14627_00.jpg'),
-                    os.path.join(example_path, 'model/09597_00.jpg'),
-                    os.path.join(example_path, 'model/01861_00.jpg'),
-                ])
-        with gr.Column():
-            garm_img = gr.Image(label="Garment", sources='upload', type="filepath", height=384, value=garment_hd)
-            example = gr.Examples(
-                inputs=garm_img,
-                examples_per_page=14,
+                ],
+                inputs=vton_input,
+                label="Common Models"
+            )
+            
+        with gr.Column(scale=1):
+            gr.Markdown("### 2. Garment")
+            garm_input = gr.Image(label="Garment Image", type="filepath", height=512)
+            gr.Examples(
                 examples=[
                     os.path.join(example_path, 'garment/03244_00.jpg'),
                     os.path.join(example_path, 'garment/00126_00.jpg'),
                     os.path.join(example_path, 'garment/03032_00.jpg'),
                     os.path.join(example_path, 'garment/06123_00.jpg'),
                     os.path.join(example_path, 'garment/02305_00.jpg'),
-                    os.path.join(example_path, 'garment/00055_00.jpg'),
-                    os.path.join(example_path, 'garment/00470_00.jpg'),
-                    os.path.join(example_path, 'garment/02015_00.jpg'),
-                    os.path.join(example_path, 'garment/10297_00.jpg'),
-                    os.path.join(example_path, 'garment/07382_00.jpg'),
-                    os.path.join(example_path, 'garment/07764_00.jpg'),
-                    os.path.join(example_path, 'garment/00151_00.jpg'),
-                    os.path.join(example_path, 'garment/12562_00.jpg'),
-                    os.path.join(example_path, 'garment/04825_00.jpg'),
-                ])
-        with gr.Column():
-            result_gallery = gr.Gallery(label='Output', show_label=False, elem_id="gallery", preview=True, scale=1)   
-    with gr.Column():
-        run_button = gr.Button(value="Run")
-        n_samples = gr.Slider(label="Images", minimum=1, maximum=4, value=1, step=1)
-        n_steps = gr.Slider(label="Steps", minimum=20, maximum=40, value=20, step=1)
-        # scale = gr.Slider(label="Scale", minimum=1.0, maximum=12.0, value=5.0, step=0.1)
-        image_scale = gr.Slider(label="Guidance scale", minimum=1.0, maximum=5.0, value=2.0, step=0.1)
-        seed = gr.Slider(label="Seed", minimum=-1, maximum=2147483647, step=1, value=-1)
-        
-    ips = [vton_img, garm_img, n_samples, n_steps, image_scale, seed]
-    run_button.click(fn=process_hd, inputs=ips, outputs=[result_gallery])
+                ],
+                inputs=garm_input,
+                label="Garment Library"
+            )
+            
+        with gr.Column(scale=1):
+            gr.Markdown("### 3. Result")
+            result_gallery = gr.Gallery(label='Virtual Try-On Output', columns=1, height=512)
+            run_btn = gr.Button("✨ Generate Try-On", variant="primary", scale=1)
 
+    with gr.Accordion("Advanced Settings", open=False):
+        with gr.Row():
+            n_samples = gr.Slider(label="Number of Samples", minimum=1, maximum=4, value=1, step=1)
+            n_steps = gr.Slider(label="Inference Steps", minimum=1, maximum=40, value=20, step=1)
+            image_scale = gr.Slider(label="Guidance Scale", minimum=1.0, maximum=5.0, value=2.0, step=0.1)
+            seed = gr.Number(label="Seed (-1 for Random)", value=-1)
 
+    run_btn.click(
+        fn=process_hd,
+        inputs=[vton_input, garm_input, n_samples, n_steps, image_scale, seed],
+        outputs=result_gallery
+    )
 
-
-block.launch(server_name='0.0.0.0', server_port=7865)
+# Launch with share=True for Kaggle access
+block.queue().launch(share=True, server_port=7865)

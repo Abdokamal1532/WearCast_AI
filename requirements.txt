@@ -5,8 +5,9 @@ opencv-python
 pillow
 diffusers==0.29.2
 transformers==4.40.2
-huggingface-hub==0.23.2
-einops==0.7.0
+accelerate
+huggingface-hub
+peft==0.10.0
 onnxruntime-gpu
-gradio
-einops
+insightface
+basicsr

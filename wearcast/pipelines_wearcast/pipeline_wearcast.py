@@ -287,6 +287,12 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             negative_prompt_embeds=negative_prompt_embeds,
         )
 
+        # Ensure prompt_embeds is in the correct precision for the U-Nets (float16)
+        if prompt_embeds.dtype != torch.float16:
+            print(f"[DEBUG] Early Cast: prompt_embeds from {prompt_embeds.dtype} to torch.float16")
+            prompt_embeds = prompt_embeds.to(dtype=torch.float16)
+
+        print(f"[WearCast] Phase 3/5: Encoding Garment and Mask...")
         # 3. Preprocess image
         image_garm = self.image_processor.preprocess(image_garm)
         image_vton = self.image_processor.preprocess(image_vton)
@@ -303,6 +309,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare Image latents
+        # Phase 1: Preparing Garment Latents
         garm_latents = self.prepare_garm_latents(
             image_garm,
             batch_size,
@@ -313,6 +320,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             generator,
         )
 
+        print("[WearCast] Phase 2: Preparing Person & Mask Latents...")
         vton_latents, mask_latents, image_ori_latents = self.prepare_vton_latents(
             image_vton,
             mask,
@@ -329,8 +337,9 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         height = height * self.vae_scale_factor
         width = width * self.vae_scale_factor
 
-        # 6. Prepare latent variables
-        num_channels_latents = self.vae.config.latent_channels
+        print(f"[WearCast] Phase 4/5: Preparing Noise Latents...")
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet_vton.config.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -344,13 +353,14 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         noise = latents.clone()
 
+        print(f"[WearCast] Phase 5/5: Starting Main Denoising Loop ({num_inference_steps} steps)...")
         # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
         # 9. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # Phase 3: Initializing U-Net Garm (Spatial Attention)
         _, spatial_attn_outputs = self.unet_garm(
             garm_latents,
             0,
@@ -358,13 +368,22 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             return_dict=False,
         )
 
+        # Phase 4: Starting Denoising Loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                if i % 10 == 0:
+                     print(f" -> Denoising Step {i}/{num_inference_steps} (Timestep {t.item():.1f})")
+                
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                
+                # Ensure dtype compatibility for U-Net input
+                if latent_model_input.dtype != self.unet_vton.dtype:
+                    latent_model_input = latent_model_input.to(dtype=self.unet_vton.dtype)
 
                 # concat latents, image_latents in the channel dimension
                 scaled_latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 latent_vton_model_input = torch.cat([scaled_latent_model_input, vton_latents], dim=1)
+
                 # latent_vton_model_input = scaled_latent_model_input + vton_latents
 
                 spatial_attn_inputs = spatial_attn_outputs.copy()
@@ -719,11 +738,18 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
+            print(f"[DEBUG] prepare_garm_latents: input shape={image.shape}, dtype={image.dtype}")
+            if image.dtype != self.vae.dtype:
+                print(f"[DEBUG]  -> Casting garment image from {image.dtype} to {self.vae.dtype}")
+                image = image.to(dtype=self.vae.dtype)
+
             if isinstance(generator, list):
                 image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
                 image_latents = torch.cat(image_latents, dim=0)
             else:
                 image_latents = self.vae.encode(image).latent_dist.mode()
+            
+            print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype}")
 
         if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
             additional_image_per_prompt = batch_size // image_latents.shape[0]
@@ -764,14 +790,25 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
+            print(f"[DEBUG] prepare_vton_latents: input shape={image.shape}, dtype={image.dtype}")
+            if image.dtype != self.vae.dtype:
+                print(f"[DEBUG]  -> Casting person image from {image.dtype} to {self.vae.dtype}")
+                image = image.to(dtype=self.vae.dtype)
+
             if isinstance(generator, list):
                 image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
                 image_latents = torch.cat(image_latents, dim=0)
-                image_ori_latents = [self.vae.encode(image_ori[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
-                image_ori_latents = torch.cat(image_ori_latents, dim=0)
             else:
                 image_latents = self.vae.encode(image).latent_dist.mode()
-                image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
+
+            print(f"[DEBUG] prepare_vton_latents: person latents shape={image_latents.shape}")
+
+            if image_ori.dtype != self.vae.dtype:
+                print(f"[DEBUG]  -> Casting original image from {image_ori.dtype} to {self.vae.dtype}")
+                image_ori = image_ori.to(dtype=self.vae.dtype)
+
+            image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
+            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}")
 
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))

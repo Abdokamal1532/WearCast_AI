@@ -1,0 +1,1 @@
+# WearCast AI package initialization
