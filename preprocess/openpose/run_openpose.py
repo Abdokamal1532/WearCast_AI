@@ -1,6 +1,6 @@
 import pdb
 
-import config
+
 from pathlib import Path
 import sys
 
