@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from transformers import AutoProcessor, CLIPVisionModelWithProjection
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# Absolute Pathing to avoid HF Repo confusion
+# Absolute Pathing to ensure local folders are used correctly
 PROJECT_ROOT = Path(__file__).absolute().parents[1].absolute() # WearCast_AI root
 VIT_PATH = os.path.join(PROJECT_ROOT, "checkpoints/clip-vit-large-patch14")
 MODEL_PATH = os.path.join(PROJECT_ROOT, "checkpoints/ootd")
@@ -29,23 +29,30 @@ class WearCastHD:
     def __init__(self, gpu_id):
         self.gpu_id = 'cuda:' + str(gpu_id)
 
+        # Load VAE from subfolder "vae"
         vae = AutoencoderKL.from_pretrained(
             MODEL_PATH,
             subfolder="vae",
             torch_dtype=torch.float16,
         )
 
+        # Load UNet Garm from subfolder "unet_garm" (using .safetensors)
         unet_garm = UNetGarm2DConditionModel.from_pretrained(
             MODEL_PATH,
+            subfolder="unet_garm",
             torch_dtype=torch.float16,
-            use_safetensors=False, 
+            use_safetensors=True, 
         )
+        
+        # Load UNet Vton from subfolder "unet_vton" (using .safetensors)
         unet_vton = UNetVton2DConditionModel.from_pretrained(
             MODEL_PATH,
+            subfolder="unet_vton",
             torch_dtype=torch.float16,
-            use_safetensors=False,
+            use_safetensors=True,
         )
 
+        # Initialize the pipeline
         self.pipe = WearCastPipeline.from_pretrained(
             MODEL_PATH,
             unet_garm=unet_garm,
@@ -53,7 +60,7 @@ class WearCastHD:
             vae=vae,
             torch_dtype=torch.float16,
             variant="fp16",
-            use_safetensors=False,
+            use_safetensors=False, # Main pipe uses separate weights we already provided
             safety_checker=None,
             requires_safety_checker=False,
         ).to(self.gpu_id)
@@ -63,6 +70,7 @@ class WearCastHD:
         self.auto_processor = AutoProcessor.from_pretrained(VIT_PATH)
         self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH).to(self.gpu_id)
 
+        # Text encoder and Tokenizer from their respective subfolders
         self.tokenizer = CLIPTokenizer.from_pretrained(
             MODEL_PATH,
             subfolder="tokenizer",
