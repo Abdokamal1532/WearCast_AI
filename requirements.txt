@@ -7,4 +7,6 @@ diffusers==0.29.2
 transformers==4.40.2
 huggingface-hub==0.23.2
 einops==0.7.0
-onnxruntime==1.16.2
+onnxruntime-gpu
+gradio
+einops
