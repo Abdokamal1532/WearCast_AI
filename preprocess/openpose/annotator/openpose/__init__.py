@@ -49,6 +49,7 @@ class OpenposeDetector:
         # face_modelpath = os.path.join(annotator_ckpts_path, "facenet.pth")
 
         if not os.path.exists(body_modelpath):
+            os.makedirs(annotator_ckpts_path, exist_ok=True)
             from torch.hub import download_url_to_file
             download_url_to_file(body_model_path, body_modelpath)
 
