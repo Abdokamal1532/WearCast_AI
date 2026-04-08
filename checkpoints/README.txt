@@ -1,0 +1,1 @@
+Put checkpoints here, including wearcast, humanparsing, openpose and clip-vit-large-patch14
