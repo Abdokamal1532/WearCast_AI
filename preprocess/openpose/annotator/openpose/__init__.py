@@ -49,16 +49,8 @@ class OpenposeDetector:
         # face_modelpath = os.path.join(annotator_ckpts_path, "facenet.pth")
 
         if not os.path.exists(body_modelpath):
-            from basicsr.utils.download_util import load_file_from_url
-            load_file_from_url(body_model_path, model_dir=annotator_ckpts_path)
-
-        # if not os.path.exists(hand_modelpath):
-        #     from basicsr.utils.download_util import load_file_from_url
-        #     load_file_from_url(hand_model_path, model_dir=annotator_ckpts_path)
-
-        # if not os.path.exists(face_modelpath):
-        #     from basicsr.utils.download_util import load_file_from_url
-        #     load_file_from_url(face_model_path, model_dir=annotator_ckpts_path)
+            from torch.hub import download_url_to_file
+            download_url_to_file(body_model_path, body_modelpath)
 
         self.body_estimation = Body(body_modelpath)
         # self.hand_estimation = Hand(hand_modelpath)
