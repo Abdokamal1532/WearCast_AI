@@ -1,4 +1,8 @@
 import gradio as gr
+import sys
+import huggingface_hub
+if not hasattr(huggingface_hub, 'cached_download'):
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 import os
 from pathlib import Path
 import sys
@@ -65,7 +69,6 @@ def process_hd(vton_img, garm_img, n_samples, n_steps, image_scale, seed):
 
 block = gr.Blocks().queue()
 with block:
-    with gr.Row():
     with gr.Row():
         gr.Markdown("# WearCast: Men's Virtual Try-On")
     with gr.Row():

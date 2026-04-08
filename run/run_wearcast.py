@@ -1,5 +1,8 @@
 from pathlib import Path
 import sys
+import huggingface_hub
+if not hasattr(huggingface_hub, 'cached_download'):
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 from PIL import Image
 from utils_wearcast import get_mask_location
 
