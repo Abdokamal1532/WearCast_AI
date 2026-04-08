@@ -44,7 +44,16 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
+)
+try:
+    from diffusers.models.embeddings import PositionNet
+except ImportError:
+    try:
+        from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
+    except ImportError:
+        PositionNet = None
+
+from diffusers.models.embeddings import (
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,
