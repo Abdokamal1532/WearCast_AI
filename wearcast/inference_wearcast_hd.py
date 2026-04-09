@@ -133,19 +133,53 @@ class WearCastHD:
             
             # 2. Sophisticated Mask Generation
             print(" -> Constructing sophisticated in-painting mask...")
-            mask, _ = self.get_mask_location(model_type, category, model_parse, keypoints)
+            _, mask = self.get_mask_location(model_type, category, model_parse, keypoints)
+            
+            # Diagnostic: Check mask density
+            mask_np = np.array(mask)
+            mask_pixels = np.sum(mask_np > 127)
+            total_pixels = mask_np.size
+            print(f" -> Mask Diagnostic: {mask_pixels} pixels marked for replacement ({100*mask_pixels/total_pixels:.2f}% of image)")
+            
             mask = mask.resize((768, 1024), Image.NEAREST)
             print(" -> Preprocessing Stage: SUCCESS")
 
         print(f"[WearCast] Phase 2/4: Encoding Inputs (VAE & CLIP Vision)...")
         with torch.no_grad():
+            # -------------------------------------------------------
+            # GARMENT PREPROCESSING: Remove white product background
+            # so CLIP can CLEARLY distinguish white garment fabric
+            # from the white product-shot background.
+            #
+            # Without this: white-shirt-on-white-bg → CLIP encodes
+            # ambiguous features → model generates GRAY instead of WHITE.
+            # With this: pure white bg → replaced with mid-gray (160) →
+            # CLIP sees white fabric as a distinct signal.
+            # -------------------------------------------------------
+            from PIL import ImageEnhance
+            garm_np = np.array(image_garm.copy())
+            # Detect near-white background: all channels >= 240
+            bg_mask = np.all(garm_np >= 240, axis=-1)
+            if bg_mask.mean() > 0.05:  # Only if > 5% of image is white bg
+                print(f" -> White product background detected ({100*bg_mask.mean():.1f}% coverage), replacing with mid-gray for CLIP...")
+                garm_np_proc = garm_np.copy()
+                garm_np_proc[bg_mask] = [160, 160, 160]  # Neutral gray
+                garm_proc = Image.fromarray(garm_np_proc)
+            else:
+                garm_proc = image_garm.copy()
+            # Sharpness + Contrast boost for richer texture features
+            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
+            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
+            print(f" -> Garment CLIP features extracted with enhanced preprocessing.")
+
             # Explicitly cast to half (float16) for T4 GPU compatibility
-            prompt_image = self.auto_processor(images=image_garm, return_tensors="pt").to(device=self.gpu_id)
+            prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
             prompt_image = self.image_encoder(prompt_image.data['pixel_values'].to(dtype=torch.float16)).image_embeds
             prompt_image = prompt_image.unsqueeze(1)
             
             prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
             prompt_embeds[:, 1:] = prompt_image[:]
+            print(f" -> CLIP Embedding shape: {prompt_embeds.shape}")
 
             print(f"[WearCast] Phase 3/4: Starting Denoising Diffusion (U-Net)...")
             images = self.pipe(prompt_embeds=prompt_embeds,
@@ -190,53 +224,99 @@ class WearCastHD:
         return refined
 
     def get_mask_location(self, model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
-        label_map = {"background": 0, "hat": 1, "hair": 2, "sunglasses": 3, "upper_clothes": 4, "skirt": 5, "pants": 6, "dress": 7, "belt": 8, "left_shoe": 9, "right_shoe": 10, "head": 11, "left_leg": 12, "right_leg": 13, "left_arm": 14, "right_arm": 15, "bag": 16, "scarf": 17}
         im_parse = model_parse.resize((width, height), Image.NEAREST)
         parse_array = np.array(im_parse)
-        arm_width = 60
 
-        parse_head = (parse_array == 1).astype(np.float32) + (parse_array == 3).astype(np.float32) + (parse_array == 11).astype(np.float32)
-        parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + (parse_array == label_map["right_shoe"]).astype(np.float32) + (parse_array == label_map["hat"]).astype(np.float32) + (parse_array == label_map["sunglasses"]).astype(np.float32) + (parse_array == label_map["bag"]).astype(np.float32)
-        parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
-        arms_left = (parse_array == 14).astype(np.float32)
-        arms_right = (parse_array == 15).astype(np.float32)
-        parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
-        parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + (parse_array == label_map["pants"]).astype(np.float32)
-        parser_mask_fixed += parser_mask_fixed_lower_cloth
-        parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+        # 2. High-Accuracy Pose-Guided Mask Generation
+        print(" -> Constructing High-Accuracy Mask (Convex Hull + Pose-Guided)...")
+        
+        # Labels to TARGET for generation (core clothes)
+        # 4: upper_clothes, 7: dress, 17: scarf, 14: left_arm, 15: right_arm (include arms for sleeves)
+        target_area = (parse_array == 4).astype(np.float32) + \
+                      (parse_array == 7).astype(np.float32) + \
+                      (parse_array == 17).astype(np.float32)
 
+        # Labels to PROTECT (Face, Hair only — NOT neck, NOT arms)
+        head_only = (parse_array == 1).astype(np.float32) + \
+                    (parse_array == 2).astype(np.float32) + \
+                    (parse_array == 11).astype(np.float32)
+        
+        # Pose keypoints
         pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
-        im_arms_left, im_arms_right = Image.new('L', (width, height)), Image.new('L', (width, height))
-        arms_draw_left, arms_draw_right = ImageDraw.Draw(im_arms_left), ImageDraw.Draw(im_arms_right)
-        
-        # Scaling pose points
         pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), height / 512.0)
-        s_r, s_l, e_r, e_l, w_r, w_l = pt(2), pt(5), pt(3), pt(6), pt(4), pt(7)
-        ARM_LINE_WIDTH = int(arm_width / 512 * height)
-
-        if w_r[0] > 1. or w_r[1] > 1.:
-            w_r_ext = self.extend_arm_mask(w_r, e_r, 1.2)
-            arms_draw_right.line(np.concatenate((s_r, e_r, w_r_ext)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-            arms_draw_right.arc([s_r[0]-ARM_LINE_WIDTH//2, s_r[1]-ARM_LINE_WIDTH//2, s_r[0]+ARM_LINE_WIDTH//2, s_r[1]+ARM_LINE_WIDTH//2], 0, 360, 'white', ARM_LINE_WIDTH//2)
-        else: im_arms_right = arms_right
-
-        if w_l[0] > 1. or w_l[1] > 1.:
-            w_l_ext = self.extend_arm_mask(w_l, e_l, 1.2)
-            arms_draw_left.line(np.concatenate((w_l_ext, e_l, s_l)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-            arms_draw_left.arc([s_l[0]-ARM_LINE_WIDTH//2, s_l[1]-ARM_LINE_WIDTH//2, s_l[0]+ARM_LINE_WIDTH//2, s_l[1]+ARM_LINE_WIDTH//2], 0, 360, 'white', ARM_LINE_WIDTH//2)
-        else: im_arms_left = arms_left
-
-        hands_left, hands_right = np.logical_and(np.logical_not(im_arms_left), arms_left), np.logical_and(np.logical_not(im_arms_right), arms_right)
-        parser_mask_fixed = parser_mask_fixed + hands_left + hands_right + parse_head
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
-        neck_mask = cv2.dilate((parse_array == 18).astype(np.float32), np.ones((5, 5), np.uint16), iterations=1)
-        neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
-        parse_mask = np.logical_or(parse_mask, neck_mask)
-        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
-        parse_mask += np.logical_or(parse_mask, arm_mask)
-        parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
+        # OpenPose: 2=RShoulder, 5=LShoulder, 3=RElbow, 6=LElbow, 4=RWrist, 7=LWrist
+        s_r, s_l = pt(2), pt(5)   # Shoulders
+        e_r, e_l = pt(3), pt(6)   # Elbows
         
-        inpaint_mask = 1 - np.logical_or(parse_mask, parser_mask_fixed)
-        dst = self.refine_mask(self.hole_fill(np.where(inpaint_mask, 255, 0).astype(np.uint8)))
-        inpaint_mask = dst / 255.0
-        return Image.fromarray((inpaint_mask * 255).astype(np.uint8)), Image.fromarray((inpaint_mask * 127).astype(np.uint8))
+        # ============================================================
+        # ROOT-CAUSE FIX: CONVEX HULL GARMENT MASK
+        # Drawing disconnected sleeve LINES creates "cold shoulder" holes.
+        # Instead, we collect all boundary points (torso pixels + pose
+        # keypoints) and wrap them in ONE solid convex polygon.
+        # This guarantees anatomical continuity - no disconnected regions.
+        # ============================================================
+        
+        # Seed points from semantic parsing
+        torso_pixels = np.column_stack(np.where(target_area > 0))  # (row, col)
+        
+        # Keypoint boundary points (x=col, y=row) with lateral padding
+        ARM_PAD = int(38 / 512 * height)
+        valid = lambda p: p[0] > 1 and p[1] > 1
+        
+        hull_pts = []
+        for p in [s_r, s_l, e_r, e_l]:
+            if valid(p):
+                # p is (x, y) where x=col, y=row
+                hull_pts.append([p[0] + ARM_PAD, p[1]])
+                hull_pts.append([p[0] - ARM_PAD, p[1]])
+        
+        # Build the garment mask
+        inpaint_mask = target_area.copy()
+        
+        if len(torso_pixels) > 5 and len(hull_pts) >= 3:
+            # torso_pixels: (row, col) -> convert to (col, row) = (x, y)
+            torso_xy = torso_pixels[:, [1, 0]]
+            
+            # Subsample for speed
+            if len(torso_xy) > 600:
+                idx = np.random.choice(len(torso_xy), 600, replace=False)
+                torso_xy = torso_xy[idx]
+            
+            all_pts = np.vstack([torso_xy, np.array(hull_pts)]).astype(np.float32)
+            
+            # Convex hull wraps everything into one solid region
+            hull = cv2.convexHull(all_pts)
+            hull_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
+            
+            # Union: parsing labels + convex hull
+            inpaint_mask = np.logical_or(inpaint_mask, hull_mask / 255.0).astype(np.float32)
+        elif len(torso_pixels) > 5:
+            # Fallback: just dilate the torso heavily if pose is missing
+            inpaint_mask = cv2.dilate(inpaint_mask, np.ones((31, 31), np.uint8), iterations=2)
+
+        # Add neck region - MINIMAL expansion (just 3px) to avoid choker artifact
+        # We only want to barely expose the collar area, NOT create a visible neck band
+        neck_area = (parse_array == 18).astype(np.float32)
+        neck_expanded = cv2.dilate(neck_area, np.ones((3, 3), np.uint8), iterations=1)
+        inpaint_mask = np.logical_or(inpaint_mask, neck_expanded).astype(np.float32)
+
+        # FINAL GUARD: protect only face/hair — allow arms and neck
+        inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(head_only)).astype(np.float32)
+        
+        # Light dilation to smooth jagged edges from the convex hull
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((11, 11), np.uint8), iterations=1)
+
+        # Hole fill + largest-contour refinement
+        filled = self.hole_fill(np.where(inpaint_mask, 255, 0).astype(np.uint8))
+        dst = self.refine_mask(filled)
+        
+        # Soft feathered mask for smooth final blending at skin edges
+        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
+        inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
+
+        # Diagnostic
+        percentage = 100 * np.sum(dst > 0) / (width * height)
+        print(f" -> Convex Hull Mask: {percentage:.1f}% coverage. Solid connected region, no holes.")
+        
+        return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
