@@ -4,7 +4,7 @@ scikit-image
 opencv-python
 pillow
 diffusers==0.29.2
-transformers==4.40.2
+transformers==5.0.0rc3
 accelerate
 huggingface-hub
 pydantic<2.0
