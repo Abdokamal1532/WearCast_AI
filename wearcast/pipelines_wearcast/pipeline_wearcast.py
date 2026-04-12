@@ -567,146 +567,17 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+        if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        else:
+            image = latents
+            has_nsfw_concept = None
 
-        # =====================================================================
-        # PIXEL-SPACE COMPOSITING (High Accuracy Final Blend)
-        #
-        # ARCHITECTURE NOTE: We composite in pixel space AFTER full denoising.
-        # This ensures:
-        #   1. Generated garment keeps 100% color fidelity (no latent bleeding)
-        #   2. Original face/hair/pants are pixel-perfect preserved
-        #   3. Garment edges are Gaussian-feathered for seamless blending
-        #   4. Background from original photo is protected by hard mask erosion
-        # =====================================================================
-        if output_type != "latent":
-            try:
-                # image from VAE is in [-1, 1]. Convert to [0, 1]
-                generated_pixels = (image.float() + 1.0) / 2.0
-                generated_pixels = generated_pixels.clamp(0, 1)
-
-                # Resize generated to match original if resolution differs
-                if generated_pixels.shape[-2:] != image_ori_pixels.shape[-2:]:
-                    generated_pixels = torch.nn.functional.interpolate(
-                        generated_pixels, size=image_ori_pixels.shape[-2:], mode='bilinear', align_corners=False
-                    )
-
-                # Align batch dims
-                if image_ori_pixels.shape[0] < generated_pixels.shape[0]:
-                    image_ori_pixels = image_ori_pixels.expand(generated_pixels.shape[0], -1, -1, -1)
-                if mask_pixel.shape[0] < generated_pixels.shape[0]:
-                    mask_pixel = mask_pixel.expand(generated_pixels.shape[0], -1, -1, -1)
-
-                # --------------------------------------------------
-                # DISTANCE-TRANSFORM FEATHERING (Best-in-class compositing)
-                #
-                # Why NOT erosion+blur: erosion shrinks the mask interior,
-                # causing original white-tank-top pixels to "leak" into the
-                # garment center. This mutes reds and grays out whites.
-                #
-                # Distance transform: GUARANTEES 1.0 weight (100% generated)
-                # everywhere inside the garment (>feather_px from boundary).
-                # Smooth 0→1 transition ONLY at the exact edge (8px wide).
-                # Outside garment: 0.0 = 100% original pixels.
-                #
-                # Effect:
-                #   - White shirts stay WHITE (no original pixel contamination)
-                #   - Bright reds stay RED (not muted to brick-red)
-                #   - Neck/choker artifact eliminated (smooth boundary at neck)
-                # --------------------------------------------------
-                import cv2 as _cv2
-                mask_np = mask_pixel[0, 0].cpu().float().numpy()
-                # Convert to hard binary for distance transform
-                mask_binary = (mask_np > 0.5).astype(np.uint8)
-                # Distance from the nearest background pixel (boundary = 0, interior = positive)
-                dist = _cv2.distanceTransform(mask_binary, _cv2.DIST_L2, 5)
-                # Feather over exactly 8 pixels from the boundary
-                FEATHER_PX = 8.0
-                feathered = np.clip(dist / FEATHER_PX, 0.0, 1.0)
-                # Build final mask tensor
-                final_mask = torch.tensor(feathered, dtype=mask_pixel.dtype, device=mask_pixel.device)
-                final_mask = final_mask.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-                if final_mask.shape[0] < generated_pixels.shape[0]:
-                    final_mask = final_mask.expand(generated_pixels.shape[0], -1, -1, -1)
-
-                # Composite: interior = 100% generated, edge = smooth, exterior = 100% original
-                composited = generated_pixels * final_mask + image_ori_pixels.to(generated_pixels.device) * (1.0 - final_mask)
-                composited = composited.clamp(0, 1)
-
-                # =====================================================================
-                # ADAPTIVE HSV COLOR CORRECTION
-                #
-                # Problem: diffusion model consistently outputs correct HUE but
-                # too-low saturation and brightness:
-                #   - Vivid red (S=240, V=220) → muted maroon (S=150, V=140)
-                #   - Bright blue → muted slate-blue
-                #
-                # Solution: Compare the original garment's HSV stats (non-white bg pixels)
-                # against the generated garment's HSV stats (inside mask).
-                # Apply proportional S and V correction using feathered mask weight.
-                # Capped at 1.8× to prevent oversaturation of already-correct results.
-                # =====================================================================
-                try:
-                    # --- Original garment reference stats ---
-                    garm_ref_01 = (image_garm.float() + 1.0) / 2.0  # [-1,1] → [0,1]
-                    garm_rgb_np = (garm_ref_01[0].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                    garm_hsv = _cv2.cvtColor(garm_rgb_np, _cv2.COLOR_RGB2HSV).astype(np.float32)
-                    # Exclude pure-white product background
-                    bg_garm = np.all(garm_rgb_np >= 238, axis=-1)
-                    valid_garm = ~bg_garm
-                    if valid_garm.sum() > 100:
-                        garm_s_ref = garm_hsv[valid_garm, 1].mean()
-                        garm_v_ref = garm_hsv[valid_garm, 2].mean()
-                    else:
-                        garm_s_ref = garm_v_ref = None
-
-                    if garm_s_ref is not None:
-                        for b_idx in range(composited.shape[0]):
-                            comp_np = (composited[b_idx].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                            comp_hsv = _cv2.cvtColor(comp_np, _cv2.COLOR_RGB2HSV).astype(np.float32)
-
-                            garment_interior = mask_binary.astype(bool)
-                            if garment_interior.sum() < 100:
-                                continue
-                            gen_s = comp_hsv[garment_interior, 1].mean()
-                            gen_v = comp_hsv[garment_interior, 2].mean()
-
-                            # Saturation ratio: how much more saturated is the target vs. generated
-                            s_ratio = np.clip(garm_s_ref / (gen_s + 1e-6), 0.8, 1.8)
-                            # Value (brightness) ratio: limit to gentle correction
-                            v_ratio = np.clip(garm_v_ref / (gen_v + 1e-6), 0.85, 1.35)
-
-                            print(f"[COLOR FIX] GarmS={garm_s_ref:.1f} GenS={gen_s:.1f} sRatio={s_ratio:.2f} | GarmV={garm_v_ref:.1f} GenV={gen_v:.1f} vRatio={v_ratio:.2f}")
-
-                            # Apply correction to HSV channels
-                            corr_hsv = comp_hsv.copy()
-                            corr_hsv[:, :, 1] = np.clip(comp_hsv[:, :, 1] * s_ratio, 0, 255)
-                            corr_hsv[:, :, 2] = np.clip(comp_hsv[:, :, 2] * v_ratio, 0, 255)
-                            corrected_rgb = _cv2.cvtColor(corr_hsv.astype(np.uint8), _cv2.COLOR_HSV2RGB)
-
-                            # Blend correction with original composited using feathered mask weight
-                            # (corrections fade out at boundaries for seamless transitions)
-                            blend_w = np.stack([feathered] * 3, axis=-1)  # H×W×3
-                            final_comp = comp_np.astype(np.float32) * (1.0 - blend_w) + corrected_rgb.astype(np.float32) * blend_w
-                            final_comp = np.clip(final_comp, 0, 255).astype(np.uint8)
-
-                            # Write back to tensor [0, 1]
-                            composited[b_idx] = torch.tensor(
-                                final_comp.astype(np.float32).transpose(2, 0, 1) / 255.0,
-                                dtype=composited.dtype, device=composited.device
-                            )
-                except Exception as e_color:
-                    print(f"[COLOR FIX] Skipped: {e_color}")
-
-                # Convert back to [-1, 1] range for postprocessing
-                image = (composited * 2.0 - 1.0).to(image.dtype)
-                print(f"[HIGH-ACCURACY] Composite + Color-Correction done. Distance-transform feathering ({int(FEATHER_PX)}px).")
-
-
-            except Exception as e:
-                import traceback
-                print(f"[WARNING] Pixel-space composite failed: {e}")
-                traceback.print_exc()
-                print(f" -> Falling back to raw generated output.")
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
 
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
