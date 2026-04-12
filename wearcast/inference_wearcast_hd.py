@@ -283,21 +283,25 @@ class WearCastHD:
             else:
                 garm_proc = image_garm.copy()
 
-            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
-            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
+            # === ACCURACY FIX 1: Stronger sharpening for richer CLIP detail ===
+            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(2.5)
+            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.6)
 
-            # ---- MULTI-SCALE CROPS ----
+            # ---- MULTI-SCALE CROPS (4 crops for richer garment coverage) ----
             w, h = garm_enhanced.size
             cx, cy = w // 2, h // 2
-            crop_full   = garm_enhanced.copy()
-            crop_center = garm_enhanced.crop([
+            crop_full    = garm_enhanced.copy()
+            crop_center  = garm_enhanced.crop([
                 int(cx - w * 0.30), int(cy - h * 0.30),
                 int(cx + w * 0.30), int(cy + h * 0.30)
             ])
-            crop_upper = garm_enhanced.crop([0, 0, w, int(h * 0.40)])
-            print(f" -> Multi-scale crops: full={crop_full.size}, center={crop_center.size}, upper={crop_upper.size}")
+            crop_upper   = garm_enhanced.crop([0, 0, w, int(h * 0.40)])
+            # 4th crop: focuses on the main graphic/print region (center vertical band)
+            crop_graphic = garm_enhanced.crop([int(w*0.10), int(h*0.15), int(w*0.90), int(h*0.85)])
+            print(f" -> Multi-scale crops: full={crop_full.size}, center={crop_center.size}, upper={crop_upper.size}, graphic={crop_graphic.size}")
 
             # ---- ENCODE CONTEXT SCALES & PROJECT ----
+            # === ACCURACY FIX 2: stride 32→16 doubles spatial token coverage (8→16 patch tokens)
             def encode_crop(img, name="?"):
                 inputs = self.auto_processor(images=img, return_tensors="pt").to(self.gpu_id)
                 pixel_vals = inputs.data['pixel_values'].to(dtype=torch.float16)
@@ -306,20 +310,22 @@ class WearCastHD:
                 hidden = outputs.last_hidden_state   # [1, 257, 1024]
                 print(f"    [CLIP]   last_hidden_state={list(hidden.shape)}")
 
-                patch_tokens = hidden[:, 1:, :]       # [1, 256, 1024]
+                patch_tokens = hidden[:, 1:, :]              # [1, 256, 1024]
                 projected_patches = self.visual_projection(patch_tokens)  # [1, 256, 768]
-                sampled = projected_patches[:, ::32, :]  # [1, 8, 768]
+                sampled = projected_patches[:, ::16, :]      # [1, 16, 768] (was ::32 = 8 tokens)
 
                 cls_proj = self.visual_projection(hidden[:, 0:1, :])  # [1, 1, 768]
-                result = torch.cat([cls_proj, sampled], dim=1)        # [1, 9, 768]
+                result = torch.cat([cls_proj, sampled], dim=1)        # [1, 17, 768]
                 print(f"    [CLIP]   final embedding={list(result.shape)}")
                 return result
 
-            feat_full   = encode_crop(crop_full,   "full")
-            feat_center = encode_crop(crop_center, "center")
-            feat_upper  = encode_crop(crop_upper,  "upper")
+            feat_full    = encode_crop(crop_full,    "full")
+            feat_center  = encode_crop(crop_center,  "center")
+            feat_upper   = encode_crop(crop_upper,   "upper")
+            feat_graphic = encode_crop(crop_graphic, "graphic")
 
-            garment_features = (feat_full * 0.5) + (feat_center * 0.3) + (feat_upper * 0.2)
+            # === ACCURACY FIX 3: Emphasise the graphic/print crop (most critical for fidelity)
+            garment_features = (feat_full * 0.30) + (feat_center * 0.25) + (feat_upper * 0.15) + (feat_graphic * 0.30)
             print(f" -> Fused garment_features: {list(garment_features.shape)}")
 
             text_emb = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
@@ -395,16 +401,18 @@ class WearCastHD:
 
             print(f" -> Resolved hard mask shape: {mask_np_hard.shape}  |  white px: {(mask_np_hard>127).sum()}  |  coverage: {100*(mask_np_hard>127).mean():.1f}%")
 
+            # === ACCURACY FIX 7: Tighter final blend mask (7→5px) → cleaner shirt-to-skin transition ===
             mask_soft_blend = Image.fromarray(
-                cv2.GaussianBlur(mask_np_hard.astype(np.float32), (7, 7), 2).astype(np.uint8)
+                cv2.GaussianBlur(mask_np_hard.astype(np.float32), (5, 5), 1.5).astype(np.uint8)
             )
 
+            # === ACCURACY FIX 8: More Laplacian levels (3→5) → better high-freq detail preservation ===
             t0 = time.time()
             lap_result = self.laplacian_pyramid_blend(
                 generated=color_fixed,
                 original=image_ori,
                 mask_soft=mask_soft_blend,
-                levels=3
+                levels=5
             )
             print(f" -> Laplacian blending completed in {time.time()-t0:.2f}s")
 
@@ -443,10 +451,13 @@ class WearCastHD:
         return is_patterned or is_complex_shape
 
     def get_optimal_params(self, category, is_complex_garment):
+        # === ACCURACY FIX 4: More steps + higher guidance for better garment fidelity ===
         if is_complex_garment:
-            return {"num_steps": 25, "image_scale": 2.0}
+            # Complex/patterned: needs more steps to render fine graphic detail
+            return {"num_steps": 40, "image_scale": 2.5}
         else:
-            return {"num_steps": 20, "image_scale": 2.5}
+            # Simple: fewer steps, but higher guidance to commit strongly to the garment
+            return {"num_steps": 30, "image_scale": 3.0}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
@@ -665,8 +676,9 @@ class WearCastHD:
                 print(f"   [MASK GEOM] Garment Bottom Y={garment_bottom_y}, Hip Y={hip_y:.1f} -> Crop-Top={is_crop_top}")
 
         # ---- STEP 3: Build hull points ----
-        ARM_PAD    = int(12 / 512 * height)
-        SLEEVE_PAD = int(12 / 512 * height)
+        # === ACCURACY FIX 5: Wider mask coverage around shoulder/sleeve boundary ===
+        ARM_PAD    = int(20 / 512 * height)  # was 12px — prevents transparency at sleeve edges
+        SLEEVE_PAD = int(18 / 512 * height)  # was 12px
         hull_pts = []
 
         if is_off_shoulder:
@@ -762,7 +774,8 @@ class WearCastHD:
         print(f"   [MASK_GEN] After morphology+fill: dst coverage={100*(dst>0).mean():.1f}%")
 
         # ---- STEP 8: Soft feathered edge ----
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (33, 33), 11)
+        # === ACCURACY FIX 6: Tighter feather (33px→21px) → sharper mask edges → less boundary bleed ===
+        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
         inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
         percentage = 100 * np.sum(dst > 0) / (width * height)
