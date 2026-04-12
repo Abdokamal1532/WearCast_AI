@@ -350,7 +350,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             generator,
         )
 
-        print("[WearCast] Phase 2: Preparing Person & Mask Latents...")
+        print(f"[WearCast Phase 3] Preparing Person & Mask Latents (Guidance={self.do_classifier_free_guidance})...")
         vton_latents, mask_latents, image_ori_latents = self.prepare_vton_latents(
             image_vton,
             mask,
@@ -362,14 +362,15 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             self.do_classifier_free_guidance,
             generator,
         )
-
+        print(f"   [LATS] VTON Latents: {vton_latents.shape}")
+        print(f"   [LATS] Mask Latents: {mask_latents.shape}")
 
         # 1. Default height and width from unet
         height, width = vton_latents.shape[-2:]
         height = height * self.vae_scale_factor
         width = width * self.vae_scale_factor
 
-        print(f"[WearCast] Phase 4/5: Preparing Noise Latents...")
+        print(f"[WearCast Phase 4] Preparing Noise Latents...")
         # 5. Prepare latent variables
         # The U-Net expects 8 channels (4 noise + 4 condition), but we only sample 4 noise channels.
         num_channels_latents = self.vae.config.latent_channels
@@ -383,10 +384,11 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             generator,
             latents,
         )
+        print(f"   [LATS] Initial Noise Latents: {latents.shape}")
 
         noise = latents.clone()
 
-        print(f"[WearCast] Phase 5/5: Starting Main Denoising Loop ({num_inference_steps} steps)...")
+        print(f"[WearCast Phase 5] Starting Main Denoising Loop ({num_inference_steps} steps)...")
         # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         # 9. Denoising loop
@@ -397,6 +399,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         # Optimization: We only need to run the garment UNet once for the conditional prompt.
         # This keeps spatial_attn_outputs at batch_size=1 so we can handle it cleanly in the loop.
         garm_prompt_embeds = prompt_embeds.chunk(2)[-1] if self.do_classifier_free_guidance else prompt_embeds
+        print(f"   [UNET GARM] Running preliminary Garment Spatial Attention... (Encoder embeds: {garm_prompt_embeds.shape})")
         
         _, spatial_attn_outputs = self.unet_garm(
             garm_latents,
@@ -404,6 +407,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             encoder_hidden_states=garm_prompt_embeds,
             return_dict=False,
         )
+        print("   [UNET GARM] Spatial Attention execution successful.")
 
         # Phase 4: Starting Denoising Loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -567,18 +571,6 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-        if not output_type == "latent":
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
-        else:
-            image = latents
-            has_nsfw_concept = None
-
-        if has_nsfw_concept is None:
-            do_denormalize = [True] * image.shape[0]
-        else:
-            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-
 
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
