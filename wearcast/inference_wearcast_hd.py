@@ -239,21 +239,30 @@ class WearCastHD:
             raw_generated = images[0]
 
             print(" -> Step 1/2: Local color correction...")
+            # Use the HARD mask for checking color stats so we don't include UNET background grey
             color_fixed = self.local_color_correction(
                 generated=raw_generated,
                 original_garment=image_garm,
-                mask_hard=mask
+                mask_hard=self._cached_hard_mask if hasattr(self, '_cached_hard_mask') else mask
             )
 
             print(" -> Step 2/2: Laplacian pyramid blending...")
-            mask_np_hard = np.array(mask)
-            mask_dilated = cv2.dilate(mask_np_hard, np.ones((7, 7), np.uint8), iterations=1)
-            mask_soft_32 = Image.fromarray(cv2.GaussianBlur(mask_dilated.astype(np.float32), (65, 65), 20).astype(np.uint8))
+            # Grab the hard mask or fall back to thresholded mask if passed externally
+            if hasattr(self, '_cached_hard_mask'):
+                mask_np_hard = np.array(self._cached_hard_mask)
+            else:
+                mask_np_hard = (np.array(mask) > 127).astype(np.uint8) * 255
+                
+            # DO NOT heavily dilate and blur. The UNET generated grey background is just outside the boundary.
+            # We want a tight blend inside the garment boundary.
+            mask_dilated = cv2.dilate(mask_np_hard, np.ones((5, 5), np.uint8), iterations=1)
+            # A 21x21 blur is tight and seamless without creating an aura. (65x65 creates massive ghost capes)
+            mask_soft_blend = Image.fromarray(cv2.GaussianBlur(mask_dilated.astype(np.float32), (21, 21), 7).astype(np.uint8))
             
             final_image = self.laplacian_pyramid_blend(
                 generated=color_fixed,
                 original=image_ori,
-                mask_soft=mask_soft_32,
+                mask_soft=mask_soft_blend,
                 levels=5
             )
 
@@ -537,4 +546,5 @@ class WearCastHD:
         percentage = 100 * np.sum(dst > 0) / (width * height)
         print(f" -> Smart Category Mask: {percentage:.1f}% | OffShoulder={is_off_shoulder} | CropTop={is_crop_top}")
 
+        self._cached_hard_mask = Image.fromarray(dst)
         return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
