@@ -392,31 +392,45 @@ class WearCastHD:
             color_fixed.save("debug_color_corrected.jpg")
             print(f" -> [SAVED] Color-corrected image saved to: debug_color_corrected.jpg")
 
-            # --- Step 2: Laplacian Blending ---
-            print(" -> Step 2/2: Laplacian pyramid blending...")
+            # --- Step 2: Strict Background-Clean Alpha Composite ---
+            # === FIX B: REPLACES Laplacian blend — eliminates white halo ===
+            # Root cause of halo: Laplacian pyramid at 5 levels, coarsest level (64x48) covers
+            # 16×16 original pixels per cell, spreading the blend zone 16–32px outside the mask.
+            # Solution: (A) strictly copy original background into generated image BEFORE blend;
+            #           (B) apply only a narrow 9px soft alpha at the exact boundary.
+            print(" -> Step 2/2: Strict background-clean alpha compositing...")
+
+            # Resolve the hard (binary) mask at full output resolution
             if hasattr(self, '_cached_hard_mask'):
                 mask_np_hard = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST))
             else:
                 mask_np_hard = (np.array(mask.resize(raw_generated.size, Image.NEAREST)) > 127).astype(np.uint8) * 255
+            print(f" -> Hard mask: shape={mask_np_hard.shape}  white_px={(mask_np_hard>127).sum()}  coverage={100*(mask_np_hard>127).mean():.1f}%")
 
-            print(f" -> Resolved hard mask shape: {mask_np_hard.shape}  |  white px: {(mask_np_hard>127).sum()}  |  coverage: {100*(mask_np_hard>127).mean():.1f}%")
-
-            # === ACCURACY FIX 7: Tighter final blend mask (7→5px) → cleaner shirt-to-skin transition ===
-            mask_soft_blend = Image.fromarray(
-                cv2.GaussianBlur(mask_np_hard.astype(np.float32), (5, 5), 1.5).astype(np.uint8)
-            )
-
-            # === ACCURACY FIX 8: More Laplacian levels (3→5) → better high-freq detail preservation ===
             t0 = time.time()
-            lap_result = self.laplacian_pyramid_blend(
-                generated=color_fixed,
-                original=image_ori,
-                mask_soft=mask_soft_blend,
-                levels=5
-            )
-            print(f" -> Laplacian blending completed in {time.time()-t0:.2f}s")
 
-            final_image = lap_result
+            gen_arr = np.array(color_fixed).astype(np.float32)
+            ori_arr = np.array(image_ori).astype(np.float32)
+            if ori_arr.shape[:2] != gen_arr.shape[:2]:
+                ori_arr = np.array(image_ori.resize(color_fixed.size, Image.BICUBIC)).astype(np.float32)
+                print(f"   [COMPOSITE] Resized original to {ori_arr.shape[:2]}")
+
+            # A: Strict background replacement
+            #    Every pixel OUTSIDE the hard mask is copied directly from the original.
+            #    This completely eliminates any white-shirt bleed into the background.
+            hard_f   = (mask_np_hard > 127).astype(np.float32)   # binary 0/1 float
+            hard_3d  = np.stack([hard_f] * 3, axis=-1)
+            gen_clean = gen_arr * hard_3d + ori_arr * (1.0 - hard_3d)
+            print(f"   [COMPOSITE] A: Background replaced outside mask  coverage={hard_f.mean()*100:.1f}%")
+
+            # B: Soft-feather alpha blend at the boundary only (13px gaussian on binary mask = ~13px blend zone)
+            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (13, 13), 3.5) / 255.0  # was (9,9),2.5
+            alpha_3d = np.stack([alpha] * 3, axis=-1)
+            final_arr = gen_clean * alpha_3d + ori_arr * (1.0 - alpha_3d)
+            print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}")
+
+            final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+            print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
             final_image.save("debug_final_output.jpg")
             print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
 
@@ -497,9 +511,11 @@ class WearCastHD:
             gen_std  = gen_hsv[mask_bool,  channel].std() + 1e-6
             garm_std = garm_hsv[valid_garm, channel].std() + 1e-6
 
-            if channel == 2:  # V — ONLY ever boost, never compress
-                ratio_std  = max(min(garm_std / gen_std, 1.3), 1.0)
-                shift_mean = (garm_mean - gen_mean) * 0.85
+            if channel == 2:  # V — boost only, but cap aggressively to prevent glowing white shirt
+                ratio_std  = max(min(garm_std / gen_std, 1.10), 1.0)   # was 1.3 max — narrowed
+                # Cap shift: product-image brightness gap is expected (studio vs body shadows)
+                # 0.35 * gap capped at 22 prevents unnatural shirt glow while still correcting hue
+                shift_mean = min((garm_mean - gen_mean) * 0.35, 22.0)  # was * 0.85 uncapped
             else:             # S — gentle bidirectional correction
                 ratio_std  = min(garm_std / gen_std, 1.2)
                 shift_mean = (garm_mean - gen_mean) * 0.6
@@ -641,7 +657,8 @@ class WearCastHD:
             print(f"   [MASK_GEN] Label {label}: {px_count} pixels")
             garment_mask += (parse_array == label).astype(np.float32)
 
-        k_size = int((height * 0.01)) | 1
+        # === Widen garment dilation to 7x7 to recover mask area lost after arm-clip Fix A ===
+        k_size = max(int((height * 0.015)) | 1, 7)   # was: int(h*0.01)|1 → 5px; now min 7px
         print(f"   [MASK_GEN] Garment dilation kernel size: {k_size}x{k_size}")
         kernel_garment = np.ones((k_size, k_size), np.uint8)
         garment_mask = cv2.dilate(garment_mask, kernel_garment, iterations=1)
@@ -651,6 +668,21 @@ class WearCastHD:
             px_count = (parse_array == label).sum()
             print(f"   [MASK_GEN] Arm Label {label}: {px_count} pixels")
             arm_mask += (parse_array == label).astype(np.float32)
+
+        # === FIX A: Clip arm mask to sleeve region only (prevents forearm ghosting/artifacts) ===
+        # Strategy: only keep arm pixels from the shoulder down to 75% of the shoulder→elbow distance.
+        # For a short-sleeve T-shirt this safely covers the sleeve but excludes the forearm.
+        # Long-sleeve shirts have no exposed arm skin (label 14/15 is covered by label 4) so this is safe.
+        if len(arm_labels) > 0 and category == 'upperbody':
+            min_sh_y     = min(s_r[1], s_l[1])            # highest shoulder point
+            avg_elbow_y  = (e_r[1] + e_l[1]) / 2.0
+            sleeve_hem_y = int(min_sh_y + 0.75 * (avg_elbow_y - min_sh_y))
+            sleeve_hem_y = max(0, min(height - 1, sleeve_hem_y))
+            arm_mask[sleeve_hem_y:, :] = 0
+            print(f"   [MASK_GEN] FIX A — Short-sleeve clip: arm mask zeroed at Y>={sleeve_hem_y} "
+                  f"(shoulder_y={min_sh_y:.0f}, elbow_y={avg_elbow_y:.0f})")
+        else:
+            print(f"   [MASK_GEN] No sleeve-hem clip applied (arm_labels={arm_labels}, cat={category}).")
 
         base_mask = np.clip(garment_mask + arm_mask, 0, 1)
         print(f"   [MASK_GEN] base_mask coverage: {100*(base_mask > 0).mean():.1f}%")
