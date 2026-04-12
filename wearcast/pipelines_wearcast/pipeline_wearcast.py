@@ -261,6 +261,15 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         self._guidance_scale = guidance_scale
         self._image_guidance_scale = image_guidance_scale
 
+        print("\n" + "=" * 60)
+        print("[PIPELINE.__call__] Starting WearCastPipeline...")
+        print(f"[PIPELINE] guidance_scale         = {guidance_scale}")
+        print(f"[PIPELINE] image_guidance_scale   = {image_guidance_scale}")
+        print(f"[PIPELINE] num_inference_steps    = {num_inference_steps}")
+        print(f"[PIPELINE] num_images_per_prompt  = {num_images_per_prompt}")
+        print(f"[PIPELINE] do_classifier_free_guidance = {self.do_classifier_free_guidance}")
+        print(f"[PIPELINE] output_type            = {output_type}")
+
         if (image_vton is None) or (image_garm is None):
             raise ValueError("`image` input cannot be undefined.")
 
@@ -271,8 +280,10 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
+        print(f"[PIPELINE] batch_size = {batch_size}")
 
         device = self._execution_device
+        print(f"[PIPELINE] execution_device = {device}")
         self.to(device)
 
         # Force-move all primary input tensors to the pipeline's device
@@ -289,6 +300,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         scheduler_is_in_sigma_space = hasattr(self.scheduler, "sigmas")
 
         # 2. Encode input prompt
+        print("[PIPELINE] Encoding prompt embeddings...")
         prompt_embeds = self._encode_prompt(
             prompt,
             device,
@@ -298,6 +310,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )
+        print(f"[PIPELINE] prompt_embeds after _encode_prompt: shape={list(prompt_embeds.shape)} dtype={prompt_embeds.dtype} device={prompt_embeds.device}")
 
         # Ensure prompt_embeds is in the correct precision for the U-Nets (float16)
         if prompt_embeds.dtype != torch.float16:
@@ -306,40 +319,49 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         print(f"[WearCast] Phase 3/5: Encoding Garment and Mask...")
         # 3. Preprocess image
+        print("[PIPELINE] Pre-processing images through VaeImageProcessor...")
         image_garm = self.image_processor.preprocess(image_garm)
         image_vton = self.image_processor.preprocess(image_vton)
-        image_ori = self.image_processor.preprocess(image_ori)
-        
+        image_ori  = self.image_processor.preprocess(image_ori)
+        print(f"[PIPELINE] image_garm preprocessed: shape={list(image_garm.shape)} dtype={image_garm.dtype} range=[{image_garm.min().item():.2f},{image_garm.max().item():.2f}]")
+        print(f"[PIPELINE] image_vton preprocessed: shape={list(image_vton.shape)} dtype={image_vton.dtype} range=[{image_vton.min().item():.2f},{image_vton.max().item():.2f}]")
+        print(f"[PIPELINE] image_ori  preprocessed: shape={list(image_ori.shape)} dtype={image_ori.dtype} range=[{image_ori.min().item():.2f},{image_ori.max().item():.2f}]")
+
         # Save raw pixel-space info for final compositing BEFORE mask binarization
-        # image_ori is in [-1, 1]. We need [0, 1] for the final composite.
         image_ori_pixels = (image_ori.clone().float() + 1.0) / 2.0  # [-1,1] -> [0,1]
         image_ori_pixels = image_ori_pixels.clamp(0, 1).to(device)
-        
+
+        print("[PIPELINE] Processing mask (soft + hard)...")
         mask = np.array(mask)
-        
-        # Save a soft mask for the final PIXEL-SPACE composite (Gaussian feathered edges)
+        print(f"[PIPELINE] Raw mask from PIL: shape={mask.shape} dtype={mask.dtype} min={mask.min()} max={mask.max()} nonzero={np.sum(mask>0)}")
+
+        # Soft mask for pixel-space composite
         mask_soft_np = mask.astype(np.float32) / 255.0
         import cv2 as _cv2
         mask_soft_np = _cv2.GaussianBlur(mask_soft_np, (15, 15), 5)
         mask_soft_np = np.clip(mask_soft_np, 0, 1)
         mask_pixel = torch.tensor(mask_soft_np, device=device, dtype=torch.float32)
         mask_pixel = mask_pixel.reshape(1, 1, mask_pixel.size(-2), mask_pixel.size(-1))
-        # Resize to final output size  
         mask_pixel = torch.nn.functional.interpolate(mask_pixel, size=image_ori_pixels.shape[-2:], mode='bilinear', align_corners=False)
-        
+        print(f"[PIPELINE] mask_pixel (soft, pixel-space): shape={list(mask_pixel.shape)}")
+
         # Hard mask for latent-space operations
         mask[mask < 127] = 0
         mask[mask >= 127] = 255
+        print(f"[PIPELINE] Hard-binarized mask: white_px={np.sum(mask==255)} black_px={np.sum(mask==0)} coverage={100*np.mean(mask==255):.1f}%")
         mask = torch.tensor(mask, device=device, dtype=prompt_embeds.dtype)
         mask = mask / 255.0
         mask = mask.reshape(-1, 1, mask.size(-2), mask.size(-1))
+        print(f"[PIPELINE] mask tensor: shape={list(mask.shape)} dtype={mask.dtype} device={mask.device}")
 
         # 4. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        print(f"[PIPELINE] Scheduler: {type(self.scheduler).__name__}  |  total timesteps={len(timesteps)}")
+        print(f"[PIPELINE] Timestep range: {timesteps[0].item():.0f} -> {timesteps[-1].item():.0f}")
 
         # 5. Prepare Image latents
-        # Phase 1: Preparing Garment Latents
+        print("\n[PIPELINE] --- Preparing Garment Latents ---")
         garm_latents = self.prepare_garm_latents(
             image_garm,
             batch_size,
@@ -349,8 +371,10 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             self.do_classifier_free_guidance,
             generator,
         )
+        print(f"[PIPELINE] garm_latents: shape={list(garm_latents.shape)} dtype={garm_latents.dtype} range=[{garm_latents.float().min().item():.4f},{garm_latents.float().max().item():.4f}]")
 
-        print(f"[WearCast Phase 3] Preparing Person & Mask Latents (Guidance={self.do_classifier_free_guidance})...")
+        print(f"\n[WearCast Phase 3] Preparing Person & Mask Latents (Guidance={self.do_classifier_free_guidance})...")
+        print("[PIPELINE] --- Preparing VTON / Mask / Original Latents ---")
         vton_latents, mask_latents, image_ori_latents = self.prepare_vton_latents(
             image_vton,
             mask,
@@ -362,17 +386,17 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             self.do_classifier_free_guidance,
             generator,
         )
-        print(f"   [LATS] VTON Latents: {vton_latents.shape}")
-        print(f"   [LATS] Mask Latents: {mask_latents.shape}")
+        print(f"   [LATS] VTON Latents    : {vton_latents.shape} range=[{vton_latents.float().min().item():.4f},{vton_latents.float().max().item():.4f}]")
+        print(f"   [LATS] Mask Latents    : {mask_latents.shape} range=[{mask_latents.float().min().item():.4f},{mask_latents.float().max().item():.4f}]")
+        print(f"   [LATS] OrigImg Latents : {image_ori_latents.shape} range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
 
         # 1. Default height and width from unet
         height, width = vton_latents.shape[-2:]
         height = height * self.vae_scale_factor
-        width = width * self.vae_scale_factor
+        width  = width  * self.vae_scale_factor
+        print(f"[PIPELINE] Effective image resolution: {width} x {height}")
 
-        print(f"[WearCast Phase 4] Preparing Noise Latents...")
-        # 5. Prepare latent variables
-        # The U-Net expects 8 channels (4 noise + 4 condition), but we only sample 4 noise channels.
+        print(f"\n[WearCast Phase 4] Preparing Noise Latents...")
         num_channels_latents = self.vae.config.latent_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -384,38 +408,44 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             generator,
             latents,
         )
-        print(f"   [LATS] Initial Noise Latents: {latents.shape}")
+        print(f"   [LATS] Initial Noise Latents: {latents.shape} dtype={latents.dtype} init_sigma={self.scheduler.init_noise_sigma:.4f}")
+        print(f"   [LATS] Noise stats: min={latents.float().min().item():.4f} max={latents.float().max().item():.4f} std={latents.float().std().item():.4f}")
 
         noise = latents.clone()
 
-        print(f"[WearCast Phase 5] Starting Main Denoising Loop ({num_inference_steps} steps)...")
-        # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        print(f"\n[WearCast Phase 5] Starting Main Denoising Loop ({num_inference_steps} steps)...")
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        # 9. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        print(f"[PIPELINE] num_warmup_steps = {num_warmup_steps}  |  scheduler.order = {self.scheduler.order}")
 
-        # Phase 3: Initializing U-Net Garm (Spatial Attention)
-        # Optimization: We only need to run the garment UNet once for the conditional prompt.
-        # This keeps spatial_attn_outputs at batch_size=1 so we can handle it cleanly in the loop.
+        # Pre-run Garment UNet once
         garm_prompt_embeds = prompt_embeds.chunk(2)[-1] if self.do_classifier_free_guidance else prompt_embeds
         print(f"   [UNET GARM] Running preliminary Garment Spatial Attention... (Encoder embeds: {garm_prompt_embeds.shape})")
-        
+        print(f"   [UNET GARM] garm_latents shape={list(garm_latents.shape)} dtype={garm_latents.dtype} device={garm_latents.device}")
+
         _, spatial_attn_outputs = self.unet_garm(
             garm_latents,
             0,
             encoder_hidden_states=garm_prompt_embeds,
             return_dict=False,
         )
-        print("   [UNET GARM] Spatial Attention execution successful.")
+        if isinstance(spatial_attn_outputs, list):
+            print(f"   [UNET GARM] Spatial Attention execution successful.  outputs={len(spatial_attn_outputs)} tensors")
+            for si, s in enumerate(spatial_attn_outputs[:3]):
+                print(f"   [UNET GARM]   attn[{si}]: shape={list(s.shape)} dtype={s.dtype}")
+            if len(spatial_attn_outputs) > 3:
+                print(f"   [UNET GARM]   ... ({len(spatial_attn_outputs)-3} more)")
+        else:
+            print(f"   [UNET GARM] Spatial Attention execution successful.  output shape={list(spatial_attn_outputs.shape)}")
 
         # Phase 4: Starting Denoising Loop
+        print("\n[PIPELINE] ==== DENOISING LOOP START ====")
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                if i % 10 == 0:
-                     print(f" -> Denoising Step {i}/{num_inference_steps} (Timestep {t.item():.1f})")
-                
-                # Smart Guidance Diagnostic: Let's see what's actually happening
+                if i % 5 == 0 or i == num_inference_steps - 1:
+                    print(f" -> Denoising Step {i}/{num_inference_steps} (Timestep {t.item():.1f})   latent_std={latents.float().std().item():.4f}")
+
                 if i == 0:
                     print(f"[DEBUG] Loop Start Shapes: latents={list(latents.shape)}, prompt_embeds={list(prompt_embeds.shape)}")
                     print(f"[DEBUG] Loop Start Shapes: vton_latents={list(vton_latents.shape)}, mask={list(mask_latents.shape)}")
@@ -560,8 +590,13 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+        print("\n[PIPELINE] ==== DENOISING LOOP COMPLETE ==== ")
+        print(f"[PIPELINE] Final latents: shape={list(latents.shape)} dtype={latents.dtype} std={latents.float().std().item():.4f}")
+
         if not output_type == "latent":
+            print(f"[PIPELINE] Decoding latents via VAE (scaling_factor={self.vae.config.scaling_factor})...")
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            print(f"[PIPELINE] VAE decoded image: shape={list(image.shape)} dtype={image.dtype} range=[{image.float().min().item():.4f},{image.float().max().item():.4f}]")
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
@@ -573,9 +608,12 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
         image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        print(f"[PIPELINE] Postprocessed: {len(image)} image(s)  size={image[0].size if hasattr(image[0], 'size') else 'N/A'}")
 
         # Offload all models
         self.maybe_free_model_hooks()
+        print("[PIPELINE] Pipeline call complete.")
+        print("=" * 60)
 
         if not return_dict:
             return (image, has_nsfw_concept)
@@ -843,7 +881,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
-            print(f"[DEBUG] prepare_garm_latents: input shape={image.shape}, dtype={image.dtype}")
+            print(f"[DEBUG] prepare_garm_latents: input shape={image.shape}, dtype={image.dtype} range=[{image.float().min().item():.4f},{image.float().max().item():.4f}]")
             if image.dtype != self.vae.dtype:
                 print(f"[DEBUG]  -> Casting garment image from {image.dtype} to {self.vae.dtype}")
                 image = image.to(dtype=self.vae.dtype)
@@ -852,9 +890,11 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
                 image_latents = torch.cat(image_latents, dim=0)
             else:
-                image_latents = self.vae.encode(image).latent_dist.mode()
-            
-            print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype}")
+                enc_output = self.vae.encode(image)
+                print(f"[DEBUG] prepare_garm_latents: VAE latent_dist mean={list(enc_output.latent_dist.mean.shape)} std_min={enc_output.latent_dist.std.min().item():.4f}")
+                image_latents = enc_output.latent_dist.mode()
+
+            print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype} range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
 
         if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
             additional_image_per_prompt = batch_size // image_latents.shape[0]
@@ -911,15 +951,18 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             if image_masked.dtype != self.vae.dtype:
                 image_masked = image_masked.to(dtype=self.vae.dtype)
 
-            image_latents = self.vae.encode(image_masked).latent_dist.mode()
-            print(f"[DEBUG] prepare_vton_latents: masked person latents shape={image_latents.shape}")
+            print(f"[DEBUG] prepare_vton_latents: image_masked range=[{image_masked.float().min().item():.4f},{image_masked.float().max().item():.4f}]  masked_region_zero={((image_masked==0).float().mean()*100):.1f}%")
+            enc_vton = self.vae.encode(image_masked)
+            image_latents = enc_vton.latent_dist.mode()
+            print(f"[DEBUG] prepare_vton_latents: masked person latents shape={image_latents.shape}  range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
 
             if image_ori.dtype != self.vae.dtype:
                 print(f"[DEBUG]  -> Casting original image from {image_ori.dtype} to {self.vae.dtype}")
                 image_ori = image_ori.to(dtype=self.vae.dtype)
 
-            image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
-            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}")
+            enc_ori = self.vae.encode(image_ori)
+            image_ori_latents = enc_ori.latent_dist.mode()
+            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
 
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))
