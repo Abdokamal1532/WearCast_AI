@@ -478,7 +478,8 @@ class WearCastHD:
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Graphic/patterned: needs more steps AND higher image conditioning for print fidelity
-            return {"num_steps": 40, "image_scale": 3.0}  # was 2.5 — stronger garment adherence
+            # image_scale 3.0→3.5: UI sends 3.5 but this function was overriding it. 3.5 keeps graphic details sharper
+            return {"num_steps": 40, "image_scale": 3.5}  # was 3.0 — graphic fidelity boost
         else:
             # Simple solid garment: slightly fewer steps, strong guidance is fine
             return {"num_steps": 30, "image_scale": 3.5}  # was 3.0
@@ -528,15 +529,19 @@ class WearCastHD:
                 shift_mean = min((garm_mean - gen_mean) * 0.35, 22.0)  # was * 0.85 uncapped
             else:             # S — boost graphic colors without tinting the white shirt body
                 ratio_std  = min(garm_std / gen_std, 1.25)  # slightly reduced from 1.30
-                shift_mean = (garm_mean - gen_mean) * 0.55  # was 0.75 — less aggressive
+                # Cap BOTH directions: max +desaturation and min desaturation
+                # Negative shift (-3.1 last run) was washing out graphic colors when model over-saturated
+                raw_shift  = (garm_mean - gen_mean) * 0.55
+                shift_mean = max(raw_shift, -1.5)  # never desaturate by more than 1.5 units
 
             print(f"   [COLOR] {name:<18}: Ref Mean={garm_mean:.1f}, Gen Mean={gen_mean:.1f} | Ref Std={garm_std:.1f}, Gen Std={gen_std:.1f} | Ratio={ratio_std:.2f}, Shift={shift_mean:.1f}")
 
             corrected_ch = gen_hsv[:, :, channel].copy()
             if channel == 1:  # S — split: colored pixels get full boost, white shirt body gets minimal push
-                # White shirt body = bright (V>195) AND nearly unsaturated (S<=20)
-                # Applying full shift there adds a color cast that makes the shirt look transparent/bluish
-                is_white_body = (gen_hsv[:, :, 2] > 195) & (gen_hsv[:, :, 1] <= 20)
+                # White shirt body = bright (V>210) AND nearly unsaturated (S<=20)
+                # V threshold raised 195→210: at 195 skin/jeans edge pixels were falsely classified as white
+                # and received incorrect S correction. At 210, only truly bright white fabric is protected.
+                is_white_body = (gen_hsv[:, :, 2] > 210) & (gen_hsv[:, :, 1] <= 20)
                 colored_px    = mask_bool & ~is_white_body
                 white_px      = mask_bool &  is_white_body
                 corrected_ch[colored_px] = corrected_ch[colored_px] * ratio_std + shift_mean
@@ -756,18 +761,20 @@ class WearCastHD:
             if hip_y_val > 0:
                 # Shirt hem at 91% of hip_y — places hem just above the belt line (was 97% = at belt)
                 hull_anchor_y = int(hip_y_val * 0.91)
-                # Use actual hip x-positions for the hem (narrower than shoulders — natural shirt taper)
-                # hip_r[0]≈163, hip_l[0]≈241  vs  s_r[0]+PAD≈156, s_l[0]-PAD≈240 at shoulder
-                hem_r_x = int(hip_r[0] + ARM_PAD * 0.5)  # right hem (hip x + small pad)
-                hem_l_x = int(hip_l[0] - ARM_PAD * 0.5)  # left  hem (hip x - small pad)
+                # Fix: hem hull points must move OUTWARD from the body, not inward.
+                # Right hip is on the LEFT side of the image (x=163): outward = smaller x (move LEFT)
+                # Left  hip is on the RIGHT side of the image (x=241): outward = larger  x (move RIGHT)
+                # Old (wrong): +/- produced INWARD points → shirt hem 58px < body width 78px
+                # New (correct): outward expansion → hem 106px > hip width 78px = natural drape
+                hem_r_x = int(hip_r[0] - ARM_PAD * 0.7)  # right hem: LEFT of R hip (outward)
+                hem_l_x = int(hip_l[0] + ARM_PAD * 0.7)  # left  hem: RIGHT of L hip (outward)
                 hull_pts += [
                     [hem_r_x, hull_anchor_y],  # right hem
                     [hem_l_x, hull_anchor_y],  # left  hem
                 ]
                 print(f"   [MASK_GEN] Added hip hull pts at Y={hull_anchor_y} "
                       f"(R_x={hem_r_x}, L_x={hem_l_x}) "
-                      f"[taper: shoulder_w={int(s_l[0]-ARM_PAD)-int(s_r[0]+ARM_PAD)}px "
-                      f"→ hem_w={hem_l_x-hem_r_x}px]")
+                      f"[body_w={int(hip_l[0]-hip_r[0])}px → hem_w={hem_l_x-hem_r_x}px (wider=correct)]")
             has_sleeves = (parse_array == 14).sum() + (parse_array == 15).sum() > 200
             print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm px sum={(parse_array==14).sum()+(parse_array==15).sum()})")
             if has_sleeves:
