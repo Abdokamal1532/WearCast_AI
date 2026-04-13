@@ -435,10 +435,10 @@ class WearCastHD:
             # Sharpens graphic edges (text, patterns) without affecting background
             # Formula: sharpened = (1+a)*orig - a*blurred  where a=0.5
             blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (3, 3), 0.8)
-            sharp_arr    = np.clip(1.5 * final_arr - 0.5 * blurred_arr, 0, 255)
+            sharp_arr    = np.clip(1.3 * final_arr - 0.3 * blurred_arr, 0, 255)  # amount=0.3 (was 0.5)
             # Blend: inside mask -> sharpened; outside mask -> original (gradual via hard_3d)
             final_arr = sharp_arr * hard_3d + final_arr * (1.0 - hard_3d)
-            print(f"   [COMPOSITE] USM sharpening applied inside mask (amount=0.5, k=3×3)")
+            print(f"   [COMPOSITE] USM sharpening applied inside mask (amount=0.3, k=3×3)")
 
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
             print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
@@ -526,14 +526,25 @@ class WearCastHD:
                 # Cap shift: product-image brightness gap is expected (studio vs body shadows)
                 # 0.35 * gap capped at 22 prevents unnatural shirt glow while still correcting hue
                 shift_mean = min((garm_mean - gen_mean) * 0.35, 22.0)  # was * 0.85 uncapped
-            else:             # S — boost vibrancy of graphic colors more aggressively
-                ratio_std  = min(garm_std / gen_std, 1.30)  # was 1.2 cap
-                shift_mean = (garm_mean - gen_mean) * 0.75  # was 0.6 multiplier
+            else:             # S — boost graphic colors without tinting the white shirt body
+                ratio_std  = min(garm_std / gen_std, 1.25)  # slightly reduced from 1.30
+                shift_mean = (garm_mean - gen_mean) * 0.55  # was 0.75 — less aggressive
 
             print(f"   [COLOR] {name:<18}: Ref Mean={garm_mean:.1f}, Gen Mean={gen_mean:.1f} | Ref Std={garm_std:.1f}, Gen Std={gen_std:.1f} | Ratio={ratio_std:.2f}, Shift={shift_mean:.1f}")
 
             corrected_ch = gen_hsv[:, :, channel].copy()
-            corrected_ch[mask_bool] = corrected_ch[mask_bool] * ratio_std + shift_mean
+            if channel == 1:  # S — split: colored pixels get full boost, white shirt body gets minimal push
+                # White shirt body = bright (V>195) AND nearly unsaturated (S<=20)
+                # Applying full shift there adds a color cast that makes the shirt look transparent/bluish
+                is_white_body = (gen_hsv[:, :, 2] > 195) & (gen_hsv[:, :, 1] <= 20)
+                colored_px    = mask_bool & ~is_white_body
+                white_px      = mask_bool &  is_white_body
+                corrected_ch[colored_px] = corrected_ch[colored_px] * ratio_std + shift_mean
+                # White areas: at most +1.5 saturation so they stay clean white
+                corrected_ch[white_px]   = corrected_ch[white_px] + min(max(shift_mean * 0.08, 0), 1.5)
+                print(f"   [COLOR]   S split: colored_px={colored_px.sum()}  white_body_px={white_px.sum()}")
+            else:  # V — apply uniformly to all mask pixels
+                corrected_ch[mask_bool] = corrected_ch[mask_bool] * ratio_std + shift_mean
             gen_hsv[:, :, channel] = np.clip(corrected_ch, 0, 255)
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
@@ -743,15 +754,20 @@ class WearCastHD:
             # and eliminates the semi-transparent shirt body effect.
             hip_y_val = (hip_r[1] + hip_l[1]) / 2
             if hip_y_val > 0:
-                # Use a y slightly above the waist_cutoff so hull doesn't exceed it
-                hull_anchor_y = int(min(hip_y_val, hip_y_val * 0.97))
-                # Laterally: use shoulder x positions (shirt is roughly same width at hip as shoulder)
+                # Shirt hem at 91% of hip_y — places hem just above the belt line (was 97% = at belt)
+                hull_anchor_y = int(hip_y_val * 0.91)
+                # Use actual hip x-positions for the hem (narrower than shoulders — natural shirt taper)
+                # hip_r[0]≈163, hip_l[0]≈241  vs  s_r[0]+PAD≈156, s_l[0]-PAD≈240 at shoulder
+                hem_r_x = int(hip_r[0] + ARM_PAD * 0.5)  # right hem (hip x + small pad)
+                hem_l_x = int(hip_l[0] - ARM_PAD * 0.5)  # left  hem (hip x - small pad)
                 hull_pts += [
-                    [s_r[0] + ARM_PAD, hull_anchor_y],   # right torso side at hip level
-                    [s_l[0] - ARM_PAD, hull_anchor_y],   # left torso side at hip level
+                    [hem_r_x, hull_anchor_y],  # right hem
+                    [hem_l_x, hull_anchor_y],  # left  hem
                 ]
                 print(f"   [MASK_GEN] Added hip hull pts at Y={hull_anchor_y} "
-                      f"(R_x={s_r[0]+ARM_PAD}, L_x={s_l[0]-ARM_PAD})")
+                      f"(R_x={hem_r_x}, L_x={hem_l_x}) "
+                      f"[taper: shoulder_w={int(s_l[0]-ARM_PAD)-int(s_r[0]+ARM_PAD)}px "
+                      f"→ hem_w={hem_l_x-hem_r_x}px]")
             has_sleeves = (parse_array == 14).sum() + (parse_array == 15).sum() > 200
             print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm px sum={(parse_array==14).sum()+(parse_array==15).sum()})")
             if has_sleeves:
