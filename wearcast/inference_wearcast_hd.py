@@ -407,12 +407,35 @@ class WearCastHD:
             #           (B) apply only a narrow 9px soft alpha at the exact boundary.
             print(" -> Step 2/2: Strict background-clean alpha compositing...")
 
-            # Resolve the hard (binary) mask at full output resolution
-            if hasattr(self, '_cached_hard_mask'):
-                mask_np_hard = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST))
+            # Resolve the hard mask: to completely eliminate synthetic background (the "halo"),
+            # we run parsing on the UNet output to get the exactly-drawn garment silhouette,
+            # then intersect it with the in-paint convex hull.
+            print("   [COMPOSITE] Running precise semantic segmentation on generated garment...")
+            t0_parse = time.time()
+            gen_parse, _ = self.parsing_model(raw_generated)
+            gen_parse_arr = np.array(gen_parse)
+            
+            if category == 'upperbody':
+                gen_mask = ((gen_parse_arr == 4) | (gen_parse_arr == 7)).astype(np.uint8) * 255
+            elif category == 'lowerbody':
+                gen_mask = ((gen_parse_arr == 5) | (gen_parse_arr == 6) | (gen_parse_arr == 12) | (gen_parse_arr == 13)).astype(np.uint8) * 255
+            elif category == 'dress':
+                gen_mask = ((gen_parse_arr == 4) | (gen_parse_arr == 5) | (gen_parse_arr == 6) | (gen_parse_arr == 7)).astype(np.uint8) * 255
             else:
-                mask_np_hard = (np.array(mask.resize(raw_generated.size, Image.NEAREST)) > 127).astype(np.uint8) * 255
-            print(f" -> Hard mask: shape={mask_np_hard.shape}  white_px={(mask_np_hard>127).sum()}  coverage={100*(mask_np_hard>127).mean():.1f}%")
+                gen_mask = ((gen_parse_arr == 4)).astype(np.uint8) * 255
+                
+            # Dilate slightly (3px) to include edge anti-aliasing, then intersect with the original hull
+            gen_mask = cv2.dilate(gen_mask, np.ones((3, 3), np.uint8), iterations=1)
+            
+            if hasattr(self, '_cached_hard_mask'):
+                hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST))
+            else:
+                hull_arr = (np.array(mask.resize(raw_generated.size, Image.NEAREST)) > 127).astype(np.uint8) * 255
+                
+            mask_np_hard = cv2.bitwise_and(gen_mask, hull_arr)
+            print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
+            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final Mask={100*(mask_np_hard>127).mean():.1f}%")
+
 
             t0 = time.time()
 
@@ -813,7 +836,7 @@ class WearCastHD:
             ]
             protect_labels = [1, 2, 11, 18]
         else:
-            SHOULDER_OUT = int(32 / 512 * height)  # wider: 22→32px covers full shoulder seam + sleeve cap transition
+            SHOULDER_OUT = int(48 / 512 * height)  # 48px: much wider to prevent original shoulder outline bleed
             hull_pts += [
                 [s_r[0] - SHOULDER_OUT, s_r[1]],   # right shoulder, outward (smaller x = right side of image)
                 [s_r[0] + ARM_PAD,      s_r[1]],   # right shoulder, inward (torso side)
@@ -843,7 +866,7 @@ class WearCastHD:
             if has_sleeves:
                 # Add sleeve hull points at 75% shoulder→elbow, projected LATERALLY outward
                 # This creates mask coverage in the zone where short sleeves physically hang
-                SLEEVE_LATERAL = int(26 / 512 * height)  # wider: covers full sleeve drape width on body
+                SLEEVE_LATERAL = int(48 / 512 * height)  # 48px: heavily widened to eliminate original skin bleed from forearms
                 sleeve_y_r = int(s_r[1] + 0.65 * (e_r[1] - s_r[1]))  # 65%: full short-sleeve coverage
                 sleeve_y_l = int(s_l[1] + 0.65 * (e_l[1] - s_l[1]))
                 hull_pts += [
