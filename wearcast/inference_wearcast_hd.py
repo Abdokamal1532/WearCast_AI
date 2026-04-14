@@ -1,3 +1,8 @@
+%%writefile /kaggle/working/WearCast_AI/wearcast/inference_wearcast_hd.py
+
+
+
+
 from pathlib import Path
 import sys
 import os
@@ -363,7 +368,7 @@ class WearCastHD:
                 mask=mask,
                 image_ori=image_ori,
                 num_inference_steps=final_steps,
-                image_guidance_scale=6.0,   # raised 4.5→6.0: tighter sleeve-to-arm anchoring, prevents puffed sleeve artifact
+                image_guidance_scale=4.0,   # FIX: 6.0→4.0 — high IGS causes hard artifacts at shoulder boundary
                 guidance_scale=final_scale, # CLIP/garment feature adherence
                 num_images_per_prompt=num_samples,
                 generator=generator,
@@ -506,10 +511,10 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # 8.5 = stable sweet spot: strong enough for graphic print, won't explode shirt shape
-            return {"num_steps": 40, "image_scale": 8.5}
+            # FIX: 8.5→6.5 — high scale causes shoulder boundary artifacts and distortion
+            return {"num_steps": 40, "image_scale": 6.5}
         else:
-            return {"num_steps": 30, "image_scale": 7.0}
+            return {"num_steps": 30, "image_scale": 5.5}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
@@ -627,8 +632,8 @@ class WearCastHD:
             mask_pix_b = corrected_rgb[mask_bool, 2]
             lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
             blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
-            # Dual guard: must be blue-biased AND near-white (lum>180) — preserves graphic illustration blue
-            blue_sel   = (blue_bias > 10) & (lum_pix > 180)
+            # GUARD: lum>210 = truly near-white only. Protects blue collar/trim (darker blue, lum<210)
+            blue_sel   = (blue_bias > 10) & (lum_pix > 210)
             if blue_sel.sum() > 0:
                 blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.55)  # gentler: max 55% desaturation
                 r_idx, c_idx = np.where(mask_bool)
@@ -726,7 +731,8 @@ class WearCastHD:
         return refined
 
     def get_mask_location(self, model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
-        print(f"\n   [MASK_GEN] get_mask_location: model_type={model_type}  category={category}  target_size=({width},{height})")
+        print(f"\n   [MASK_GEN] ============================================================")
+        print(f"   [MASK_GEN] get_mask_location: model_type={model_type}  category={category}  target_size=({width},{height})")
         im_parse = model_parse.resize((width, height), Image.NEAREST)
         parse_array = np.array(im_parse)
         print(f"   [MASK_GEN] parse_array shape={parse_array.shape}  unique_vals={np.unique(parse_array).tolist()}")
@@ -737,7 +743,6 @@ class WearCastHD:
         scale = height / 512.0
         pt = lambda idx: np.multiply(pose_data[idx][:2], scale)
 
-        # ALL keypoints needed
         nose  = pt(0)
         neck  = pt(1)
         s_r, s_l = pt(2), pt(5)
@@ -763,6 +768,9 @@ class WearCastHD:
         elif category == 'dress':
             target_labels = [4, 5, 6, 7]
             arm_labels    = [14, 15]
+        else:
+            target_labels = [4, 7]
+            arm_labels    = [14, 15]
 
         garment_mask = np.zeros((height, width), dtype=np.float32)
         for label in target_labels:
@@ -770,11 +778,14 @@ class WearCastHD:
             print(f"   [MASK_GEN] Label {label}: {px_count} pixels")
             garment_mask += (parse_array == label).astype(np.float32)
 
-        # === Widen garment dilation to 7x7 to recover mask area lost after arm-clip Fix A ===
-        k_size = max(int((height * 0.015)) | 1, 7)   # was: int(h*0.01)|1 → 5px; now min 7px
+        # GARMENT DILATION: 13px minimum to fill boundary gaps
+        k_size = max(int((height * 0.025)) | 1, 13)
         print(f"   [MASK_GEN] Garment dilation kernel size: {k_size}x{k_size}")
         kernel_garment = np.ones((k_size, k_size), np.uint8)
+        garment_mask_pre_dilate = garment_mask.copy()
         garment_mask = cv2.dilate(garment_mask, kernel_garment, iterations=1)
+        print(f"   [MASK_GEN] Garment mask coverage before dilation: {100*(garment_mask_pre_dilate>0).mean():.1f}%")
+        print(f"   [MASK_GEN] Garment mask coverage after  dilation: {100*(garment_mask>0).mean():.1f}%")
 
         arm_mask = np.zeros((height, width), dtype=np.float32)
         for label in arm_labels:
@@ -782,21 +793,22 @@ class WearCastHD:
             print(f"   [MASK_GEN] Arm Label {label}: {px_count} pixels")
             arm_mask += (parse_array == label).astype(np.float32)
 
-        # === FIX A: Clip arm mask to sleeve region only (prevents forearm ghosting/artifacts) ===
-        # Strategy: only keep arm pixels from the shoulder down to 75% of the shoulder→elbow distance.
-        # For a short-sleeve T-shirt this safely covers the sleeve but excludes the forearm.
-        # Long-sleeve shirts have no exposed arm skin (label 14/15 is covered by label 4) so this is safe.
+        # ---- ARM MASK: Keep entire arm from shoulder to elbow (NO forearm clipping) ----
+        # ROOT CAUSE of shoulder holes: clipping arm_mask at 90% shoulder→elbow removes 
+        # the shoulder seam pixel band, creating a visible gap/hole at the shoulder.
+        # FIX: Keep ALL arm pixels up to the elbow, but NOT beyond (avoids forearm ghost).
         if len(arm_labels) > 0 and category == 'upperbody':
-            min_sh_y     = min(s_r[1], s_l[1])
-            avg_elbow_y  = (e_r[1] + e_l[1]) / 2.0
-            # Raised from 0.75 to 0.90: covers full short sleeve length without reaching forearm
-            sleeve_hem_y = int(min_sh_y + 0.90 * (avg_elbow_y - min_sh_y))
-            sleeve_hem_y = max(0, min(height - 1, sleeve_hem_y))
-            arm_mask[sleeve_hem_y:, :] = 0
-            print(f"   [MASK_GEN] FIX A — Short-sleeve clip: arm mask zeroed at Y>={sleeve_hem_y} "
-                f"(shoulder_y={min_sh_y:.0f}, elbow_y={avg_elbow_y:.0f})")
+            arm_px_before = (arm_mask > 0).sum()
+            avg_elbow_y = (e_r[1] + e_l[1]) / 2.0
+            # Use elbow Y + small padding: covers full sleeve including hem
+            sleeve_cutoff_y = int(avg_elbow_y + int(5 / 512 * height))
+            sleeve_cutoff_y = max(0, min(height - 1, sleeve_cutoff_y))
+            arm_mask[sleeve_cutoff_y:, :] = 0
+            arm_px_after = (arm_mask > 0).sum()
+            print(f"   [MASK_GEN] ARM CLIP: zeroed arm below Y={sleeve_cutoff_y} (elbow_y={avg_elbow_y:.0f})")
+            print(f"   [MASK_GEN] ARM CLIP: arm pixels before={arm_px_before}  after={arm_px_after}  removed={arm_px_before-arm_px_after}")
         else:
-            print(f"   [MASK_GEN] No sleeve-hem clip applied (arm_labels={arm_labels}, cat={category}).")
+            print(f"   [MASK_GEN] No arm clip applied (arm_labels={arm_labels}, cat={category}).")
 
         base_mask = np.clip(garment_mask + arm_mask, 0, 1)
         print(f"   [MASK_GEN] base_mask coverage: {100*(base_mask > 0).mean():.1f}%")
@@ -822,64 +834,74 @@ class WearCastHD:
                 print(f"   [MASK GEOM] Garment Bottom Y={garment_bottom_y}, Hip Y={hip_y:.1f} -> Crop-Top={is_crop_top}")
 
         # ---- STEP 3: Build hull points ----
-        # === ACCURACY FIX 5: Wider mask coverage around shoulder/sleeve boundary ===
-        ARM_PAD    = int(14 / 512 * height)  # reduced: just enough to cover shirt seam at shoulder
-        SLEEVE_PAD = int(16 / 512 * height)  # reduced proportionally
+        # SHOULDER_OUT: how far outward the hull extends from shoulder keypoint
+        # Must be LARGER than actual shoulder to cover shirt fabric at the seam
+        ARM_PAD      = int(20 / 512 * height)   # inward pad from shoulder toward neck
+        SLEEVE_PAD   = int(24 / 512 * height)   # pad at elbow level for sleeves
+        SHOULDER_OUT = int(35 / 512 * height)   # outward extension past shoulder keypoint
+        SLEEVE_LAT   = int(32 / 512 * height)   # lateral extension for sleeve hull
+
+        print(f"   [MASK_GEN] Hull padding params: ARM_PAD={ARM_PAD} SLEEVE_PAD={SLEEVE_PAD} SHOULDER_OUT={SHOULDER_OUT} SLEEVE_LAT={SLEEVE_LAT}")
         hull_pts = []
 
         if is_off_shoulder:
             hull_pts += [
-                [s_r[0] + ARM_PAD, s_r[1] + int(20/512*height)],
-                [s_l[0] - ARM_PAD, s_l[1] + int(20/512*height)],
+                [s_r[0] + ARM_PAD,    s_r[1] + int(20/512*height)],
+                [s_l[0] - ARM_PAD,    s_l[1] + int(20/512*height)],
                 [e_r[0] + SLEEVE_PAD, e_r[1]],
                 [e_l[0] - SLEEVE_PAD, e_l[1]],
             ]
             protect_labels = [1, 2, 11, 18]
+            print(f"   [MASK_GEN] Off-shoulder hull: 4 pts")
         else:
-            SHOULDER_OUT = int(48 / 512 * height)  # 48px: much wider to prevent original shoulder outline bleed
             hull_pts += [
-                [s_r[0] - SHOULDER_OUT, s_r[1]],   # right shoulder, outward (smaller x = right side of image)
-                [s_r[0] + ARM_PAD,      s_r[1]],   # right shoulder, inward (torso side)
-                [s_l[0] + SHOULDER_OUT, s_l[1]],   # left shoulder, outward (larger x = left side of image)
-                [s_l[0] - ARM_PAD,      s_l[1]],   # left shoulder, inward (torso side)
-                [neck[0], neck[1] + int(2/512*height)],
+                [s_r[0] - SHOULDER_OUT, s_r[1]],          # right shoulder — FAR outward
+                [s_r[0] + ARM_PAD,      s_r[1]],          # right shoulder — inward
+                [s_l[0] + SHOULDER_OUT, s_l[1]],          # left shoulder  — FAR outward
+                [s_l[0] - ARM_PAD,      s_l[1]],          # left shoulder  — inward
+                [neck[0],               neck[1] + int(2/512*height)],   # neck base
             ]
-            # === FIX: Add torso-width (hip-level) hull points to create full trapezoid coverage ===
-            # Without these, the hull is only a tiny shoulder-neck triangle (3pts) → 10.9% coverage.
-            # Adding hip-width anchors at waist level fills the gap from garment_bottom_y→waist_cutoff
-            # and eliminates the semi-transparent shirt body effect.
+            print(f"   [MASK_GEN] Shoulder hull pts:")
+            print(f"              R-out=[{s_r[0]-SHOULDER_OUT:.0f},{s_r[1]:.0f}]  R-in=[{s_r[0]+ARM_PAD:.0f},{s_r[1]:.0f}]")
+            print(f"              L-out=[{s_l[0]+SHOULDER_OUT:.0f},{s_l[1]:.0f}]  L-in=[{s_l[0]-ARM_PAD:.0f},{s_l[1]:.0f}]")
+
+            # Hip-level anchor: fills torso body of shirt
             hip_y_val = (hip_r[1] + hip_l[1]) / 2
             if hip_y_val > 0:
-                # Use a y slightly above the waist_cutoff so hull doesn't exceed it
-                hull_anchor_y = int(min(hip_y_val, hip_y_val * 0.97))
-                # Laterally: use shoulder x positions (shirt is roughly same width at hip as shoulder)
-                # Shirt tapers slightly at hem — use hip x positions instead of padded shoulder x
-                hip_pad = int(8 / 512 * height)  # small pad just to cover hem seam
+                hull_anchor_y = int(hip_y_val * 0.97)
+                hip_pad = int(12 / 512 * height)
                 hull_pts += [
-                    [hip_r[0] + hip_pad, hull_anchor_y],   # right hem — follows actual hip width
-                    [hip_l[0] - hip_pad, hull_anchor_y],   # left hem
+                    [hip_r[0] + hip_pad, hull_anchor_y],
+                    [hip_l[0] - hip_pad, hull_anchor_y],
                 ]
-                print(f"   [MASK_GEN] Added hip hull pts at Y={hull_anchor_y} "
-                      f"(R_x={s_r[0]+ARM_PAD}, L_x={s_l[0]-ARM_PAD})")
+                print(f"   [MASK_GEN] Hip hull pts: Y={hull_anchor_y}  R_x={hip_r[0]+hip_pad:.0f}  L_x={hip_l[0]-hip_pad:.0f}")
+
+            # Sleeve hull: extend outward at mid-sleeve to cover short sleeve fabric
             has_sleeves = (parse_array == 14).sum() + (parse_array == 15).sum() > 200
-            print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm px sum={(parse_array==14).sum()+(parse_array==15).sum()})")
+            print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm_px={(parse_array==14).sum()+(parse_array==15).sum()})")
             if has_sleeves:
-                # Add sleeve hull points at 75% shoulder→elbow, projected LATERALLY outward
-                # This creates mask coverage in the zone where short sleeves physically hang
-                SLEEVE_LATERAL = int(48 / 512 * height)  # 48px: heavily widened to eliminate original skin bleed from forearms
-                sleeve_y_r = int(s_r[1] + 0.65 * (e_r[1] - s_r[1]))  # 65%: full short-sleeve coverage
-                sleeve_y_l = int(s_l[1] + 0.65 * (e_l[1] - s_l[1]))
+                # Mid-sleeve Y: 50% down shoulder→elbow (not 65%) — shorter sleeves mean we need the hull earlier
+                sleeve_y_r = int(s_r[1] + 0.50 * (e_r[1] - s_r[1]))
+                sleeve_y_l = int(s_l[1] + 0.50 * (e_l[1] - s_l[1]))
+                # Also add a second point near shoulder for upper sleeve
+                upper_sleeve_y_r = int(s_r[1] + 0.20 * (e_r[1] - s_r[1]))
+                upper_sleeve_y_l = int(s_l[1] + 0.20 * (e_l[1] - s_l[1]))
                 hull_pts += [
-                    [s_r[0] - SLEEVE_LATERAL, sleeve_y_r],  # right sleeve hem (outward = smaller x)
-                    [s_l[0] + SLEEVE_LATERAL, sleeve_y_l],  # left sleeve hem  (outward = larger x)
+                    [s_r[0] - SLEEVE_LAT, upper_sleeve_y_r],  # RIGHT upper sleeve
+                    [s_r[0] - SLEEVE_LAT, sleeve_y_r],        # RIGHT lower sleeve
+                    [s_l[0] + SLEEVE_LAT, upper_sleeve_y_l],  # LEFT  upper sleeve
+                    [s_l[0] + SLEEVE_LAT, sleeve_y_l],        # LEFT  lower sleeve
                 ]
-                print(f"   [MASK_GEN] Sleeve hull pts added: R=({s_r[0]-SLEEVE_LATERAL},{sleeve_y_r})  L=({s_l[0]+SLEEVE_LATERAL},{sleeve_y_l})")
+                print(f"   [MASK_GEN] Sleeve hull: R_upper=[{s_r[0]-SLEEVE_LAT:.0f},{upper_sleeve_y_r}]  R_lower=[{s_r[0]-SLEEVE_LAT:.0f},{sleeve_y_r}]")
+                print(f"   [MASK_GEN] Sleeve hull: L_upper=[{s_l[0]+SLEEVE_LAT:.0f},{upper_sleeve_y_l}]  L_lower=[{s_l[0]+SLEEVE_LAT:.0f},{sleeve_y_l}]")
             protect_labels = [1, 2, 11]
 
-        print(f"   [MASK_GEN] hull_pts (raw): {hull_pts}")
+        print(f"   [MASK_GEN] Total hull_pts: {len(hull_pts)}")
+        for i, pt_val in enumerate(hull_pts):
+            print(f"   [MASK_GEN]   hull_pt[{i}]: {pt_val}")
 
-        # ---- STEP 4: Crop top lower boundary ----
-        if is_crop_top:
+        # ---- STEP 4: Waist / Crop-top cutoff ----
+        if is_crop_top and len(garment_pixels_y) > 0:
             garment_bottom_y = np.max(garment_pixels_y)
             cutoff = int(garment_bottom_y * 1.05)
             base_mask[cutoff:, :] = 0
@@ -899,8 +921,8 @@ class WearCastHD:
         else:
             core_mask = base_mask.copy()
 
-        if is_crop_top:
-            core_mask[int(garment_bottom_y * 1.05):, :] = 0
+        if is_crop_top and len(garment_pixels_y) > 0:
+            core_mask[int(np.max(garment_pixels_y) * 1.05):, :] = 0
         if category == 'upperbody' and hip_y > 0:
             core_mask[waist_cutoff:, :] = 0
 
@@ -914,47 +936,71 @@ class WearCastHD:
             if len(core_xy) > 800:
                 idx = np.random.choice(len(core_xy), 800, replace=False)
                 core_xy = core_xy[idx]
-                print(f"   [MASK_GEN] core_xy downsampled to 800 random pts")
-
             all_pts = np.vstack([core_xy, np.array(valid_hull_pts)]).astype(np.float32)
             hull = cv2.convexHull(all_pts)
             hull_mask = np.zeros((height, width), dtype=np.uint8)
             cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
             hull_coverage = 100*(hull_mask > 0).mean()
             print(f"   [MASK_GEN] Convex hull built. Hull coverage: {hull_coverage:.1f}%")
+            # DIAGNOSTIC: check if shoulder region is covered by hull
+            sh_y_min = int(min(s_r[1], s_l[1])) - 5
+            sh_y_max = int(min(s_r[1], s_l[1])) + 15
+            sh_x_min = int(min(s_r[0], s_l[0]) - SHOULDER_OUT) - 5
+            sh_x_max = int(max(s_r[0], s_l[0]) + SHOULDER_OUT) + 5
+            sh_y_min = max(0, sh_y_min); sh_y_max = min(height-1, sh_y_max)
+            sh_x_min = max(0, sh_x_min); sh_x_max = min(width-1,  sh_x_max)
+            shoulder_region = hull_mask[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
+            print(f"   [MASK_GEN] SHOULDER REGION CHECK (Y={sh_y_min}:{sh_y_max}, X={sh_x_min}:{sh_x_max}): "
+                  f"coverage={100*(shoulder_region>0).mean():.1f}%  "
+                  f"({'GOOD - covered' if (shoulder_region>0).mean() > 0.3 else 'WARNING - low coverage - SHOULDER HOLE RISK'})")
             inpaint_mask = np.logical_or(base_mask, hull_mask / 255.0).astype(np.float32)
         else:
-            print(f"   [MASK_GEN] Skipped convex hull (not enough points). Using raw base_mask.")
+            print(f"   [MASK_GEN] WARNING: Skipped convex hull (not enough points). Using raw base_mask.")
             inpaint_mask = base_mask.copy()
 
-        # ---- STEP 6: Protect face/hair/skin ----
+        # ---- STEP 6: Protect face/hair/neck ----
         protect_mask = np.zeros((height, width), dtype=np.float32)
         for label in protect_labels:
             px = (parse_array == label).sum()
             print(f"   [MASK_GEN] Protect label {label}: {px} pixels")
             protect_mask += (parse_array == label).astype(np.float32)
         protect_mask = np.clip(protect_mask, 0, 1)
+        coverage_before_protect = 100*(inpaint_mask>0).mean()
         inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-        print(f"   [MASK_GEN] After protection: inpaint_mask coverage={100*(inpaint_mask>0).mean():.1f}%")
+        coverage_after_protect = 100*(inpaint_mask>0).mean()
+        print(f"   [MASK_GEN] After protection: {coverage_before_protect:.1f}% -> {coverage_after_protect:.1f}%  (removed {coverage_before_protect-coverage_after_protect:.1f}%)")
 
-        # === Widened dilation 5→9px: filling gaps at shirt boundary (main cause of semi-transparent shirt) ===
-        kernel_close  = np.ones((7, 7), np.uint8)   # reduced from 11x11: less gap-fill overshoot
-        kernel_dilate = np.ones((7, 7), np.uint8)   # reduced from 13x13: stops mask bloating past shirt edge
+        # ---- STEP 7: Morphology close + dilate to fill gaps ----
+        kernel_close  = np.ones((13, 13), np.uint8)
+        kernel_dilate = np.ones((13, 13), np.uint8)
         inpaint_mask_u8 = (inpaint_mask * 255).astype(np.uint8)
+        coverage_before_morph = 100*(inpaint_mask_u8>0).mean()
         inpaint_mask_u8 = cv2.morphologyEx(inpaint_mask_u8, cv2.MORPH_CLOSE, kernel_close)
         inpaint_mask_u8 = cv2.dilate(inpaint_mask_u8, kernel_dilate, iterations=1)
+        coverage_after_morph = 100*(inpaint_mask_u8>0).mean()
+        print(f"   [MASK_GEN] Morphology: before={coverage_before_morph:.1f}%  after={coverage_after_morph:.1f}%  gained={coverage_after_morph-coverage_before_morph:.1f}%")
+
+        # DIAGNOSTIC: check shoulder area after morphology
+        sh_check = inpaint_mask_u8[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
+        print(f"   [MASK_GEN] POST-MORPH SHOULDER CHECK: coverage={100*(sh_check>0).mean():.1f}%  "
+              f"({'GOOD' if (sh_check>0).mean() > 0.5 else 'STILL LOW - SHOULDER HOLE WILL APPEAR'})")
 
         filled = self.hole_fill(inpaint_mask_u8)
         dst    = self.refine_mask(filled)
-        print(f"   [MASK_GEN] After morphology+fill: dst coverage={100*(dst>0).mean():.1f}%")
+        print(f"   [MASK_GEN] After hole_fill+refine: dst coverage={100*(dst>0).mean():.1f}%")
+
+        # DIAGNOSTIC: final shoulder check
+        sh_final = dst[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
+        print(f"   [MASK_GEN] FINAL SHOULDER CHECK: coverage={100*(sh_final>0).mean():.1f}%  "
+              f"({'GOOD' if (sh_final>0).mean() > 0.5 else 'PROBLEM: shoulder not masked - HOLE WILL APPEAR'})")
 
         # ---- STEP 8: Soft feathered edge ----
-        # === ACCURACY FIX 6: Tighter feather (33px→21px) → sharper mask edges → less boundary bleed ===
         mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
         inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
         percentage = 100 * np.sum(dst > 0) / (width * height)
         print(f" -> Smart Category Mask: {percentage:.1f}% | OffShoulder={is_off_shoulder} | CropTop={is_crop_top}")
+        print(f"   [MASK_GEN] ============================================================")
 
         self._cached_hard_mask = Image.fromarray(dst)
         return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
