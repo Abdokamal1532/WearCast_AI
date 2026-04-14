@@ -430,8 +430,8 @@ class WearCastHD:
             gen_clean = gen_arr * hard_3d + ori_arr * (1.0 - hard_3d)
             print(f"   [COMPOSITE] A: Background replaced outside mask  coverage={hard_f.mean()*100:.1f}%")
 
-            # B: Soft-feather alpha blend at the boundary only (13px gaussian on binary mask = ~13px blend zone)
-            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (7, 7), 1.8) / 255.0  # was (9,9),2.5
+            # B: Soft-feather alpha blend at the boundary only — 5px kernel kills white halo
+            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (5, 5), 1.0) / 255.0  # tighter: 7px→5px kills halo glow
             alpha_3d = np.stack([alpha] * 3, axis=-1)
             final_arr = gen_clean * alpha_3d + ori_arr * (1.0 - alpha_3d)
             print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}")
@@ -439,8 +439,8 @@ class WearCastHD:
             # === USM Sharpening: applied only inside hard mask region ===
             # Sharpens graphic edges (text, patterns) without affecting background
             # Formula: sharpened = (1+a)*orig - a*blurred  where a=0.5
-            blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (5, 5), 1.0)  # tighter kernel: preserves fine illustration lines
-            sharp_arr    = np.clip(2.20 * final_arr - 1.20 * blurred_arr, 0, 255)  # stronger USM: recovers text/graphic detail
+            blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (5, 5), 0.8)  # sigma=0.8: sharpest fine-detail kernel
+            sharp_arr    = np.clip(2.50 * final_arr - 1.50 * blurred_arr, 0, 255)  # USM 2.5x: recovers illustration line art
             
             # Blend: inside mask -> sharpened; outside mask -> original (gradual via hard_3d)
             final_arr = sharp_arr * hard_3d + final_arr * (1.0 - hard_3d)
@@ -522,6 +522,10 @@ class WearCastHD:
         print(f"   [COLOR] Garment profile: ref_lum={ref_lum_mean:.1f}, ref_sat={ref_sat_mean:.1f}, is_white={is_white_garm}")
 
         # ── Channel 2: V (Brightness) ──────────────────────────────────────────
+        # KEY FIX: Weight the brightness boost by (1 - normalized_saturation).
+        # Vivid graphic elements (high-S: blue jeans illustration, red text) get weight~0 → no brightness change.
+        # White shirt background (low-S) gets weight~1 → full brightness boost.
+        # This PRESERVES graphic colors while whitening the shirt background.
         gen_mean_v  = gen_hsv[mask_bool, 2].mean()
         garm_mean_v = garm_hsv[valid_garm, 2].mean()
         gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
@@ -531,7 +535,11 @@ class WearCastHD:
         shift_v     = min(max(raw_shift_v, 0.0), 55.0)              # only boost, never darken
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
-        corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + shift_v
+        # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
+        sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
+        sat_weight   = np.clip(1.0 - sat_mask / 120.0, 0.0, 1.0)  # S<40→weight~1.0, S>120→weight~0.0
+        v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
+        corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
         gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
 
         # ── Channel 1: S (Saturation) ──────────────────────────────────────────
@@ -564,29 +572,42 @@ class WearCastHD:
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
-        # === Extra pass: direct RGB luminance rescue for still-dark/blue mask pixels ===
+        # === Extra pass: RGB luminance rescue — ONLY for near-white (low-saturation) mask pixels ===
+        # GUARD: skip pixels with high saturation — those are graphic/illustration elements.
+        # A dark pixel with high S is part of the colored artwork; boosting it would wash out graphic.
         if ref_lum_mean > 200:  # reference is a white/light garment
-            rgb_lum = corrected_rgb[mask_bool].mean(axis=-1)
-            dark_pixels = rgb_lum < 220  # raised threshold: catch lighter gray residuals
+            mask_r = corrected_rgb[mask_bool, 0]
+            mask_g = corrected_rgb[mask_bool, 1]
+            mask_b = corrected_rgb[mask_bool, 2]
+            rgb_lum      = mask_r * 0.299 + mask_g * 0.587 + mask_b * 0.114
+            rgb_sum      = mask_r + mask_g + mask_b + 1e-6
+            rgb_min      = np.minimum(np.minimum(mask_r, mask_g), mask_b)
+            # Desaturation fraction: 0=pure gray/white, 1=fully saturated color
+            rgb_sat_frac = 1.0 - 3.0 * rgb_min / rgb_sum
+            # Only rescue pixels that are: dark AND low-saturation (near-white, not colorful)
+            dark_and_light = (rgb_lum < 220) & (rgb_sat_frac < 0.30)  # low-S guard: S<30% → near-white
             dark_idx = np.where(mask_bool)
-            dark_sel = dark_pixels
+            dark_sel = dark_and_light
             if dark_sel.sum() > 0:
-                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.75, 0, 45)  # push up to 45pt
+                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.75, 0, 40)
                 corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
                     corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
                 )
-                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} dark pixels boosted (ref_lum={ref_lum_mean:.1f})")
+                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} near-white dark pixels boosted (ref_lum={ref_lum_mean:.1f})")
 
-        # === Final pass: For white garment, flatten residual blue saturation directly in RGB ===
+        # === Final pass: flatten residual blue in NEAR-WHITE pixels only ===
+        # GUARD: Only apply to pixels that are both: (1) blue-biased AND (2) already bright/near-white.
+        # Dark pixels belong to the graphic/illustration — their blue is intentional (blue jeans art, scribbles).
         if is_white_garm:
             mask_pix_r = corrected_rgb[mask_bool, 0]
             mask_pix_g = corrected_rgb[mask_bool, 1]
             mask_pix_b = corrected_rgb[mask_bool, 2]
             lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
             blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
-            blue_sel   = blue_bias > 8  # pixels with meaningful blue excess
+            # Dual guard: must be blue-biased AND near-white (lum>180) — preserves graphic illustration blue
+            blue_sel   = (blue_bias > 10) & (lum_pix > 180)
             if blue_sel.sum() > 0:
-                blend_str = np.clip(blue_bias[blue_sel] / 40.0, 0, 0.65)  # 0–65% desaturation
+                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.55)  # gentler: max 55% desaturation
                 r_idx, c_idx = np.where(mask_bool)
                 r_blue = r_idx[blue_sel]
                 c_blue = c_idx[blue_sel]
@@ -594,7 +615,7 @@ class WearCastHD:
                 for ch in range(3):
                     ch_vals = corrected_rgb[r_blue, c_blue, ch]
                     corrected_rgb[r_blue, c_blue, ch] = ch_vals * (1 - blend_str) + lum_b * blend_str
-                print(f"   [COLOR] Blue-desaturation pass: {blue_sel.sum()} blue-biased pixels flattened toward white")
+                print(f"   [COLOR] Blue-desaturation (near-white only): {blue_sel.sum()} px (guarded from {(blue_bias>10).sum()} total blue-biased)")
 
         # Blend zone: 19px tight feather — avoids the 51px halo while still blending mask boundary
         blend_mask    = cv2.GaussianBlur(msk_np, (19, 19), 4)   # tightened: 51→19px kills white halo glow
