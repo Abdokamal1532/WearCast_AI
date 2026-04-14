@@ -456,11 +456,17 @@ class WearCastHD:
             gen_mask = cv2.dilate(gen_mask, np.ones((3, 3), np.uint8), iterations=1)
             
             if hasattr(self, '_cached_hard_mask'):
-                hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST))
+                # FIX-A: BILINEAR resize (was NEAREST) eliminates the staircase pixel-block
+                # edge caused by upscaling a 384×512 binary mask to 768×1024. BILINEAR
+                # produces smooth sub-pixel transitions at the garment boundary.
+                hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR))
             else:
-                hull_arr = (np.array(mask.resize(raw_generated.size, Image.NEAREST)) > 127).astype(np.uint8) * 255
+                hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
 
-            hull_dilated = cv2.dilate(hull_arr, np.ones((5, 5), np.uint8), iterations=2)
+            # FIX-A: iterations=1 (was 2 = 10px total). 5px dilation is enough to bridge
+            # silhouette gaps without pushing the mask into the arm/skin region causing
+            # the floating-sleeve-wing artifact.
+            hull_dilated = cv2.dilate(hull_arr, np.ones((5, 5), np.uint8), iterations=1)
             mask_np_hard = cv2.bitwise_or(gen_mask, hull_dilated)  # UNION — was AND (too restrictive)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
             print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final Mask={100*(mask_np_hard>127).mean():.1f}%")
@@ -482,11 +488,13 @@ class WearCastHD:
             gen_clean = gen_arr * hard_3d + ori_arr * (1.0 - hard_3d)
             print(f"   [COMPOSITE] A: Background replaced outside mask  coverage={hard_f.mean()*100:.1f}%")
 
-            # B: Soft-feather alpha blend at the boundary only — 5px kernel kills white halo
-            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (5, 5), 1.0) / 255.0  # tighter: 7px→5px kills halo glow
+            # B: Soft-feather alpha blend at the boundary — FIX-B: widen from 5px→31px
+            # (sigma=10). On a 768×1024 image a 5px blur creates a ~2px visible seam;
+            # 31px (±3σ = ±30px) creates a natural, photorealistic skin-to-fabric fade.
+            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (31, 31), 10.0) / 255.0
             alpha_3d = np.stack([alpha] * 3, axis=-1)
             final_arr = gen_clean * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}")
+            print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}  (31px feather)")
 
             # === FIX 6: USM Sharpening — reduced from 2.5× to 2.0× to eliminate ringing
             # at graphic/shirt boundary. Blend uses a 7px soft zone instead of hard_3d
@@ -587,7 +595,9 @@ class WearCastHD:
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
         raw_shift_v = (garm_mean_v - gen_mean_v) * 0.90
-        shift_v     = min(max(raw_shift_v, 0.0), 55.0)              # only boost, never darken
+        # FIX-C: raise cap 55→70 so large brightness gaps (e.g. Gen=184 vs Ref=229)
+        # are fully corrected rather than being capped and leaving a pink/grey cast.
+        shift_v     = min(max(raw_shift_v, 0.0), 70.0)              # only boost, never darken
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
@@ -657,11 +667,13 @@ class WearCastHD:
             dark_idx = np.where(mask_bool)
             dark_sel = dark_and_light
             if dark_sel.sum() > 0:
-                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.75, 0, 40)
+                # FIX-C: target 230 (was 220) and multiplier 1.0 (was 0.75), cap 60 (was 40)
+                # to ensure shirt background reaches clean white (≥230 luminance).
+                boost = np.clip((230 - rgb_lum[dark_sel]) * 1.0, 0, 60)
                 corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
                     corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
                 )
-                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} near-white dark pixels boosted (ref_lum={ref_lum_mean:.1f})")
+                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} near-white dark pixels boosted to target=230 (ref_lum={ref_lum_mean:.1f})")
 
         # === Final pass: flatten residual blue in NEAR-WHITE pixels only ===
         # GUARD: Only apply to pixels that are both: (1) blue-biased AND (2) already bright/near-white.
