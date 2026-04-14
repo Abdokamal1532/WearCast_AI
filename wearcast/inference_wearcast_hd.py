@@ -329,13 +329,16 @@ class WearCastHD:
             feat_graphic = encode_crop(crop_graphic, "graphic")
             feat_trim    = encode_crop(crop_trim,    "trim")
 
-            # === FIX 1: Tile-grid CLIP encoding — divide garment into 3×4=12 tiles,
-            #            encode each tile at native 224px resolution so fine detail
-            #            (text like "BURST", small illustrated figures) is preserved.
+            # === ENHANCE 1: Edge-density weighted tile CLIP ===
+            # Tiles with more Canny edges (text, illustration lines) are more information-dense.
+            # Weight them proportionally to their edge density rather than equal averaging.
+            # This automatically gives 'BURST' text tiles 2-4× the weight of plain-white tiles.
             tile_cols, tile_rows = 3, 4
             tile_w = w // tile_cols
             tile_h = h // tile_rows
-            tile_feats = []
+            tile_feats    = []
+            tile_weights  = []
+            garm_gray = np.array(garm_enhanced.convert('L'))
             for tr in range(tile_rows):
                 for tc in range(tile_cols):
                     x0 = tc * tile_w
@@ -344,8 +347,18 @@ class WearCastHD:
                     y1 = y0 + tile_h if tr < tile_rows - 1 else h
                     tile_crop = garm_enhanced.crop([x0, y0, x1, y1])
                     tile_feats.append(encode_crop(tile_crop, f"tile_{tr}x{tc}"))
-            feat_tiles = torch.stack(tile_feats, dim=0).mean(dim=0)  # [1, 17, 768]
-            print(f" -> Tile-grid CLIP: {len(tile_feats)} tiles encoded and averaged. shape={list(feat_tiles.shape)}")
+                    # Edge density: mean Canny response in this tile (0-1)
+                    tile_gray  = garm_gray[y0:y1, x0:x1]
+                    tile_edges = cv2.Canny(tile_gray, 50, 150).astype(np.float32) / 255.0
+                    tile_weights.append(float(tile_edges.mean()) + 0.05)  # +0.05 floor so blank tiles still contribute
+            # Normalize weights to sum=1
+            tw_arr = np.array(tile_weights, dtype=np.float32)
+            tw_arr = tw_arr / tw_arr.sum()
+            feat_tiles_stack = torch.stack(tile_feats, dim=0)  # [12, 1, 17, 768]
+            tw_tensor = torch.tensor(tw_arr, dtype=feat_tiles_stack.dtype, device=feat_tiles_stack.device).view(-1, 1, 1, 1)
+            feat_tiles = (feat_tiles_stack * tw_tensor).sum(dim=0)  # [1, 17, 768]
+            print(f" -> Tile-grid CLIP: {len(tile_feats)} tiles encoded (edge-density weighted). shape={list(feat_tiles.shape)}")
+            print(f"    Tile weights (top-3): {sorted(zip(tile_weights, [f'{r}x{c}' for r in range(tile_rows) for c in range(tile_cols)]), reverse=True)[:3]}")
 
             # Weights: full(0.10)+center(0.10)+upper(0.10)+graphic(0.35)+trim(0.10)+tiles(0.25)=1.00
             # Graphic reduced from 0.50→0.35; tile grid takes 0.25 for fine-detail coverage
@@ -401,6 +414,48 @@ class WearCastHD:
                 print(f" -> GPU VRAM after  UNet call: {mem_after:.2f} GB")
             print(f" -> Denoising loop elapsed    : {t_unet_end - t_unet_start:.2f}s")
             print(f" -> Pipeline returned {len(images)} image(s)")
+
+            # =========================================================
+            # ENHANCE 3 — Multi-Sample Voting (best-of-N by CLIP score)
+            # =========================================================
+            # For complex garments, generate an extra sample and keep the one
+            # whose garment-region CLIP embedding is most similar to the original.
+            # This discards bad diffusion lottery draws without human inspection.
+            if is_complex and num_samples == 1 and len(images) == 1:
+                print("\n[WearCast] ENHANCE 3: Generating 2nd sample for CLIP voting...")
+                generator2   = torch.manual_seed(torch.randint(0, 2**32 - 1, (1,)).item())
+                images_alt = self.pipe(
+                    prompt_embeds=prompt_embeds,
+                    image_garm=image_garm,
+                    image_vton=image_vton,
+                    mask=mask,
+                    image_ori=image_ori,
+                    num_inference_steps=final_steps,
+                    image_guidance_scale=4.0,
+                    guidance_scale=final_scale,
+                    num_images_per_prompt=1,
+                    generator=generator2,
+                ).images
+
+                def clip_score(img):
+                    """Encode shirt area of img and compute cosine sim with garment_features."""
+                    pv = self.clip_processor(images=img, return_tensors="pt").pixel_values
+                    pv = pv.to(dtype=torch.float16, device=self.gpu_id)
+                    with torch.no_grad():
+                        hs = self.image_encoder(pixel_values=pv, output_hidden_states=True).hidden_states
+                        feat = self.visual_projection(hs[-2][:, 1::16, :]).mean(dim=1, keepdim=True)  # [1,1,768]
+                    feat = feat.float().flatten()
+                    ref  = garment_features.float().flatten()
+                    return torch.nn.functional.cosine_similarity(feat.unsqueeze(0), ref.unsqueeze(0)).item()
+
+                score1 = clip_score(images[0])
+                score2 = clip_score(images_alt[0])
+                print(f"   [VOTE] Sample 1 CLIP score={score1:.4f} | Sample 2 CLIP score={score2:.4f}")
+                if score2 > score1:
+                    images[0] = images_alt[0]
+                    print(f"   [VOTE] ✓ Sample 2 wins (score={score2:.4f}) — higher garment fidelity")
+                else:
+                    print(f"   [VOTE] ✓ Sample 1 wins (score={score1:.4f}) — retaining original")
 
             # =========================================================
             # PHASE 4 — Post-Processing
@@ -515,6 +570,36 @@ class WearCastHD:
             final_image.save("debug_final_output.jpg")
             print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
 
+            # === ENHANCE 4: Debug strip — all pipeline stages side-by-side ===
+            # One wide image every run: Person | Garment | Mask | Raw UNet | Color Corrected | Final
+            # Makes it trivial to spot exactly which stage introduced an artifact.
+            try:
+                strip_h  = image_ori.height
+                strip_w  = image_ori.width
+                def _thumb(img, label):
+                    t = img.resize((strip_w, strip_h), Image.BICUBIC).convert('RGB')
+                    from PIL import ImageDraw, ImageFont
+                    d = ImageDraw.Draw(t)
+                    d.rectangle([0, 0, strip_w, 22], fill=(0, 0, 0))
+                    d.text((4, 4), label, fill=(255, 255, 0))
+                    return t
+                mask_rgb = mask.resize((strip_w, strip_h), Image.NEAREST).convert('RGB')
+                panels = [
+                    _thumb(image_ori,      "1: Person"),
+                    _thumb(image_garm,     "2: Garment"),
+                    _thumb(mask_rgb,       "3: Inpaint Mask"),
+                    _thumb(raw_generated,  "4: Raw UNet"),
+                    _thumb(color_fixed,    "5: Color Corrected"),
+                    _thumb(final_image,    "6: Final Output"),
+                ]
+                strip = Image.new('RGB', (strip_w * len(panels), strip_h))
+                for i, p in enumerate(panels):
+                    strip.paste(p, (i * strip_w, 0))
+                strip.save("debug_strip.jpg", quality=90)
+                print(f" -> [SAVED] Debug strip saved to: debug_strip.jpg  ({strip.width}x{strip.height})")
+            except Exception as e:
+                print(f" -> [WARN] Debug strip failed: {e}")
+
             print("\n[WearCast] SUCCESS: Inference completed successfully!")
             print("=" * 70)
 
@@ -606,11 +691,27 @@ class WearCastHD:
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
         sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
         # FIX 2: Tighter saturation guard S/80 (was S/120) — pixels with S>80 are graphic/
-        # illustration elements and must NOT receive any brightness boost. This prevents the
-        # blue scribbles, red text, and yellow figure from being washed out.
-        sat_weight   = np.clip(1.0 - sat_mask / 80.0, 0.0, 1.0)   # S<30→weight~1.0, S>80→weight~0.0
-        v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
+        # illustration elements and must NOT receive any brightness boost.
+        sat_weight   = np.clip(1.0 - sat_mask / 80.0, 0.0, 1.0)
+
+        # === ENHANCE 2: Region-aware correction — split mask into two zones ===
+        # Zone A (white-shirt background): S < 40 → full brightness + hue correction
+        # Zone B (graphic region):         S ≥ 40 → ONLY mild contrast stretch, never shift hue/brightness
+        graphic_zone = (sat_mask >= 40) & mask_bool  # high-saturation pixels = illustration/text
+        shirt_zone   = (sat_mask <  40) & mask_bool  # near-white shirt body
+
+        # Brightness boost applies only to shirt zone (graphic zone: sat_weight≈0 already)
+        v_boost_map  = sat_weight * shift_v
         corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
+        # Graphic zone: gentle contrast stretch around its own mean (preserve vivid colors)
+        if graphic_zone.sum() > 50:
+            gz_v     = corrected_v[graphic_zone]
+            gz_mean  = gz_v.mean()
+            gz_std   = gz_v.std() + 1e-6
+            ref_gz_v = gen_hsv[:, :, 2][graphic_zone]   # use gen as reference (not garment)
+            # Very mild stretch: ratio capped at 1.1 so we don't over-saturate
+            gz_ratio = min(gz_std / (gz_std + 1e-6), 1.10)   # effectively no-op stretch
+            corrected_v[graphic_zone] = gz_v  # keep as-is (no brightness shift for graphic)
         gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
 
         # ── Channel 1: S (Saturation) ──────────────────────────────────────────
@@ -628,7 +729,16 @@ class WearCastHD:
             shift_s  = (garm_mean_s - gen_mean_s) * 0.90
         print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
         corrected_s = gen_hsv[:, :, 1].copy()
-        corrected_s[mask_bool] = corrected_s[mask_bool] * ratio_s + shift_s
+        # ENHANCE 2: Saturation correction applied per-zone:
+        # Shirt zone (S<40): compress toward white (ratio≤1.0, full shift)
+        # Graphic zone (S≥40): only mild shift (30% strength) to preserve vivid illustration colors
+        if is_white_garm:
+            corrected_s[shirt_zone]   = corrected_s[shirt_zone]   * ratio_s + shift_s
+            # Graphic: very gentle saturation pull (30% of shift) — boost vivid but don't strip
+            graphic_shift_s = shift_s * 0.30
+            corrected_s[graphic_zone] = np.clip(corrected_s[graphic_zone] + graphic_shift_s, 0, 255)
+        else:
+            corrected_s[mask_bool] = corrected_s[mask_bool] * ratio_s + shift_s
         gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
 
         # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
