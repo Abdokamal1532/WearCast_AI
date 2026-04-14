@@ -1,8 +1,3 @@
-%%writefile /kaggle/working/WearCast_AI/wearcast/inference_wearcast_hd.py
-
-
-
-
 from pathlib import Path
 import sys
 import os
@@ -288,9 +283,10 @@ class WearCastHD:
             else:
                 garm_proc = image_garm.copy()
 
-            # === ACCURACY FIX 1: Stronger sharpening for richer CLIP detail ===
-            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(2.5)
-            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.6)
+            # === FIX 5: Reduced pre-processing — 2.5×/1.6× was too aggressive, flattening
+            #            mid-tones and pushing CLIP toward shape over texture detail.
+            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)   # was 2.5
+            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.2)  # was 1.6
 
             # ---- MULTI-SCALE CROPS (4 crops for richer garment coverage) ----
             w, h = garm_enhanced.size
@@ -333,10 +329,34 @@ class WearCastHD:
             feat_graphic = encode_crop(crop_graphic, "graphic")
             feat_trim    = encode_crop(crop_trim,    "trim")
 
-            # === Graphic crop weight boosted 50% for better print/text fidelity ===
-            # weights sum to 1.0: full(20%) + center(15%) + upper(15%) + graphic(50%)
-            # Graphic boosted to 50% — forces CLIP to focus on hand-drawn text/character detail
-            garment_features = (feat_full * 0.15) + (feat_center * 0.10) + (feat_upper * 0.10) + (feat_graphic * 0.50) + (feat_trim * 0.15)
+            # === FIX 1: Tile-grid CLIP encoding — divide garment into 3×4=12 tiles,
+            #            encode each tile at native 224px resolution so fine detail
+            #            (text like "BURST", small illustrated figures) is preserved.
+            tile_cols, tile_rows = 3, 4
+            tile_w = w // tile_cols
+            tile_h = h // tile_rows
+            tile_feats = []
+            for tr in range(tile_rows):
+                for tc in range(tile_cols):
+                    x0 = tc * tile_w
+                    y0 = tr * tile_h
+                    x1 = x0 + tile_w if tc < tile_cols - 1 else w
+                    y1 = y0 + tile_h if tr < tile_rows - 1 else h
+                    tile_crop = garm_enhanced.crop([x0, y0, x1, y1])
+                    tile_feats.append(encode_crop(tile_crop, f"tile_{tr}x{tc}"))
+            feat_tiles = torch.stack(tile_feats, dim=0).mean(dim=0)  # [1, 17, 768]
+            print(f" -> Tile-grid CLIP: {len(tile_feats)} tiles encoded and averaged. shape={list(feat_tiles.shape)}")
+
+            # Weights: full(0.10)+center(0.10)+upper(0.10)+graphic(0.35)+trim(0.10)+tiles(0.25)=1.00
+            # Graphic reduced from 0.50→0.35; tile grid takes 0.25 for fine-detail coverage
+            garment_features = (
+                feat_full    * 0.10 +
+                feat_center  * 0.10 +
+                feat_upper   * 0.10 +
+                feat_graphic * 0.35 +
+                feat_trim    * 0.10 +
+                feat_tiles   * 0.25
+            )
             print(f" -> Fused garment_features: {list(garment_features.shape)}")
 
             text_emb = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
@@ -429,15 +449,19 @@ class WearCastHD:
             else:
                 gen_mask = ((gen_parse_arr == 4)).astype(np.uint8) * 255
                 
-            # Dilate slightly (3px) to include edge anti-aliasing, then intersect with the original hull
+            # FIX 4: Union (OR) instead of intersection (AND) to prevent the original
+            # white tank-top from bleeding through pixels that are in the hull but outside
+            # the predicted silhouette. The hull is dilated 5px before the union to avoid
+            # over-bleeding while ensuring full sleeve/shoulder coverage.
             gen_mask = cv2.dilate(gen_mask, np.ones((3, 3), np.uint8), iterations=1)
             
             if hasattr(self, '_cached_hard_mask'):
                 hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST))
             else:
                 hull_arr = (np.array(mask.resize(raw_generated.size, Image.NEAREST)) > 127).astype(np.uint8) * 255
-                
-            mask_np_hard = cv2.bitwise_and(gen_mask, hull_arr)
+
+            hull_dilated = cv2.dilate(hull_arr, np.ones((5, 5), np.uint8), iterations=2)
+            mask_np_hard = cv2.bitwise_or(gen_mask, hull_dilated)  # UNION — was AND (too restrictive)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
             print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final Mask={100*(mask_np_hard>127).mean():.1f}%")
 
@@ -464,15 +488,16 @@ class WearCastHD:
             final_arr = gen_clean * alpha_3d + ori_arr * (1.0 - alpha_3d)
             print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}")
 
-            # === USM Sharpening: applied only inside hard mask region ===
-            # Sharpens graphic edges (text, patterns) without affecting background
-            # Formula: sharpened = (1+a)*orig - a*blurred  where a=0.5
-            blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (5, 5), 0.8)  # sigma=0.8: sharpest fine-detail kernel
-            sharp_arr    = np.clip(2.50 * final_arr - 1.50 * blurred_arr, 0, 255)  # USM 2.5x: recovers illustration line art
-            
-            # Blend: inside mask -> sharpened; outside mask -> original (gradual via hard_3d)
-            final_arr = sharp_arr * hard_3d + final_arr * (1.0 - hard_3d)
-            print(f"   [COMPOSITE] USM sharpening applied inside mask (amount=1.20, k=5×5, σ=1.0)")
+            # === FIX 6: USM Sharpening — reduced from 2.5× to 2.0× to eliminate ringing
+            # at graphic/shirt boundary. Blend uses a 7px soft zone instead of hard_3d
+            # to prevent a visible seam between sharpened and unsharpened regions.
+            blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (5, 5), 0.8)
+            sharp_arr    = np.clip(2.0 * final_arr - 1.0 * blurred_arr, 0, 255)  # was 2.5/1.5
+            # Soft blend mask: 7px feather prevents hard seam at mask boundary
+            usm_soft_blend   = cv2.GaussianBlur(hard_f.astype(np.float32), (7, 7), 2.0)
+            usm_soft_blend_3d = np.stack([usm_soft_blend] * 3, axis=-1)
+            final_arr = sharp_arr * usm_soft_blend_3d + final_arr * (1.0 - usm_soft_blend_3d)
+            print(f"   [COMPOSITE] USM sharpening applied (amount=1.0, k=5×5, σ=0.8, soft-blend 7px)")
 
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
             print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
@@ -511,8 +536,10 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # FIX: 8.5→6.5 — high scale causes shoulder boundary artifacts and distortion
-            return {"num_steps": 40, "image_scale": 6.5}
+            # FIX 7: Raise scale 6.5→7.5 and steps 40→45 — stronger CLIP guidance forces
+            # the model to commit to the graphic pattern; final latent_std was 0.82 (high),
+            # indicating the model wasn't fully converging to the garment detail.
+            return {"num_steps": 45, "image_scale": 7.5}
         else:
             return {"num_steps": 30, "image_scale": 5.5}
 
@@ -565,7 +592,10 @@ class WearCastHD:
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
         sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
-        sat_weight   = np.clip(1.0 - sat_mask / 120.0, 0.0, 1.0)  # S<40→weight~1.0, S>120→weight~0.0
+        # FIX 2: Tighter saturation guard S/80 (was S/120) — pixels with S>80 are graphic/
+        # illustration elements and must NOT receive any brightness boost. This prevents the
+        # blue scribbles, red text, and yellow figure from being washed out.
+        sat_weight   = np.clip(1.0 - sat_mask / 80.0, 0.0, 1.0)   # S<30→weight~1.0, S>80→weight~0.0
         v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
         corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
         gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
@@ -589,14 +619,22 @@ class WearCastHD:
         gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
 
         # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
+        # FIX 3: Hue shift is now ONLY applied to low-saturation pixels (S < 40), i.e.
+        # the white shirt body. High-saturation pixels (blue collar, red "FOLLOW THE SUN"
+        # text, yellow illustration) keep their original hue untouched.
         if is_white_garm:
             gen_mean_h  = gen_hsv[mask_bool, 0].mean()
             garm_mean_h = garm_hsv[valid_garm, 0].mean()
             hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.60, -15, 15)  # gentle hue correction (max ±15)
             corrected_h = gen_hsv[:, :, 0].copy()
-            corrected_h[mask_bool] = corrected_h[mask_bool] + hue_shift
+            # Only shift low-saturation (near-white shirt) pixels — protect vivid graphic colors
+            sat_in_mask = gen_hsv[:, :, 1][mask_bool]  # saturation at mask pixels
+            low_sat_sel = sat_in_mask < 40             # S < 40 → near-white shirt background
+            mask_rows, mask_cols = np.where(mask_bool)
+            corrected_h[mask_rows[low_sat_sel], mask_cols[low_sat_sel]] += hue_shift
             gen_hsv[:, :, 0] = np.clip(corrected_h, 0, 180)  # OpenCV H range is 0–180
-            print(f"   [COLOR] {'Hue':<18}: Ref Mean={garm_mean_h:.1f}, Gen Mean={gen_mean_h:.1f} | Shift={hue_shift:.1f}")
+            low_sat_pct = 100 * low_sat_sel.sum() / max(mask_bool.sum(), 1)
+            print(f"   [COLOR] {'Hue':<18}: Ref Mean={garm_mean_h:.1f}, Gen Mean={gen_mean_h:.1f} | Shift={hue_shift:.1f} | Applied to {low_sat_pct:.1f}% of mask (S<40 only)")
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
@@ -613,7 +651,9 @@ class WearCastHD:
             # Desaturation fraction: 0=pure gray/white, 1=fully saturated color
             rgb_sat_frac = 1.0 - 3.0 * rgb_min / rgb_sum
             # Only rescue pixels that are: dark AND low-saturation (near-white, not colorful)
-            dark_and_light = (rgb_lum < 220) & (rgb_sat_frac < 0.30)  # low-S guard: S<30% → near-white
+            # FIX 2 (part 2): Tighten luminance rescue threshold 220→210 to avoid boosting
+            # near-white graphic highlight regions (e.g. white shirt background inside illustration)
+            dark_and_light = (rgb_lum < 210) & (rgb_sat_frac < 0.30)  # low-S guard: S<30% → near-white
             dark_idx = np.where(mask_bool)
             dark_sel = dark_and_light
             if dark_sel.sum() > 0:
