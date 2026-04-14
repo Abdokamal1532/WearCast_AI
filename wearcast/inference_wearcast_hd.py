@@ -463,11 +463,16 @@ class WearCastHD:
             else:
                 hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
 
-            # FIX: No dilation needed — hull_arr is already BILINEAR-smooth after resize;
-            # dilation was expanding the mask into arm zones causing skin-patch artifacts.
-            mask_np_hard = cv2.bitwise_or(gen_mask, hull_arr)
+            # FIX-FINAL: Use ONLY the semantic silhouette for the composite (not the hull).
+            # The geometric hull is for Phase 1 INPAINTING (tells UNet where to generate).
+            # For the Phase 4 COMPOSITE it creates ghost wings — every hull pixel outside
+            # the real shirt gets a partial alpha and shows as transparent shirt over BG.
+            # Semantic parser gives the tight, precise shirt boundary. 7px dilation covers
+            # sub-pixel gaps at the garment boundary without creating phantom areas.
+            seg_dilated  = cv2.dilate(gen_mask, np.ones((7, 7), np.uint8), iterations=1)
+            mask_np_hard = seg_dilated   # pure semantic — no hull bleed
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
-            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final Mask={100*(mask_np_hard>127).mean():.1f}%")
+            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (seg+7px)={100*(mask_np_hard>127).mean():.1f}%")
 
 
             t0 = time.time()
