@@ -463,11 +463,9 @@ class WearCastHD:
             else:
                 hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
 
-            # FIX-A: iterations=1 (was 2 = 10px total). 5px dilation is enough to bridge
-            # silhouette gaps without pushing the mask into the arm/skin region causing
-            # the floating-sleeve-wing artifact.
-            hull_dilated = cv2.dilate(hull_arr, np.ones((5, 5), np.uint8), iterations=1)
-            mask_np_hard = cv2.bitwise_or(gen_mask, hull_dilated)  # UNION — was AND (too restrictive)
+            # FIX: No dilation needed — hull_arr is already BILINEAR-smooth after resize;
+            # dilation was expanding the mask into arm zones causing skin-patch artifacts.
+            mask_np_hard = cv2.bitwise_or(gen_mask, hull_arr)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
             print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final Mask={100*(mask_np_hard>127).mean():.1f}%")
 
@@ -480,21 +478,21 @@ class WearCastHD:
                 ori_arr = np.array(image_ori.resize(color_fixed.size, Image.BICUBIC)).astype(np.float32)
                 print(f"   [COMPOSITE] Resized original to {ori_arr.shape[:2]}")
 
-            # A: Strict background replacement
-            #    Every pixel OUTSIDE the hard mask is copied directly from the original.
-            #    This completely eliminates any white-shirt bleed into the background.
-            hard_f   = (mask_np_hard > 127).astype(np.float32)   # binary 0/1 float
+            # Unified single-step soft composite: Step A (binary hard cut) REMOVED.
+            # Root cause of blocky border: binary cut created a hard rectangular edge
+            # that the 31px feather could not fully conceal — the two steps conflicted.
+            # Root cause of arm skin patches: feather zone bled into arm pixels,
+            # blending generated (white shirt) with original (skin) = brownish artifact.
+            # Fix: single Gaussian alpha (21px sigma=7) is the ONLY boundary.
+            # Pixels well inside mask: alpha≈1.0 → pure generated shirt.
+            # Pixels well outside mask: alpha≈0.0 → pure original person.
+            # Boundary (21px band): smooth photorealistic fade. No hard edges anywhere.
+            hard_f   = (mask_np_hard > 127).astype(np.float32)  # kept for USM blend only
             hard_3d  = np.stack([hard_f] * 3, axis=-1)
-            gen_clean = gen_arr * hard_3d + ori_arr * (1.0 - hard_3d)
-            print(f"   [COMPOSITE] A: Background replaced outside mask  coverage={hard_f.mean()*100:.1f}%")
-
-            # B: Soft-feather alpha blend at the boundary — FIX-B: widen from 5px→31px
-            # (sigma=10). On a 768×1024 image a 5px blur creates a ~2px visible seam;
-            # 31px (±3σ = ±30px) creates a natural, photorealistic skin-to-fabric fade.
-            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (31, 31), 10.0) / 255.0
+            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (21, 21), 7.0) / 255.0
             alpha_3d = np.stack([alpha] * 3, axis=-1)
-            final_arr = gen_clean * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            print(f"   [COMPOSITE] B: Alpha boundary blend done  max={alpha.max():.3f}  mean={alpha.mean():.4f}  (31px feather)")
+            final_arr = np.array(color_fixed).astype(np.float32) * alpha_3d + ori_arr * (1.0 - alpha_3d)
+            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (21px feather, no binary cut)")
 
             # === FIX 6: USM Sharpening — reduced from 2.5× to 2.0× to eliminate ringing
             # at graphic/shirt boundary. Blend uses a 7px soft zone instead of hard_3d
