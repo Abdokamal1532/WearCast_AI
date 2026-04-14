@@ -490,15 +490,13 @@ class WearCastHD:
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
-        Match overall S/V stats of the generated garment to the original garment,
+        Match overall H/S/V stats of the generated garment to the original garment,
         restricted precisely to the mask boundary, and gently capped.
         """
         print(f"   [COLOR] Starting correction. Gen shape: {generated.size}, Garm shape: {original_garment.size}")
         gen_np  = np.array(generated).astype(np.float32)
         garm_np = np.array(original_garment.resize(generated.size)).astype(np.float32)
         msk_np  = np.array(mask_hard.resize(generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-
-        result = gen_np.copy()
 
         gen_hsv  = cv2.cvtColor(gen_np.astype(np.uint8),  cv2.COLOR_RGB2HSV).astype(np.float32)
         garm_hsv = cv2.cvtColor(garm_np.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
@@ -510,7 +508,6 @@ class WearCastHD:
             print("   [COLOR] Skipped: Mask interior area too small (<100px).")
             return generated
 
-        # Reference clothing background check
         bg_garm  = np.all(garm_np >= 238, axis=-1)
         valid_garm = ~bg_garm
         print(f"   [COLOR] Valid garment pixels (non-BG): {valid_garm.sum()}  ({100*valid_garm.mean():.1f}%)")
@@ -519,49 +516,88 @@ class WearCastHD:
             valid_garm = np.ones_like(bg_garm)
             print("   [COLOR] Warning: Product image had almost no valid foreground pixels. Using entire image stats.")
 
-        for channel, name in zip([1, 2], ["Saturation", "Value / Brightness"]):
-            gen_mean  = gen_hsv[mask_bool, channel].mean()
-            garm_mean = garm_hsv[valid_garm, channel].mean()
+        ref_lum_mean  = garm_hsv[valid_garm, 2].mean()   # reference V mean (brightness)
+        ref_sat_mean  = garm_hsv[valid_garm, 1].mean()   # reference S mean (saturation)
+        is_white_garm = ref_lum_mean > 180 and ref_sat_mean < 60  # garment is primarily white/light
+        print(f"   [COLOR] Garment profile: ref_lum={ref_lum_mean:.1f}, ref_sat={ref_sat_mean:.1f}, is_white={is_white_garm}")
 
-            gen_std  = gen_hsv[mask_bool,  channel].std() + 1e-6
-            garm_std = garm_hsv[valid_garm, channel].std() + 1e-6
+        # ── Channel 2: V (Brightness) ──────────────────────────────────────────
+        gen_mean_v  = gen_hsv[mask_bool, 2].mean()
+        garm_mean_v = garm_hsv[valid_garm, 2].mean()
+        gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
+        garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
+        ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
+        raw_shift_v = (garm_mean_v - gen_mean_v) * 0.90
+        shift_v     = min(max(raw_shift_v, 0.0), 55.0)              # only boost, never darken
+        print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
+        corrected_v = gen_hsv[:, :, 2].copy()
+        corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + shift_v
+        gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
 
-            if channel == 2:  # V — brightness: NEVER compress (ratio floor=1.0), always boost toward reference
-                ratio_std  = max(min(garm_std / gen_std, 1.30), 1.00)  # floor at 1.0: never compress V → prevents gray shirt
-                # Only apply positive shift (never darken the shirt further)
-                raw_shift  = (garm_mean - gen_mean) * 0.90
-                shift_mean = min(max(raw_shift, 0.0), 55.0)  # clamp [0, 55]: only boost, never darken
-            else:             # S — boost vibrancy of graphic colors
-                ratio_std  = min(garm_std / gen_std, 1.60)  # raised cap: allows full color vibrancy of blue/red/yellow illustration
-                shift_mean = (garm_mean - gen_mean) * 0.90  # slightly stronger saturation pull
+        # ── Channel 1: S (Saturation) ──────────────────────────────────────────
+        gen_mean_s  = gen_hsv[mask_bool, 1].mean()
+        garm_mean_s = garm_hsv[valid_garm, 1].mean()
+        gen_std_s   = gen_hsv[mask_bool,  1].std() + 1e-6
+        garm_std_s  = garm_hsv[valid_garm, 1].std() + 1e-6
+        if is_white_garm:
+            # White garment: compress saturation, never expand it (cap ratio at 1.0)
+            ratio_s  = min(garm_std_s / gen_std_s, 1.00)          # cap at 1.0: compress blue std → toward white
+            shift_s  = (garm_mean_s - gen_mean_s) * 1.20          # slightly stronger pull toward low-S white
+        else:
+            # Colorful garment: allow expansion for vibrancy
+            ratio_s  = min(garm_std_s / gen_std_s, 1.60)
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.90
+        print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
+        corrected_s = gen_hsv[:, :, 1].copy()
+        corrected_s[mask_bool] = corrected_s[mask_bool] * ratio_s + shift_s
+        gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
 
-            print(f"   [COLOR] {name:<18}: Ref Mean={garm_mean:.1f}, Gen Mean={gen_mean:.1f} | Ref Std={garm_std:.1f}, Gen Std={gen_std:.1f} | Ratio={ratio_std:.2f}, Shift={shift_mean:.1f}")
-
-            corrected_ch = gen_hsv[:, :, channel].copy()
-            corrected_ch[mask_bool] = corrected_ch[mask_bool] * ratio_std + shift_mean
-            gen_hsv[:, :, channel] = np.clip(corrected_ch, 0, 255)
+        # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
+        if is_white_garm:
+            gen_mean_h  = gen_hsv[mask_bool, 0].mean()
+            garm_mean_h = garm_hsv[valid_garm, 0].mean()
+            hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.60, -15, 15)  # gentle hue correction (max ±15)
+            corrected_h = gen_hsv[:, :, 0].copy()
+            corrected_h[mask_bool] = corrected_h[mask_bool] + hue_shift
+            gen_hsv[:, :, 0] = np.clip(corrected_h, 0, 180)  # OpenCV H range is 0–180
+            print(f"   [COLOR] {'Hue':<18}: Ref Mean={garm_mean_h:.1f}, Gen Mean={gen_mean_h:.1f} | Shift={hue_shift:.1f}")
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
-        # === Extra pass: direct RGB luminance rescue for still-dark mask pixels ===
-        # If pixels inside the mask are still darker than 200 (gray zone) but the reference
-        # garment is bright white (>220), push them up directly in RGB space.
-        # This catches pixels where the HSV ratio alone wasn't sufficient.
-        ref_lum_mean = garm_hsv[valid_garm, 2].mean()
+        # === Extra pass: direct RGB luminance rescue for still-dark/blue mask pixels ===
         if ref_lum_mean > 200:  # reference is a white/light garment
-            rgb_lum = corrected_rgb[mask_bool].mean(axis=-1)  # per-pixel luminance in mask
-            dark_pixels = rgb_lum < 210  # still too gray
-            dark_idx = np.where(mask_bool)  # (row_arr, col_arr)
-            dark_sel = dark_pixels  # bool selector over mask pixels
+            rgb_lum = corrected_rgb[mask_bool].mean(axis=-1)
+            dark_pixels = rgb_lum < 220  # raised threshold: catch lighter gray residuals
+            dark_idx = np.where(mask_bool)
+            dark_sel = dark_pixels
             if dark_sel.sum() > 0:
-                boost = np.clip((210 - rgb_lum[dark_sel]) * 0.80, 0, 40)  # push up to 40pt
+                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.75, 0, 45)  # push up to 45pt
                 corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
                     corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
                 )
                 print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} dark pixels boosted (ref_lum={ref_lum_mean:.1f})")
 
-        # Widen blend zone (51px) to catch transparent shoulder/sleeve boundary regions
-        blend_mask    = cv2.GaussianBlur(msk_np, (51, 51), 10)  # wider: 31→51px catches shoulder transparency edges
+        # === Final pass: For white garment, flatten residual blue saturation directly in RGB ===
+        if is_white_garm:
+            mask_pix_r = corrected_rgb[mask_bool, 0]
+            mask_pix_g = corrected_rgb[mask_bool, 1]
+            mask_pix_b = corrected_rgb[mask_bool, 2]
+            lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
+            blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
+            blue_sel   = blue_bias > 8  # pixels with meaningful blue excess
+            if blue_sel.sum() > 0:
+                blend_str = np.clip(blue_bias[blue_sel] / 40.0, 0, 0.65)  # 0–65% desaturation
+                r_idx, c_idx = np.where(mask_bool)
+                r_blue = r_idx[blue_sel]
+                c_blue = c_idx[blue_sel]
+                lum_b  = lum_pix[blue_sel]
+                for ch in range(3):
+                    ch_vals = corrected_rgb[r_blue, c_blue, ch]
+                    corrected_rgb[r_blue, c_blue, ch] = ch_vals * (1 - blend_str) + lum_b * blend_str
+                print(f"   [COLOR] Blue-desaturation pass: {blue_sel.sum()} blue-biased pixels flattened toward white")
+
+        # Blend zone: 19px tight feather — avoids the 51px halo while still blending mask boundary
+        blend_mask    = cv2.GaussianBlur(msk_np, (19, 19), 4)   # tightened: 51→19px kills white halo glow
         blend_mask_3d = np.stack([blend_mask]*3, axis=-1)
 
         result_float = corrected_rgb * blend_mask_3d + gen_np * (1.0 - blend_mask_3d)
