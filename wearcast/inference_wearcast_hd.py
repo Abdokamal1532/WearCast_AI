@@ -444,7 +444,7 @@ class WearCastHD:
             
             # Blend: inside mask -> sharpened; outside mask -> original (gradual via hard_3d)
             final_arr = sharp_arr * hard_3d + final_arr * (1.0 - hard_3d)
-            print(f"   [COMPOSITE] USM sharpening applied inside mask (amount=0.85, k=7×7)")
+            print(f"   [COMPOSITE] USM sharpening applied inside mask (amount=1.20, k=5×5, σ=1.0)")
 
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
             print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
@@ -526,11 +526,11 @@ class WearCastHD:
             gen_std  = gen_hsv[mask_bool,  channel].std() + 1e-6
             garm_std = garm_hsv[valid_garm, channel].std() + 1e-6
 
-            if channel == 2:  # V — boost only, but cap aggressively to prevent glowing white shirt
-                ratio_std  = max(min(garm_std / gen_std, 1.30), 0.75)  # wider range: compresses muddy mid-tone spread to crisp white
-                # Cap shift: product-image brightness gap is expected (studio vs body shadows)
-                # 0.35 * gap capped at 22 prevents unnatural shirt glow while still correcting hue
-                shift_mean = min((garm_mean - gen_mean) * 0.90, 55.0)  # gap=37.8 → shift=34pt → target ~226 → true white
+            if channel == 2:  # V — brightness: NEVER compress (ratio floor=1.0), always boost toward reference
+                ratio_std  = max(min(garm_std / gen_std, 1.30), 1.00)  # floor at 1.0: never compress V → prevents gray shirt
+                # Only apply positive shift (never darken the shirt further)
+                raw_shift  = (garm_mean - gen_mean) * 0.90
+                shift_mean = min(max(raw_shift, 0.0), 55.0)  # clamp [0, 55]: only boost, never darken
             else:             # S — boost vibrancy of graphic colors
                 ratio_std  = min(garm_std / gen_std, 1.60)  # raised cap: allows full color vibrancy of blue/red/yellow illustration
                 shift_mean = (garm_mean - gen_mean) * 0.90  # slightly stronger saturation pull
@@ -543,7 +543,25 @@ class WearCastHD:
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
-        blend_mask    = cv2.GaussianBlur(msk_np, (31, 31), 6)  # tightened from 61px — stops color bleeding onto skin
+        # === Extra pass: direct RGB luminance rescue for still-dark mask pixels ===
+        # If pixels inside the mask are still darker than 200 (gray zone) but the reference
+        # garment is bright white (>220), push them up directly in RGB space.
+        # This catches pixels where the HSV ratio alone wasn't sufficient.
+        ref_lum_mean = garm_hsv[valid_garm, 2].mean()
+        if ref_lum_mean > 200:  # reference is a white/light garment
+            rgb_lum = corrected_rgb[mask_bool].mean(axis=-1)  # per-pixel luminance in mask
+            dark_pixels = rgb_lum < 210  # still too gray
+            dark_idx = np.where(mask_bool)  # (row_arr, col_arr)
+            dark_sel = dark_pixels  # bool selector over mask pixels
+            if dark_sel.sum() > 0:
+                boost = np.clip((210 - rgb_lum[dark_sel]) * 0.80, 0, 40)  # push up to 40pt
+                corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
+                    corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
+                )
+                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} dark pixels boosted (ref_lum={ref_lum_mean:.1f})")
+
+        # Widen blend zone (51px) to catch transparent shoulder/sleeve boundary regions
+        blend_mask    = cv2.GaussianBlur(msk_np, (51, 51), 10)  # wider: 31→51px catches shoulder transparency edges
         blend_mask_3d = np.stack([blend_mask]*3, axis=-1)
 
         result_float = corrected_rgb * blend_mask_3d + gen_np * (1.0 - blend_mask_3d)
