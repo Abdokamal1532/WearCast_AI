@@ -428,8 +428,8 @@ class WearCastHD:
 
             if n_target > 100:
                 current_val = val_channel[correction_target]
-                # Gentle boost: pull gray values toward 235 (bright white)
-                brightness_boost = np.clip((235.0 - current_val) * 0.5, 0, 35)
+                # Strong boost: pull gray values toward 240 (bright white)
+                brightness_boost = np.clip((240.0 - current_val) * 0.7, 0, 50)
                 val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
                 gen_hsv[:, :, 2] = val_channel
 
@@ -451,8 +451,8 @@ class WearCastHD:
         # --- Step 3/3: Alpha Compositing ---
         print(f"\n -> Step 3/3: Alpha compositing with original background...")
 
-        # Feathered blend: 31px Gaussian feather for imperceptible seam
-        alpha    = cv2.GaussianBlur(hull_arr, (31, 31), 15.0) / 255.0
+        # Feathered blend: 21px Gaussian feather — tight enough to avoid visible halo
+        alpha    = cv2.GaussianBlur(hull_arr, (21, 21), 8.0) / 255.0
         alpha_3d = np.stack([alpha] * 3, axis=-1)
 
         final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
