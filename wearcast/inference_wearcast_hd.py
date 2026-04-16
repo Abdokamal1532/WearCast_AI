@@ -327,93 +327,47 @@ class WearCastHD:
 
             # --- Step 1: Color Correction ---
             print(" -> Step 1/2: Local color correction...")
-            t0 = time.time()
-            color_fixed = self.local_color_correction(
-                generated=raw_generated,
-                original_garment=image_garm,
-                mask_hard=self._cached_hard_mask if hasattr(self, '_cached_hard_mask') else mask
-            )
-            print(f" -> [SUCCESS] Color correction completed in {time.time()-t0:.2f}s")
-            color_fixed.save("debug_color_corrected.jpg")
-            print(f" -> [SAVED] Color-corrected image saved to: debug_color_corrected.jpg")
+        # =====================================================================
+        # Phase 4: Final Post-processing (Simplified Photorealistic Blend)
+        # =====================================================================
+        print("\n[WearCast] Phase 4/4: Final Post-processing...")
+        raw_generated = images[0]
+        raw_generated.save("debug_raw_unet_output.jpg")
+        print(f" -> [SAVED] Raw UNet output saved to: debug_raw_unet_output.jpg")
+        print(f" -> UNet Generated Target Size: {raw_generated.size}")
 
-            # --- Step 2: Strict Background-Clean Alpha Composite ---
-            # === FIX B: REPLACES Laplacian blend — eliminates white halo ===
-            # Root cause of halo: Laplacian pyramid at 5 levels, coarsest level (64x48) covers
-            # 16×16 original pixels per cell, spreading the blend zone 16–32px outside the mask.
-            # Solution: (A) strictly copy original background into generated image BEFORE blend;
-            #           (B) apply only a narrow 9px soft alpha at the exact boundary.
-            print(" -> Step 2/2: Strict background-clean alpha compositing...")
+        print(" -> Step 1/1: Strict background-clean alpha compositing...")
+        t0_parse = time.time()
+        
+        # OOTD UNet generates the garment AND necessary skin (arms/shoulders) inside the hull.
+        # We simply blend the UNet output with the original image to preserve the crisp
+        # background, using a feathered version of the exact inpaint hull.
+        
+        gen_arr = np.array(raw_generated).astype(np.float32)
+        ori_arr = np.array(image_ori).astype(np.float32)
+        if ori_arr.shape[:2] != gen_arr.shape[:2]:
+            ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-            # Resolve the hard mask: to completely eliminate synthetic background (the "halo"),
-            # we run parsing on the UNet output to get the exactly-drawn garment silhouette,
-            # then intersect it with the in-paint convex hull.
-            print("   [COMPOSITE] Running precise semantic segmentation on generated garment...")
-            t0_parse = time.time()
-            gen_parse, _ = self.parsing_model(raw_generated)
-            gen_parse_arr = np.array(gen_parse)
-            
-            if category == 'upperbody':
-                gen_mask = ((gen_parse_arr == 4) | (gen_parse_arr == 7)).astype(np.uint8) * 255
-            elif category == 'lowerbody':
-                gen_mask = ((gen_parse_arr == 5) | (gen_parse_arr == 6) | (gen_parse_arr == 12) | (gen_parse_arr == 13)).astype(np.uint8) * 255
-            elif category == 'dress':
-                gen_mask = ((gen_parse_arr == 4) | (gen_parse_arr == 5) | (gen_parse_arr == 6) | (gen_parse_arr == 7)).astype(np.uint8) * 255
-            else:
-                gen_mask = ((gen_parse_arr == 4)).astype(np.uint8) * 255
-                
-            # FIX 4: Union (OR) instead of intersection (AND) to prevent the original
-            # white tank-top from bleeding through pixels that are in the hull but outside
-            # the predicted silhouette. The hull is dilated 5px before the union to avoid
-            # over-bleeding while ensuring full sleeve/shoulder coverage.
-            gen_mask = cv2.dilate(gen_mask, np.ones((3, 3), np.uint8), iterations=1)
-            
-            if hasattr(self, '_cached_hard_mask'):
-                # FIX-A: BILINEAR resize (was NEAREST) eliminates the staircase pixel-block
-                # edge caused by upscaling a 384×512 binary mask to 768×1024. BILINEAR
-                # produces smooth sub-pixel transitions at the garment boundary.
-                hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR))
-            else:
-                hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
+        # Get the original inpaint hull
+        if hasattr(self, '_cached_hard_mask'):
+            hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)).astype(np.float32)
+        else:
+            hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.float32) * 255.0
 
-            # HYBRID Strategy: eroded_hull + segmentation
-            # - Eroded hull (7px inward) covers the Interior — no shoulder holes
-            # - Segmented silhouette (7px dilation) covers the Boundary — no halo
-            # - Final intersection with hull ensures no overflow
-            seg_dilated  = cv2.dilate(gen_mask, np.ones((7, 7), np.uint8), iterations=1)
-            hull_binary  = (hull_arr > 127).astype(np.uint8) * 255
-            hull_eroded  = cv2.erode(hull_binary, np.ones((7, 7), np.uint8), iterations=1)
-            # Union of eroded hull (safe interior) + dilated segmentation (precise boundary)
-            mask_combined = np.maximum(hull_eroded, seg_dilated)
-            # Clip to hull to prevent any overflow
-            mask_np_hard  = np.minimum(mask_combined, hull_binary)
-            print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
-            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Eroded={100*(hull_eroded>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final={100*(mask_np_hard>127).mean():.1f}%")
+        # Wide 31px Gaussian feather (sigma 15) for an imperceptible seam between
+        # the UNet output and the untouched high-res original background.
+        alpha    = cv2.GaussianBlur(hull_arr, (31, 31), 15.0) / 255.0
+        alpha_3d = np.stack([alpha] * 3, axis=-1)
+        
+        final_arr = gen_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
+        final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+        
+        print(f"   [COMPOSITE] Photorealistic blend completed in {time.time()-t0_parse:.2f}s")
+        final_image.save("debug_final_output.jpg")
+        print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
 
-
-            t0 = time.time()
-
-            gen_arr = np.array(color_fixed).astype(np.float32)
-            ori_arr = np.array(image_ori).astype(np.float32)
-            if ori_arr.shape[:2] != gen_arr.shape[:2]:
-                ori_arr = np.array(image_ori.resize(color_fixed.size, Image.BICUBIC)).astype(np.float32)
-                print(f"   [COMPOSITE] Resized original to {ori_arr.shape[:2]}")
-
-            # Soft alpha composite with wide feather for photorealistic blending.
-            # 31px Gaussian (sigma=10) creates a smooth ~15px fade zone at the boundary.
-            hard_f   = (mask_np_hard > 127).astype(np.float32)
-            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (31, 31), 10.0) / 255.0
-            alpha_3d = np.stack([alpha] * 3, axis=-1)
-            final_arr = gen_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (31px feather)")
-
-            final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
-            print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
-            final_image.save("debug_final_output.jpg")
-            print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
-
-            print("\n[WearCast] SUCCESS: Inference completed successfully!")
-            print("=" * 70)
+        print("\n[WearCast] SUCCESS: Inference completed successfully!")
+        print("=" * 70)
 
         return [final_image]
 
