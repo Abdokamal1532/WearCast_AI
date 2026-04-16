@@ -376,20 +376,19 @@ class WearCastHD:
             else:
                 hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
 
-            # Use the HULL mask (inpaint area) for compositing, dilated slightly
-            # to cover any sub-pixel gaps. The hull defines exactly where the UNet
-            # was told to generate — every pixel inside it should come from the UNet.
-            #
-            # Strategy: INTERSECT(dilated_segmentation, hull)
-            # - Dilate segmentation aggressively (15px) to cover shoulder/sleeve gaps
-            # - Intersect with hull to BOUND it — prevents compositing UNet-generated
-            #   background over the real background (which caused the white halo)
-            seg_dilated  = cv2.dilate(gen_mask, np.ones((15, 15), np.uint8), iterations=1)
+            # HYBRID Strategy: eroded_hull + segmentation
+            # - Eroded hull (7px inward) covers the Interior — no shoulder holes
+            # - Segmented silhouette (7px dilation) covers the Boundary — no halo
+            # - Final intersection with hull ensures no overflow
+            seg_dilated  = cv2.dilate(gen_mask, np.ones((7, 7), np.uint8), iterations=1)
             hull_binary  = (hull_arr > 127).astype(np.uint8) * 255
-            # Intersection: dilated segmentation bounded by the hull
-            mask_np_hard = np.minimum(seg_dilated, hull_binary)
+            hull_eroded  = cv2.erode(hull_binary, np.ones((7, 7), np.uint8), iterations=1)
+            # Union of eroded hull (safe interior) + dilated segmentation (precise boundary)
+            mask_combined = np.maximum(hull_eroded, seg_dilated)
+            # Clip to hull to prevent any overflow
+            mask_np_hard  = np.minimum(mask_combined, hull_binary)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
-            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (intersect)={100*(mask_np_hard>127).mean():.1f}%")
+            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Eroded={100*(hull_eroded>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Final={100*(mask_np_hard>127).mean():.1f}%")
 
 
             t0 = time.time()
@@ -547,10 +546,9 @@ class WearCastHD:
 
         corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
 
-        # === Extra pass: RGB luminance rescue — ONLY for near-white (low-saturation) mask pixels ===
-        # GUARD: skip pixels with high saturation — those are graphic/illustration elements.
-        # A dark pixel with high S is part of the colored artwork; boosting it would wash out graphic.
-        if ref_lum_mean > 200:  # reference is a white/light garment
+        # Luminance rescue disabled — brightness shift already handles white correction.
+        # The rescue was over-modifying 70%+ of mask pixels.
+        if False and ref_lum_mean > 200:  # reference is a white/light garment
             mask_r = corrected_rgb[mask_bool, 0]
             mask_g = corrected_rgb[mask_bool, 1]
             mask_b = corrected_rgb[mask_bool, 2]
