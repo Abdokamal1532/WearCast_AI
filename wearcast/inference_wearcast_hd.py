@@ -379,13 +379,17 @@ class WearCastHD:
             # Use the HULL mask (inpaint area) for compositing, dilated slightly
             # to cover any sub-pixel gaps. The hull defines exactly where the UNet
             # was told to generate — every pixel inside it should come from the UNet.
-            # Using segmentation-only caused shoulder holes (16.6% vs 20% hull coverage).
-            seg_dilated  = cv2.dilate(gen_mask, np.ones((7, 7), np.uint8), iterations=1)
-            # Union of hull + segmentation: covers both the geometric inpaint area
-            # AND any pixels the parser detected as garment
-            mask_np_hard = np.maximum(seg_dilated, (hull_arr > 127).astype(np.uint8) * 255)
+            #
+            # Strategy: INTERSECT(dilated_segmentation, hull)
+            # - Dilate segmentation aggressively (15px) to cover shoulder/sleeve gaps
+            # - Intersect with hull to BOUND it — prevents compositing UNet-generated
+            #   background over the real background (which caused the white halo)
+            seg_dilated  = cv2.dilate(gen_mask, np.ones((15, 15), np.uint8), iterations=1)
+            hull_binary  = (hull_arr > 127).astype(np.uint8) * 255
+            # Intersection: dilated segmentation bounded by the hull
+            mask_np_hard = np.minimum(seg_dilated, hull_binary)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
-            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (union)={100*(mask_np_hard>127).mean():.1f}%")
+            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (intersect)={100*(mask_np_hard>127).mean():.1f}%")
 
 
             t0 = time.time()
@@ -396,21 +400,13 @@ class WearCastHD:
                 ori_arr = np.array(image_ori.resize(color_fixed.size, Image.BICUBIC)).astype(np.float32)
                 print(f"   [COMPOSITE] Resized original to {ori_arr.shape[:2]}")
 
-            # Unified single-step soft composite: Step A (binary hard cut) REMOVED.
-            # Root cause of blocky border: binary cut created a hard rectangular edge
-            # that the 31px feather could not fully conceal — the two steps conflicted.
-            # Root cause of arm skin patches: feather zone bled into arm pixels,
-            # blending generated (white shirt) with original (skin) = brownish artifact.
-            # Fix: single Gaussian alpha (21px sigma=7) is the ONLY boundary.
-            # Pixels well inside mask: alpha≈1.0 → pure generated shirt.
-            # Pixels well outside mask: alpha≈0.0 → pure original person.
-            # Boundary (21px band): smooth photorealistic fade. No hard edges anywhere.
-            hard_f   = (mask_np_hard > 127).astype(np.float32)  # kept for USM blend only
-            hard_3d  = np.stack([hard_f] * 3, axis=-1)
-            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (21, 21), 7.0) / 255.0
+            # Soft alpha composite with wide feather for photorealistic blending.
+            # 31px Gaussian (sigma=10) creates a smooth ~15px fade zone at the boundary.
+            hard_f   = (mask_np_hard > 127).astype(np.float32)
+            alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (31, 31), 10.0) / 255.0
             alpha_3d = np.stack([alpha] * 3, axis=-1)
-            final_arr = np.array(color_fixed).astype(np.float32) * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (21px feather)")
+            final_arr = gen_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
+            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (31px feather)")
 
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
             print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
