@@ -376,16 +376,16 @@ class WearCastHD:
             else:
                 hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.uint8) * 255
 
-            # FIX-FINAL: Use ONLY the semantic silhouette for the composite (not the hull).
-            # The geometric hull is for Phase 1 INPAINTING (tells UNet where to generate).
-            # For the Phase 4 COMPOSITE it creates ghost wings — every hull pixel outside
-            # the real shirt gets a partial alpha and shows as transparent shirt over BG.
-            # Semantic parser gives the tight, precise shirt boundary. 7px dilation covers
-            # sub-pixel gaps at the garment boundary without creating phantom areas.
+            # Use the HULL mask (inpaint area) for compositing, dilated slightly
+            # to cover any sub-pixel gaps. The hull defines exactly where the UNet
+            # was told to generate — every pixel inside it should come from the UNet.
+            # Using segmentation-only caused shoulder holes (16.6% vs 20% hull coverage).
             seg_dilated  = cv2.dilate(gen_mask, np.ones((7, 7), np.uint8), iterations=1)
-            mask_np_hard = seg_dilated   # pure semantic — no hull bleed
+            # Union of hull + segmentation: covers both the geometric inpaint area
+            # AND any pixels the parser detected as garment
+            mask_np_hard = np.maximum(seg_dilated, (hull_arr > 127).astype(np.uint8) * 255)
             print(f"   [COMPOSITE] Exact silhouette extracted in {time.time()-t0_parse:.2f}s ")
-            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (seg+7px)={100*(mask_np_hard>127).mean():.1f}%")
+            print(f"   [COMPOSITE] Hull={100*(hull_arr>127).mean():.1f}% | Silhouette={100*(gen_mask>127).mean():.1f}% | Composite Mask (union)={100*(mask_np_hard>127).mean():.1f}%")
 
 
             t0 = time.time()
@@ -410,18 +410,7 @@ class WearCastHD:
             alpha    = cv2.GaussianBlur(mask_np_hard.astype(np.float32), (21, 21), 7.0) / 255.0
             alpha_3d = np.stack([alpha] * 3, axis=-1)
             final_arr = np.array(color_fixed).astype(np.float32) * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (21px feather, no binary cut)")
-
-            # === FIX 6: USM Sharpening — reduced from 2.5× to 2.0× to eliminate ringing
-            # at graphic/shirt boundary. Blend uses a 7px soft zone instead of hard_3d
-            # to prevent a visible seam between sharpened and unsharpened regions.
-            blurred_arr  = cv2.GaussianBlur(final_arr.astype(np.float32), (5, 5), 0.8)
-            sharp_arr    = np.clip(2.0 * final_arr - 1.0 * blurred_arr, 0, 255)  # was 2.5/1.5
-            # Soft blend mask: 7px feather prevents hard seam at mask boundary
-            usm_soft_blend   = cv2.GaussianBlur(hard_f.astype(np.float32), (7, 7), 2.0)
-            usm_soft_blend_3d = np.stack([usm_soft_blend] * 3, axis=-1)
-            final_arr = sharp_arr * usm_soft_blend_3d + final_arr * (1.0 - usm_soft_blend_3d)
-            print(f"   [COMPOSITE] USM sharpening applied (amount=1.0, k=5×5, σ=0.8, soft-blend 7px)")
+            print(f"   [COMPOSITE] Unified soft composite: coverage={hard_f.mean()*100:.1f}%  alpha_mean={alpha.mean():.4f}  (21px feather)")
 
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
             print(f"   [COMPOSITE] Completed in {time.time()-t0:.2f}s")
@@ -510,10 +499,8 @@ class WearCastHD:
         gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
-        raw_shift_v = (garm_mean_v - gen_mean_v) * 0.90
-        # FIX-C: raise cap 55→70 so large brightness gaps (e.g. Gen=184 vs Ref=229)
-        # are fully corrected rather than being capped and leaving a pink/grey cast.
-        shift_v     = min(max(raw_shift_v, 0.0), 70.0)              # only boost, never darken
+        raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
+        shift_v     = min(max(raw_shift_v, 0.0), 30.0)              # only boost, never darken; cap at 30
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
@@ -583,9 +570,7 @@ class WearCastHD:
             dark_idx = np.where(mask_bool)
             dark_sel = dark_and_light
             if dark_sel.sum() > 0:
-                # FIX-C: target 230 (was 220) and multiplier 1.0 (was 0.75), cap 60 (was 40)
-                # to ensure shirt background reaches clean white (≥230 luminance).
-                boost = np.clip((230 - rgb_lum[dark_sel]) * 1.0, 0, 60)
+                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.6, 0, 30)
                 corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
                     corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
                 )
@@ -603,7 +588,7 @@ class WearCastHD:
             # GUARD: lum>210 = truly near-white only. Protects blue collar/trim (darker blue, lum<210)
             blue_sel   = (blue_bias > 10) & (lum_pix > 210)
             if blue_sel.sum() > 0:
-                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.55)  # gentler: max 55% desaturation
+                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.35)  # gentle: max 35% desaturation
                 r_idx, c_idx = np.where(mask_bool)
                 r_blue = r_idx[blue_sel]
                 c_blue = c_idx[blue_sel]
