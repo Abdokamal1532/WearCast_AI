@@ -253,34 +253,69 @@ class WearCastHD:
         print(f"\n[WearCast] Phase 2/4: Encoding Inputs (VAE & Multi-Scale CLIP Vision)...")
         with torch.no_grad():
             from PIL import ImageEnhance
+
+            # --- 2a. Adaptive Background Detection ---
             garm_np = np.array(image_garm.copy())
-            bg_mask = np.all(garm_np >= 250, axis=-1)  # 250: only pure-white product-photo BG, not shirt body
-            bg_coverage = bg_mask.mean()
-            print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% pure-white pixels (threshold >=250, 5% min)")
+
+            # Try multiple thresholds to find the product-photo background
+            for bg_thresh in [250, 245, 240]:
+                bg_mask = np.all(garm_np >= bg_thresh, axis=-1)
+                bg_coverage = bg_mask.mean()
+                print(f"   [BG-DETECT] Threshold>={bg_thresh}: {100*bg_coverage:.1f}% pixels")
+                if bg_coverage > 0.05:
+                    break
+
+            print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% BG pixels (selected threshold>={bg_thresh})")
 
             if bg_coverage > 0.05:
-                print(f" -> White product background detected ({100*bg_coverage:.1f}% coverage), replacing with light-gray for CLIP...")
+                print(f" -> White product background detected ({100*bg_coverage:.1f}%), replacing with neutral gray for CLIP...")
                 garm_np_proc = garm_np.copy()
-                garm_np_proc[bg_mask] = [180, 180, 180]  # lighter gray to avoid biasing white garment embeddings
+                garm_np_proc[bg_mask] = [170, 170, 170]
                 garm_proc = Image.fromarray(garm_np_proc)
+                garm_proc.save("debug_phase2_clip_bg_replaced.jpg")
+                print(f" -> [SAVED] CLIP input (BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
             else:
+                print(f" -> No significant white BG detected. Using original garment for CLIP.")
                 garm_proc = image_garm.copy()
 
-            # Mild sharpness + contrast boost for richer texture features
+            # Save the original garment for reference comparison
+            image_garm.save("debug_phase2_garment_original.jpg")
+            print(f" -> [SAVED] Original garment saved to: debug_phase2_garment_original.jpg")
+
+            # --- 2b. Garment Enhancement for CLIP ---
             garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
             garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
-            print(f" -> Garment CLIP features extracted with enhanced preprocessing.")
+            garm_enhanced.save("debug_phase2_clip_enhanced.jpg")
+            print(f" -> [SAVED] CLIP enhanced garment saved to: debug_phase2_clip_enhanced.jpg")
 
-            # Original OOTD 2-token encoding: [null_text_token, garment_CLIP_embedding]
+            # --- 2c. CLIP Encoding ---
             prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
             prompt_image = self.image_encoder(prompt_image.data['pixel_values'].to(dtype=torch.float16)).image_embeds
+            clip_norm = prompt_image.float().norm().item()
+            clip_std  = prompt_image.float().std().item()
             prompt_image = prompt_image.unsqueeze(1)  # [1, 768] -> [1, 1, 768]
-            print(f" -> CLIP image_embeds shape: {list(prompt_image.shape)}")
+            print(f" -> CLIP image_embeds shape: {list(prompt_image.shape)} | norm={clip_norm:.2f} | std={clip_std:.4f}")
 
             prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
-            prompt_embeds[:, 1:] = prompt_image[:]  # Replace 2nd token with garment embedding
+            prompt_embeds[:, 1:] = prompt_image[:]
             print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (2 tokens: null_text + garment_CLIP)")
             _dbg_tensor("prompt_embeds", prompt_embeds)
+
+            # --- 2d. VAE Garment Fidelity Check ---
+            # Encode garment through VAE and decode back to check reconstruction quality
+            print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
+            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float16)
+            garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
+            garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
+            # Undo: [-1,1] -> [0,255]
+            garm_rt_np = ((garm_roundtrip[0].float().cpu().clamp(-1, 1) + 1) / 2 * 255).byte().permute(1, 2, 0).numpy()
+            Image.fromarray(garm_rt_np).save("debug_phase2_vae_roundtrip.jpg")
+            # Compute PSNR between original and roundtrip
+            garm_orig_resized = np.array(image_garm.resize((garm_rt_np.shape[1], garm_rt_np.shape[0]))).astype(np.float32)
+            mse_val = np.mean((garm_orig_resized - garm_rt_np.astype(np.float32))**2)
+            psnr_val = 10 * np.log10(255**2 / max(mse_val, 1e-6))
+            print(f"   [VAE FIDELITY] Garment VAE round-trip PSNR: {psnr_val:.1f} dB (>30=good, >35=excellent)")
+            print(f"   [VAE FIDELITY] [SAVED] debug_phase2_vae_roundtrip.jpg")
 
             # =========================================================
             # PHASE 3 — Denoising Diffusion
@@ -291,6 +326,14 @@ class WearCastHD:
             mask_diagnostic = (np.array(mask) * 255).astype(np.uint8)
             Image.fromarray(mask_diagnostic).save("debug_final_unet_mask.jpg")
             print(f" -> [SAVED] Final UNet mask saved to: debug_final_unet_mask.jpg")
+
+            # Save masked person image (what the UNet receives as context)
+            mask_np_vis = np.array(mask.resize(image_vton.size, Image.NEAREST))
+            vton_np = np.array(image_vton)
+            masked_person_vis = vton_np.copy()
+            masked_person_vis[mask_np_vis > 127] = [0, 0, 0]  # black out masked region
+            Image.fromarray(masked_person_vis).save("debug_phase3_masked_person.jpg")
+            print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -318,36 +361,19 @@ class WearCastHD:
             print(f" -> Denoising loop elapsed    : {t_unet_end - t_unet_start:.2f}s")
             print(f" -> Pipeline returned {len(images)} image(s)")
 
-            # =========================================================
-            # PHASE 4 — Post-Processing
-            # =========================================================
-            print(f"\n[WearCast] Phase 4/4: Final Post-processing...")
-
-            raw_generated = images[0]
-            raw_generated.save("debug_raw_unet_output.jpg")
-            print(f" -> [SAVED] Raw UNet output saved to: debug_raw_unet_output.jpg")
-            print(f" -> UNet Generated Target Size: {raw_generated.size}")
-
-            # --- Step 1: Color Correction ---
-            print(" -> Step 1/2: Local color correction...")
         # =====================================================================
-        # Phase 4: Final Post-processing (Simplified Photorealistic Blend)
+        # Phase 4: Final Post-processing
         # =====================================================================
-        print("\n[WearCast] Phase 4/4: Final Post-processing...")
+        print(f"\n[WearCast] Phase 4/4: Final Post-processing...")
         raw_generated = images[0]
-        raw_generated.save("debug_raw_unet_output.jpg")
-        print(f" -> [SAVED] Raw UNet output saved to: debug_raw_unet_output.jpg")
+        raw_generated.save("debug_phase4_raw_unet_output.jpg")
+        print(f" -> [SAVED] Raw UNet output saved to: debug_phase4_raw_unet_output.jpg")
         print(f" -> UNet Generated Target Size: {raw_generated.size}")
 
-        print(" -> Step 1/1: Strict background-clean alpha compositing...")
-        t0_parse = time.time()
-        
-        # OOTD UNet generates the garment AND necessary skin (arms/shoulders) inside the hull.
-        # We simply blend the UNet output with the original image to preserve the crisp
-        # background, using a feathered version of the exact inpaint hull.
-        
         gen_arr = np.array(raw_generated).astype(np.float32)
         ori_arr = np.array(image_ori).astype(np.float32)
+        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
+        t0_parse = time.time()
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
@@ -357,17 +383,117 @@ class WearCastHD:
         else:
             hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.float32) * 255.0
 
-        # Wide 31px Gaussian feather (sigma 15) for an imperceptible seam between
-        # the UNet output and the untouched high-res original background.
+        mask_bool = hull_arr > 127
+
+        # --- Step 1/3: Color Diagnostics (before any correction) ---
+        print(f"\n   [COLOR DIAG] === Per-Channel Analysis (Mask Region) ===")
+        gen_in_mask   = gen_arr[mask_bool]
+        garm_fg_mask  = np.all(garm_arr >= 240, axis=-1)
+        garm_fg_valid = ~garm_fg_mask  # foreground (non-BG) pixels of garment
+        for ch, ch_name in enumerate(['Red', 'Green', 'Blue']):
+            gen_ch_mean  = gen_in_mask[:, ch].mean() if len(gen_in_mask) > 0 else 0
+            gen_ch_std   = gen_in_mask[:, ch].std() if len(gen_in_mask) > 0 else 0
+            garm_ch_mean = garm_arr[garm_fg_valid, ch].mean() if garm_fg_valid.sum() > 0 else 0
+            garm_ch_std  = garm_arr[garm_fg_valid, ch].std() if garm_fg_valid.sum() > 0 else 0
+            delta = gen_ch_mean - garm_ch_mean
+            print(f"   [COLOR DIAG]   {ch_name:5s}: Garment FG mean={garm_ch_mean:.1f}±{garm_ch_std:.1f} | UNet output mean={gen_ch_mean:.1f}±{gen_ch_std:.1f} | Δ={delta:+.1f}")
+
+        gen_lum_mask  = gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114
+        garm_lum_fg   = garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114
+        print(f"   [COLOR DIAG]   Lum  : Garment FG mean={garm_lum_fg.mean():.1f} | UNet output mean={gen_lum_mask.mean():.1f} | Δ={gen_lum_mask.mean()-garm_lum_fg.mean():+.1f}")
+
+        # Detect the white-garment problem: if garment is bright but output is dim
+        is_white_garment = garm_lum_fg.mean() > 170 if len(garm_lum_fg) > 0 else False
+        lum_deficit = garm_lum_fg.mean() - gen_lum_mask.mean() if len(garm_lum_fg) > 0 else 0
+        print(f"   [COLOR DIAG]   White garment={is_white_garment} | Luminance deficit={lum_deficit:.1f}")
+
+        # --- Step 2/3: Targeted White-Base Brightness Correction ---
+        print(f"\n -> Step 2/3: Targeted brightness correction...")
+        corrected_arr = gen_arr.copy()
+
+        if is_white_garment and lum_deficit > 10:
+            # Convert to HSV for saturation-aware correction
+            gen_hsv = cv2.cvtColor(gen_arr.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+            sat_channel  = gen_hsv[:, :, 1]  # 0-255
+            val_channel  = gen_hsv[:, :, 2]  # 0-255
+
+            # ONLY boost near-white (low saturation) pixels — protect ALL colorful graphics
+            # S < 50 → near-white/gray shirt body. High S = blue collar, red text, yellow art.
+            low_sat_mask = sat_channel < 50
+            correction_target = mask_bool & low_sat_mask
+
+            n_target = correction_target.sum()
+            n_mask_total = mask_bool.sum()
+            print(f"   [WHITE FIX] Correction targets: {n_target} px ({100*n_target/max(n_mask_total,1):.1f}% of mask, all have S<50)")
+
+            if n_target > 100:
+                current_val = val_channel[correction_target]
+                # Gentle boost: pull gray values toward 235 (bright white)
+                brightness_boost = np.clip((235.0 - current_val) * 0.5, 0, 35)
+                val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
+                gen_hsv[:, :, 2] = val_channel
+
+                # Also slightly desaturate any residual blue/purple tint in these white areas
+                sat_channel[correction_target] = np.clip(sat_channel[correction_target] * 0.6, 0, 255)
+                gen_hsv[:, :, 1] = sat_channel
+
+                corrected_arr = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+                print(f"   [WHITE FIX] Applied brightness boost (avg={brightness_boost.mean():.1f}) + desaturation to {n_target} pixels")
+
+                # Save the correction result
+                Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)).save("debug_phase4_color_corrected.jpg")
+                print(f"   [WHITE FIX] [SAVED] debug_phase4_color_corrected.jpg")
+            else:
+                print(f"   [WHITE FIX] Skipped: too few target pixels ({n_target})")
+        else:
+            print(f"   [WHITE FIX] Skipped: not a white garment or luminance deficit too small ({lum_deficit:.1f})")
+
+        # --- Step 3/3: Alpha Compositing ---
+        print(f"\n -> Step 3/3: Alpha compositing with original background...")
+
+        # Feathered blend: 31px Gaussian feather for imperceptible seam
         alpha    = cv2.GaussianBlur(hull_arr, (31, 31), 15.0) / 255.0
         alpha_3d = np.stack([alpha] * 3, axis=-1)
-        
-        final_arr = gen_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
+
+        final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
         final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
-        
+
+        # Save alpha mask visualization
+        alpha_vis = (alpha * 255).astype(np.uint8)
+        Image.fromarray(alpha_vis).save("debug_phase4_alpha_mask.jpg")
+        print(f"   [COMPOSITE] [SAVED] Alpha mask: debug_phase4_alpha_mask.jpg")
+
+        # Save side-by-side comparison: original garment | raw UNet | final
+        comparison_w = raw_generated.size[0] * 3
+        comparison = Image.new('RGB', (comparison_w, raw_generated.size[1]))
+        comparison.paste(image_garm.resize(raw_generated.size), (0, 0))
+        comparison.paste(raw_generated, (raw_generated.size[0], 0))
+        comparison.paste(final_image, (raw_generated.size[0] * 2, 0))
+        comparison.save("debug_phase4_comparison.jpg")
+        print(f"   [COMPOSITE] [SAVED] Side-by-side comparison: debug_phase4_comparison.jpg")
+
+        # Post-correction color diagnostics
+        final_np = np.array(final_image).astype(np.float32)
+        final_in_mask = final_np[mask_bool]
+        final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114
+        print(f"   [COMPOSITE] Final luminance in mask: mean={final_lum.mean():.1f} (target≈{garm_lum_fg.mean():.1f})")
         print(f"   [COMPOSITE] Photorealistic blend completed in {time.time()-t0_parse:.2f}s")
+
         final_image.save("debug_final_output.jpg")
         print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
+
+        print(f"\n   [SUMMARY] Debug images saved:")
+        print(f"     1. debug_phase2_garment_original.jpg    — Input garment")
+        print(f"     2. debug_phase2_clip_bg_replaced.jpg    — CLIP input (BG neutralized)")
+        print(f"     3. debug_phase2_clip_enhanced.jpg       — CLIP input (sharpened+contrast)")
+        print(f"     4. debug_phase2_vae_roundtrip.jpg       — VAE encode→decode fidelity")
+        print(f"     5. debug_phase3_masked_person.jpg       — Person with mask applied")
+        print(f"     6. debug_final_unet_mask.jpg            — Binary mask for UNet")
+        print(f"     7. debug_phase4_raw_unet_output.jpg     — Raw UNet output (no correction)")
+        print(f"     8. debug_phase4_color_corrected.jpg     — After white-base correction")
+        print(f"     9. debug_phase4_alpha_mask.jpg           — Feathered blend mask")
+        print(f"    10. debug_phase4_comparison.jpg          — Garment | Raw UNet | Final")
+        print(f"    11. debug_final_output.jpg               — Final result")
 
         print("\n[WearCast] SUCCESS: Inference completed successfully!")
         print("=" * 70)
