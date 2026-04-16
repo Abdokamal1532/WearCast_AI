@@ -93,16 +93,9 @@ class WearCastHD:
         self.auto_processor = AutoProcessor.from_pretrained(VIT_PATH)
         print(f"[WearCastHD] AutoProcessor loaded.")
 
-        from transformers import CLIPVisionModel, CLIPVisionModelWithProjection
-        print("[WearCastHD] Loading CLIPVisionModel (for hidden states)...")
-        self.image_encoder = CLIPVisionModel.from_pretrained(VIT_PATH).to(self.gpu_id).half()
-        print(f"[WearCastHD] CLIPVisionModel loaded.  hidden_size={self.image_encoder.config.hidden_size}  num_hidden_layers={self.image_encoder.config.num_hidden_layers}")
-
-        print("[WearCastHD] Extracting pretrained visual_projection...")
-        clip_full = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH)
-        self.visual_projection = clip_full.visual_projection.to(self.gpu_id).half()
-        del clip_full
-        print(f"[WearCastHD] visual_projection extracted. projection_dim={self.visual_projection.out_features if hasattr(self.visual_projection, 'out_features') else 'N/A'}")
+        print("[WearCastHD] Loading CLIPVisionModelWithProjection...")
+        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH).to(self.gpu_id).half()
+        print(f"[WearCastHD] CLIPVisionModelWithProjection loaded.  hidden_size={self.image_encoder.config.hidden_size}  projection_dim={self.image_encoder.config.projection_dim}")
 
         # Load scheduler
         print("[WearCastHD] Loading DDPMScheduler...")
@@ -125,16 +118,9 @@ class WearCastHD:
         ).to(self.gpu_id)
         print(f"[WearCastHD] Pipeline assembled. VAE scale factor={self.pipe.vae_scale_factor}")
 
-        # Swap to DPM-Solver++
-        from diffusers import DPMSolverMultistepScheduler
-        self.pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-            self.pipe.scheduler.config,
-            algorithm_type="dpmsolver++",
-            solver_order=2,
-            use_karras_sigmas=True,
-            final_sigmas_type="sigma_min",
-        )
-        print(f"[WearCastHD] Scheduler replaced with DPMSolverMultistepScheduler.")
+        # Use UniPC scheduler (what OOTD was designed for)
+        self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+        print(f"[WearCastHD] Scheduler replaced with UniPCMultistepScheduler.")
         print("=" * 70)
 
     def tokenize_captions(self, captions, max_length):
@@ -253,16 +239,10 @@ class WearCastHD:
 
             print(" -> Preprocessing Stage: SUCCESS")
 
-        # =========================================================
-        # PHASE 1.5 — Garment Auto-Analysis
-        # =========================================================
-        print(f"\n[WearCast] Phase 1.5: Garment Complexity Analysis...")
-        is_complex = self.detect_garment_complexity(image_garm)
-        opt_params = self.get_optimal_params(category, is_complex)
-        final_steps = opt_params["num_steps"]
-        final_scale = opt_params["image_scale"]
-        print(f" -> is_complex     : {is_complex}")
-        print(f" -> Auto-params    : steps={final_steps}, scale={final_scale}, complex={is_complex}")
+        # Use UI-provided steps and guidance scale directly
+        final_steps = num_steps
+        final_scale = image_scale
+        print(f"\n[WearCast] Using params: steps={final_steps}, guidance_scale={final_scale}")
 
         # =========================================================
         # PHASE 2 — CLIP Vision Encoding
@@ -283,86 +263,20 @@ class WearCastHD:
             else:
                 garm_proc = image_garm.copy()
 
-            # === FIX 5: Reduced pre-processing — 2.5×/1.6× was too aggressive, flattening
-            #            mid-tones and pushing CLIP toward shape over texture detail.
-            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)   # was 2.5
-            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.2)  # was 1.6
+            # Mild sharpness + contrast boost for richer texture features
+            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
+            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
+            print(f" -> Garment CLIP features extracted with enhanced preprocessing.")
 
-            # ---- MULTI-SCALE CROPS (4 crops for richer garment coverage) ----
-            w, h = garm_enhanced.size
-            cx, cy = w // 2, h // 2
-            crop_full    = garm_enhanced.copy()
-            crop_center  = garm_enhanced.crop([
-                int(cx - w * 0.30), int(cy - h * 0.30),
-                int(cx + w * 0.30), int(cy + h * 0.30)
-            ])
-            crop_upper   = garm_enhanced.crop([0, 0, w, int(h * 0.40)])
-            # 4th crop: focuses on the main graphic/print region (center vertical band)
-            crop_graphic = garm_enhanced.crop([int(w*0.05), int(h*0.10), int(w*0.95), int(h*0.90)])  # wider: captures BURST text at right edge
-            # 5th crop: collar top-strip + sleeve cuff strip — preserves blue ringer detail
-            crop_trim    = garm_enhanced.crop([0, 0, w, int(h * 0.18)])  # top 18%: collar trim band
-            print(f" -> Multi-scale crops: full={crop_full.size}, center={crop_center.size}, upper={crop_upper.size}, graphic={crop_graphic.size}, trim={crop_trim.size}")
-            
+            # Original OOTD 2-token encoding: [null_text_token, garment_CLIP_embedding]
+            prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
+            prompt_image = self.image_encoder(prompt_image.data['pixel_values'].to(dtype=torch.float16)).image_embeds
+            prompt_image = prompt_image.unsqueeze(1)  # [1, 768] -> [1, 1, 768]
+            print(f" -> CLIP image_embeds shape: {list(prompt_image.shape)}")
 
-            # ---- ENCODE CONTEXT SCALES & PROJECT ----
-            # === ACCURACY FIX 2: stride 32→16 doubles spatial token coverage (8→16 patch tokens)
-            def encode_crop(img, name="?"):
-                inputs = self.auto_processor(images=img, return_tensors="pt").to(self.gpu_id)
-                pixel_vals = inputs.data['pixel_values'].to(dtype=torch.float16)
-                print(f"    [CLIP] Encoding '{name}': pixel_values={list(pixel_vals.shape)} dtype={pixel_vals.dtype}")
-                outputs = self.image_encoder(pixel_values=pixel_vals, output_hidden_states=True)
-                hidden = outputs.last_hidden_state   # [1, 257, 1024]
-                print(f"    [CLIP]   last_hidden_state={list(hidden.shape)}")
-
-                patch_tokens = hidden[:, 1:, :]              # [1, 256, 1024]
-                projected_patches = self.visual_projection(patch_tokens)  # [1, 256, 768]
-                sampled = projected_patches[:, ::16, :]      # [1, 16, 768] (was ::32 = 8 tokens)
-
-                cls_proj = self.visual_projection(hidden[:, 0:1, :])  # [1, 1, 768]
-                result = torch.cat([cls_proj, sampled], dim=1)        # [1, 17, 768]
-                print(f"    [CLIP]   final embedding={list(result.shape)}")
-                return result
-
-            feat_full    = encode_crop(crop_full,    "full")
-            feat_center  = encode_crop(crop_center,  "center")
-            feat_upper   = encode_crop(crop_upper,   "upper")
-            feat_graphic = encode_crop(crop_graphic, "graphic")
-            feat_trim    = encode_crop(crop_trim,    "trim")
-
-            # === FIX 1: Tile-grid CLIP encoding — divide garment into 3×4=12 tiles,
-            #            encode each tile at native 224px resolution so fine detail
-            #            (text like "BURST", small illustrated figures) is preserved.
-            tile_cols, tile_rows = 3, 4
-            tile_w = w // tile_cols
-            tile_h = h // tile_rows
-            tile_feats = []
-            for tr in range(tile_rows):
-                for tc in range(tile_cols):
-                    x0 = tc * tile_w
-                    y0 = tr * tile_h
-                    x1 = x0 + tile_w if tc < tile_cols - 1 else w
-                    y1 = y0 + tile_h if tr < tile_rows - 1 else h
-                    tile_crop = garm_enhanced.crop([x0, y0, x1, y1])
-                    tile_feats.append(encode_crop(tile_crop, f"tile_{tr}x{tc}"))
-            feat_tiles = torch.stack(tile_feats, dim=0).mean(dim=0)  # [1, 17, 768]
-            print(f" -> Tile-grid CLIP: {len(tile_feats)} tiles encoded and averaged. shape={list(feat_tiles.shape)}")
-
-            # Weights: full(0.10)+center(0.10)+upper(0.10)+graphic(0.35)+trim(0.10)+tiles(0.25)=1.00
-            # Graphic reduced from 0.50→0.35; tile grid takes 0.25 for fine-detail coverage
-            garment_features = (
-                feat_full    * 0.10 +
-                feat_center  * 0.10 +
-                feat_upper   * 0.10 +
-                feat_graphic * 0.35 +
-                feat_trim    * 0.10 +
-                feat_tiles   * 0.25
-            )
-            print(f" -> Fused garment_features: {list(garment_features.shape)}")
-
-            text_emb = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
-            print(f" -> Text embedding (null): {list(text_emb.shape)}")
-            prompt_embeds = torch.cat([text_emb, garment_features], dim=1)
-            print(f" -> Multi-Scale CLIP Embedding shape: {prompt_embeds.shape}")
+            prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
+            prompt_embeds[:, 1:] = prompt_image[:]  # Replace 2nd token with garment embedding
+            print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (2 tokens: null_text + garment_CLIP)")
             _dbg_tensor("prompt_embeds", prompt_embeds)
 
             # =========================================================
@@ -388,8 +302,7 @@ class WearCastHD:
                 mask=mask,
                 image_ori=image_ori,
                 num_inference_steps=final_steps,
-                image_guidance_scale=4.0,   # FIX: 6.0→4.0 — high IGS causes hard artifacts at shoulder boundary
-                guidance_scale=final_scale, # CLIP/garment feature adherence
+                image_guidance_scale=final_scale,
                 num_images_per_prompt=num_samples,
                 generator=generator,
             ).images
