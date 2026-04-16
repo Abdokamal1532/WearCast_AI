@@ -239,10 +239,13 @@ class WearCastHD:
 
             print(" -> Preprocessing Stage: SUCCESS")
 
-        # Use UI-provided steps and guidance scale directly
-        final_steps = num_steps
-        final_scale = image_scale
-        print(f"\n[WearCast] Using params: steps={final_steps}, guidance_scale={final_scale}")
+        # Auto-detect garment complexity and choose optimal params
+        is_complex = self.detect_garment_complexity(image_garm)
+        auto_params = self.get_optimal_params(category, is_complex)
+        final_steps = max(num_steps, auto_params["num_steps"])   # use auto if higher
+        final_scale = max(image_scale, auto_params["image_scale"]) # use auto if higher
+        print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
+        print(f"[WearCast] Using params: steps={final_steps} (UI={num_steps}), guidance_scale={final_scale} (UI={image_scale})")
 
         # =========================================================
         # PHASE 2 — CLIP Vision Encoding
@@ -251,14 +254,14 @@ class WearCastHD:
         with torch.no_grad():
             from PIL import ImageEnhance
             garm_np = np.array(image_garm.copy())
-            bg_mask = np.all(garm_np >= 240, axis=-1)
+            bg_mask = np.all(garm_np >= 250, axis=-1)  # 250: only pure-white product-photo BG, not shirt body
             bg_coverage = bg_mask.mean()
-            print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% near-white pixels (threshold=5%)")
+            print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% pure-white pixels (threshold >=250, 5% min)")
 
             if bg_coverage > 0.05:
-                print(f" -> White product background detected ({100*bg_coverage:.1f}% coverage), replacing with mid-gray for CLIP...")
+                print(f" -> White product background detected ({100*bg_coverage:.1f}% coverage), replacing with light-gray for CLIP...")
                 garm_np_proc = garm_np.copy()
-                garm_np_proc[bg_mask] = [160, 160, 160]
+                garm_np_proc[bg_mask] = [180, 180, 180]  # lighter gray to avoid biasing white garment embeddings
                 garm_proc = Image.fromarray(garm_np_proc)
             else:
                 garm_proc = image_garm.copy()
@@ -398,12 +401,13 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # FIX 7: Raise scale 6.5→7.5 and steps 40→45 — stronger CLIP guidance forces
-            # the model to commit to the graphic pattern; final latent_std was 0.82 (high),
-            # indicating the model wasn't fully converging to the garment detail.
-            return {"num_steps": 45, "image_scale": 7.5}
+            # Complex garments (graphics, patterns, text): higher guidance forces the UNet
+            # to commit to the garment detail. OOTD image_guidance_scale sweet-spot is 3.5-5.0;
+            # values above 5.0 can cause over-saturation artifacts.
+            return {"num_steps": 40, "image_scale": 4.0}
         else:
-            return {"num_steps": 30, "image_scale": 5.5}
+            # Simple/solid garments: lower guidance preserves natural draping
+            return {"num_steps": 30, "image_scale": 2.5}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
