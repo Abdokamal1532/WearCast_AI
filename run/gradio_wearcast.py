@@ -217,7 +217,7 @@ with gr.Blocks(title="WearCast AI: Premium Virtual Try-On", theme=gr.themes.Soft
     with gr.Accordion("Advanced Settings", open=False):
         with gr.Row():
             n_samples = gr.Slider(label="Number of Samples", minimum=1, maximum=4, value=1, step=1)
-            n_steps = gr.Slider(label="Inference Steps", minimum=10, maximum=50, value=20, step=5)
+            n_steps = gr.Slider(label="Inference Steps", minimum=10, maximum=50, value=30, step=5)
             image_scale = gr.Slider(label="Guidance Scale", minimum=1.0, maximum=5.0, value=2.0, step=0.1)
             seed = gr.Number(label="Seed (-1 for Random)", value=-1)
 
