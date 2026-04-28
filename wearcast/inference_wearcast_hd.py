@@ -971,19 +971,27 @@ class WearCastHD:
         print(f"   [MASK_GEN] After protection: {coverage_before_protect:.1f}% -> {coverage_after_protect:.1f}%  (removed {coverage_before_protect-coverage_after_protect:.1f}%)")
 
         # ---- SHOULDER BRIDGE FILL: Guarantee shoulder-seam coverage ----
-        # Paint a horizontal band across the shoulder region to fill any gaps
-        # the parse mask or hull missed at the shirt-arm seam
+        # Draw thick lines between neck and shoulders, and circles at shoulders,
+        # to ensure no gaps at the seams, even if shoulders are tilted.
         if category == 'upperbody' and not is_off_shoulder:
-            bridge_y_min = max(0, int(min(s_r[1], s_l[1])) - 8)
-            bridge_y_max = min(height - 1, int(max(s_r[1], s_l[1])) + 12)
-            bridge_x_min = max(0, int(min(s_r[0], s_l[0])) - SHOULDER_OUT)
-            bridge_x_max = min(width - 1, int(max(s_r[0], s_l[0])) + SHOULDER_OUT)
-            bridge_before = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
-            inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] = 1.0
+            thickness = int(35 / 512 * height)
+            circle_radius = int(35 / 512 * height)
+            
+            bridge_mask = np.zeros((height, width), dtype=np.uint8)
+            
+            # Draw circles at shoulders to cover the deltoid/seam area completely
+            cv2.circle(bridge_mask, (int(s_r[0]), int(s_r[1])), circle_radius, 1, -1)
+            cv2.circle(bridge_mask, (int(s_l[0]), int(s_l[1])), circle_radius, 1, -1)
+            
+            # Draw thick lines from neck to shoulders to fill the trapezius/collarbone area
+            cv2.line(bridge_mask, (int(neck[0]), int(neck[1])), (int(s_r[0]), int(s_r[1])), 1, thickness)
+            cv2.line(bridge_mask, (int(neck[0]), int(neck[1])), (int(s_l[0]), int(s_l[1])), 1, thickness)
+            
+            inpaint_mask = np.logical_or(inpaint_mask, bridge_mask).astype(np.float32)
+            
             # Re-apply protection to avoid painting over face/hair
             inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-            bridge_after = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
-            print(f"   [MASK_GEN] SHOULDER BRIDGE: Y=[{bridge_y_min},{bridge_y_max}] X=[{bridge_x_min},{bridge_x_max}]  coverage {100*bridge_before:.0f}%→{100*bridge_after:.0f}%")
+            print(f"   [MASK_GEN] SHOULDER BRIDGE: Applied geometric bridge with radius {circle_radius} and thickness {thickness}")
 
         # ---- STEP 7: Morphology close + dilate to fill gaps ----
         # FIX: Reduced close 17→11, dilate 13→7 to prevent puffy over-expansion
