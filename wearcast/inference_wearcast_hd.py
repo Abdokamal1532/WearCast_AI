@@ -246,8 +246,8 @@ class WearCastHD:
         # Auto-detect garment complexity and choose optimal params
         is_complex = self.detect_garment_complexity(image_garm)
         auto_params = self.get_optimal_params(category, is_complex)
-        final_steps = max(num_steps, auto_params["num_steps"])   # use auto if higher
-        final_scale = max(image_scale, auto_params["image_scale"]) # use auto if higher
+        final_steps = auto_params["num_steps"]    # use auto-detected optimal steps
+        final_scale = auto_params["image_scale"]   # use auto-detected optimal guidance
         print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
         print(f"[WearCast] Using params: steps={final_steps} (UI={num_steps}), guidance_scale={final_scale} (UI={image_scale})")
 
@@ -397,10 +397,10 @@ class WearCastHD:
         if mask_np.max() > 1.0:
             mask_np = mask_np / 255.0
 
-        # Binarize then apply thin Gaussian feather (3px sigma)
+        # Binarize then apply thin Gaussian feather (2px sigma)
         # This is exactly what OOTDiffusion does — a thin, smooth transition
         binary_mask = (mask_np > 0.5).astype(np.float32)
-        feather_sigma = 3.0
+        feather_sigma = 2.0
         alpha = cv2.GaussianBlur(binary_mask, (0, 0), feather_sigma)
         alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -419,21 +419,13 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- Gentle luminance & color recovery (artifact-free) ---
-        # Uniform operations only — no spatial variation, so no halos possible.
-        # The UNet adapts lighting for on-body realism but often over-darkens;
-        # we recover 30% of the gap via a global multiplicative scale.
-        if lum_gap > 15:
-            correction_strength = 0.30
-            target_lum = gen_lum_mean + lum_gap * correction_strength
-            scale = target_lum / max(gen_lum_mean, 1.0)
-            gen_arr = np.clip(gen_arr * scale, 0, 255)
-            print(f"   [CORR] Luminance recovery: scale={scale:.3f} (+{lum_gap*correction_strength:.1f} lum)")
-        else:
-            print(f"   [CORR] Luminance gap <= 15, no correction needed")
+        # --- Luminance recovery REMOVED ---
+        # The UNet naturally adapts lighting for on-body realism.
+        # Recovering luminance toward studio lighting created unnatural brightness mismatch.
+        print(f"   [CORR] Luminance recovery: DISABLED (let UNet handle lighting naturally)")
 
         # Subtle saturation boost to counteract VAE color dampening
-        sat_boost = 1.12
+        sat_boost = 1.05
         gen_uint8 = np.clip(gen_arr, 0, 255).astype(np.uint8)
         gen_hsv = cv2.cvtColor(gen_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
         gen_hsv[:, :, 1] = np.clip(gen_hsv[:, :, 1] * sat_boost, 0, 255)
@@ -785,8 +777,8 @@ class WearCastHD:
             print(f"   [MASK_GEN] Label {label}: {px_count} pixels")
             garment_mask += (parse_array == label).astype(np.float32)
 
-        # GARMENT DILATION: 13px minimum to fill boundary gaps
-        k_size = max(int((height * 0.025)) | 1, 13)
+        # GARMENT DILATION: 7px minimum to fill boundary gaps (reduced from 13 to prevent puffy over-expansion)
+        k_size = max(int((height * 0.014)) | 1, 7)
         print(f"   [MASK_GEN] Garment dilation kernel size: {k_size}x{k_size}")
         kernel_garment = np.ones((k_size, k_size), np.uint8)
         garment_mask_pre_dilate = garment_mask.copy()
@@ -844,10 +836,10 @@ class WearCastHD:
         # SHOULDER_OUT: how far outward the hull extends from shoulder keypoint
         # Must be LARGER than actual shoulder to cover shirt fabric at the seam
         ARM_PAD      = int(20 / 512 * height)   # inward pad from shoulder toward neck
-        SLEEVE_PAD   = int(24 / 512 * height)   # pad at elbow level for sleeves
-        # FIX: Increased from 35→42 for wider shoulder hull coverage
-        SHOULDER_OUT = int(42 / 512 * height)   # outward extension past shoulder keypoint
-        SLEEVE_LAT   = int(32 / 512 * height)   # lateral extension for sleeve hull
+        SLEEVE_PAD   = int(16 / 512 * height)   # pad at elbow level for sleeves (reduced from 24 to prevent puffy elbows)
+        # FIX: Reduced from 42→30 to prevent boxy/puffy shoulder over-extension
+        SHOULDER_OUT = int(30 / 512 * height)   # outward extension past shoulder keypoint
+        SLEEVE_LAT   = int(22 / 512 * height)   # lateral extension for sleeve hull (reduced from 32)
 
         print(f"   [MASK_GEN] Hull padding params: ARM_PAD={ARM_PAD} SLEEVE_PAD={SLEEVE_PAD} SHOULDER_OUT={SHOULDER_OUT} SLEEVE_LAT={SLEEVE_LAT}")
         hull_pts = []
@@ -994,9 +986,9 @@ class WearCastHD:
             print(f"   [MASK_GEN] SHOULDER BRIDGE: Y=[{bridge_y_min},{bridge_y_max}] X=[{bridge_x_min},{bridge_x_max}]  coverage {100*bridge_before:.0f}%→{100*bridge_after:.0f}%")
 
         # ---- STEP 7: Morphology close + dilate to fill gaps ----
-        # FIX: Increased close kernel from 13→17 to bridge small shoulder-zone gaps
-        kernel_close  = np.ones((17, 17), np.uint8)
-        kernel_dilate = np.ones((13, 13), np.uint8)
+        # FIX: Reduced close 17→11, dilate 13→7 to prevent puffy over-expansion
+        kernel_close  = np.ones((11, 11), np.uint8)
+        kernel_dilate = np.ones((7, 7), np.uint8)
         inpaint_mask_u8 = (inpaint_mask * 255).astype(np.uint8)
         coverage_before_morph = 100*(inpaint_mask_u8>0).mean()
         inpaint_mask_u8 = cv2.morphologyEx(inpaint_mask_u8, cv2.MORPH_CLOSE, kernel_close)
@@ -1018,8 +1010,8 @@ class WearCastHD:
         print(f"   [MASK_GEN] FINAL SHOULDER CHECK: coverage={100*(sh_final>0).mean():.1f}%  "
               f"({'GOOD' if (sh_final>0).mean() > 0.5 else 'PROBLEM: shoulder not masked - HOLE WILL APPEAR'})")
 
-        # ---- STEP 8: Soft feathered edge ----
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
+        # ---- STEP 8: Soft feathered edge (tighter: 15px/σ5 instead of 21px/σ7) ----
+        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (15, 15), 5)
         inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
         percentage = 100 * np.sum(dst > 0) / (width * height)
