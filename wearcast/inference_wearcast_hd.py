@@ -33,6 +33,74 @@ def _dbg_tensor(label, t):
     else:
         print(f"   [DBG] {label:40s} | type={type(t)}")
 
+def match_histograms(src, ref, src_mask, ref_mask):
+    """Matches the histogram of src to ref, channel by channel, using provided masks."""
+    out = src.copy()
+    for c in range(src.shape[-1]):
+        s_vals = src[..., c][src_mask]
+        r_vals = ref[..., c][ref_mask]
+        if len(s_vals) == 0 or len(r_vals) == 0:
+            continue
+            
+        # Get quantiles
+        s_quantiles = np.percentile(s_vals, np.linspace(0, 100, 256))
+        r_quantiles = np.percentile(r_vals, np.linspace(0, 100, 256))
+        
+        # Interpolate
+        matched_vals = np.interp(s_vals, s_quantiles, r_quantiles)
+        out[..., c][src_mask] = matched_vals
+        
+    return np.clip(out, 0, 255).astype(np.float32)
+
+def laplacian_pyramid_blend(src, dst, mask, levels=6):
+    """Multi-scale blend: src inside mask, dst outside, smooth transition."""
+    # Ensure all have the same shape/type
+    h, w = src.shape[:2]
+    # Ensure dimensions are divisible by 2^levels to avoid pyrUp/pyrDown shape mismatches
+    # We pad the images if needed
+    pad_h = (2**levels - h % (2**levels)) % (2**levels)
+    pad_w = (2**levels - w % (2**levels)) % (2**levels)
+    
+    if pad_h > 0 or pad_w > 0:
+        src = cv2.copyMakeBorder(src, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        dst = cv2.copyMakeBorder(dst, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+
+    gp_src = [src.astype(np.float32)]
+    gp_dst = [dst.astype(np.float32)]
+    
+    # If mask is 2D, make it 3D for broadcasting
+    if len(mask.shape) == 2:
+        mask = np.stack([mask]*3, axis=-1)
+    gp_mask = [mask.astype(np.float32)]
+    
+    # Build Gaussian pyramids
+    for _ in range(levels):
+        gp_src.append(cv2.pyrDown(gp_src[-1]))
+        gp_dst.append(cv2.pyrDown(gp_dst[-1]))
+        gp_mask.append(cv2.pyrDown(gp_mask[-1]))
+    
+    # Build Laplacian pyramids
+    lp_src = [gp_src[i] - cv2.pyrUp(gp_src[i+1], dstsize=gp_src[i].shape[:2][::-1]) for i in range(levels)]
+    lp_src.append(gp_src[levels])
+    
+    lp_dst = [gp_dst[i] - cv2.pyrUp(gp_dst[i+1], dstsize=gp_dst[i].shape[:2][::-1]) for i in range(levels)]
+    lp_dst.append(gp_dst[levels])
+    
+    # Blend at each level
+    lp_blend = [lp_src[i] * gp_mask[i] + lp_dst[i] * (1 - gp_mask[i]) for i in range(levels + 1)]
+    
+    # Reconstruct
+    result = lp_blend[levels]
+    for i in range(levels - 1, -1, -1):
+        result = cv2.pyrUp(result, dstsize=lp_blend[i].shape[:2][::-1]) + lp_blend[i]
+        
+    # Remove padding if added
+    if pad_h > 0 or pad_w > 0:
+        result = result[:h, :w]
+        
+    return np.clip(result, 0, 255).astype(np.uint8)
+
 
 class WearCastHD:
 
@@ -407,147 +475,59 @@ class WearCastHD:
         lum_deficit = garm_lum_fg.mean() - gen_lum_mask.mean() if len(garm_lum_fg) > 0 else 0
         print(f"   [COLOR DIAG]   White garment={is_white_garment} | Luminance deficit={lum_deficit:.1f}")
 
-        # --- Step 2/3: Interior-Only Brightness Correction ---
-        # KEY FIX: Erode the mask before applying correction so the brightness
-        # boost never reaches the mask boundary. This prevents the "cutout" halo.
-        print(f"\n -> Step 2/3: Interior-only brightness correction...")
+        # --- Step 2/3: Histogram Matching ---
+        print(f"\n -> Step 2/3: Histogram Matching (interior only)...")
         corrected_arr = gen_arr.copy()
 
-        # Create eroded interior mask: correction fades to zero before reaching the edge
-        interior_mask_uint8 = (hull_arr > 127).astype(np.uint8) * 255
-        interior_mask_eroded = cv2.erode(interior_mask_uint8, np.ones((20, 20), np.uint8), iterations=1)
-        interior_alpha = cv2.GaussianBlur(interior_mask_eroded.astype(np.float32), (25, 25), 10.0) / 255.0
-        interior_bool = interior_alpha > 0.01
-        n_interior = interior_bool.sum()
-        n_edge = mask_bool.sum() - n_interior
-        print(f"   [INTERIOR] Eroded interior: {n_interior} px | Edge zone: {n_edge} px")
+        # Create a distance-transform based feather mask
+        binary_mask = (hull_arr > 127).astype(np.uint8)
+        dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
+        feather_width = 12.0  # pixels of transition
+        alpha = np.clip(dist / feather_width, 0, 1.0)
+        
+        # We only want to histogram-match the inside of the garment
+        interior_bool = alpha > 0.99
+        
+        # We only consider foreground of the garment image for histogram matching reference
+        garm_fg_bool = ~np.all(garm_arr >= 240, axis=-1)
 
-        if is_white_garment and lum_deficit > 10:
-            # HSV correction on the FULL image, then blend with raw using interior mask
-            gen_hsv = cv2.cvtColor(gen_arr.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-            sat_channel = gen_hsv[:, :, 1]
-            val_channel = gen_hsv[:, :, 2]
-
-            # Only boost low-saturation pixels (protect colorful graphics)
-            # FIX: Widened to S<45 — more white-shirt body pixels get brightness correction
-            low_sat_mask = sat_channel < 45
-            correction_target = interior_bool & low_sat_mask
-
-            n_target = correction_target.sum()
-            print(f"   [WHITE FIX] Interior correction targets: {n_target} px (low-sat interior pixels)")
-
-            if n_target > 100:
-                current_val = val_channel[correction_target]
-                # Phase 3: Stronger pre-Poisson push — 0.80 multiplier, 55 cap
-                # Poisson will claw back ~40pts, so we need to over-correct significantly
-                brightness_boost = np.clip((240.0 - current_val) * 0.80, 0, 55)
-                val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
-                gen_hsv[:, :, 2] = val_channel
-
-                sat_channel[correction_target] = np.clip(sat_channel[correction_target] * 0.6, 0, 255)
-                gen_hsv[:, :, 1] = sat_channel
-
-                corrected_full = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-                print(f"   [WHITE FIX] Brightness boost avg={brightness_boost.mean():.1f}")
-
-                # Blend corrected interior with raw UNet at edges
-                # At mask boundary: 100% raw UNet (no correction artifacts)
-                # Deep inside mask: 100% corrected (white shirt)
-                interior_3d = np.stack([interior_alpha] * 3, axis=-1)
-                corrected_arr = corrected_full * interior_3d + gen_arr * (1.0 - interior_3d)
-
-                Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)).save("debug_phase4_color_corrected.jpg")
-                print(f"   [WHITE FIX] [SAVED] debug_phase4_color_corrected.jpg")
-            else:
-                print(f"   [WHITE FIX] Skipped: too few interior targets ({n_target})")
+        if interior_bool.sum() > 100 and garm_fg_bool.sum() > 100:
+            # Match histograms
+            matched_interior = match_histograms(gen_arr, garm_arr, interior_bool, garm_fg_bool)
+            
+            # Blend with original generated image based on alpha
+            # 1.0 alpha = fully matched, 0.0 alpha = raw UNet output
+            alpha_3d = np.stack([alpha] * 3, axis=-1)
+            corrected_arr = matched_interior * alpha_3d + gen_arr * (1.0 - alpha_3d)
+            
+            Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)).save("debug_phase4_hist_matched.jpg")
+            print(f"   [HIST MATCH] [SAVED] debug_phase4_hist_matched.jpg")
         else:
-            print(f"   [WHITE FIX] Skipped: not white garment or deficit too small ({lum_deficit:.1f})")
+            print(f"   [HIST MATCH] Skipped: too few interior/foreground pixels")
+            
+        Image.fromarray((alpha * 255).astype(np.uint8)).save("debug_phase4_feather_mask.jpg")
+        print(f"   [FEATHER] [SAVED] Feather mask: debug_phase4_feather_mask.jpg")
 
-        # Save interior mask for debugging
-        Image.fromarray((interior_alpha * 255).astype(np.uint8)).save("debug_phase4_interior_mask.jpg")
-        print(f"   [INTERIOR] [SAVED] Interior correction mask: debug_phase4_interior_mask.jpg")
-
-        # --- Step 3/3: Compositing (Poisson primary, Alpha fallback) ---
-        print(f"\n -> Step 3/3: Compositing with original background...")
-
-        # Try Poisson seamless cloning first (eliminates visible seams entirely)
-        poisson_success = False
+        # --- Step 3/3: Compositing (Laplacian Pyramid Blending) ---
+        print(f"\n -> Step 3/3: Laplacian Pyramid Compositing...")
+        t_composite = time.time()
+        
         try:
-            src_bgr = cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            dst_bgr = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            clone_mask = (hull_arr > 127).astype(np.uint8) * 255
-            # Phase 3: 7×7 erosion eliminates the visible halo/glow at garment boundaries
-            clone_mask = cv2.erode(clone_mask, np.ones((7, 7), np.uint8), iterations=1)
-
-            M = cv2.moments(clone_mask)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-            else:
-                cx, cy = clone_mask.shape[1] // 2, clone_mask.shape[0] // 2
-
-            # FIX: NORMAL_CLONE preserves generated garment colors; MIXED_CLONE was
-            # blending destination (original skin/clothes) colors into the new garment
-            result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.NORMAL_CLONE)
-            final_image = Image.fromarray(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
-            poisson_success = True
-            print(f"   [COMPOSITE] Poisson NORMAL_CLONE compositing successful (center={cx},{cy})")
+            # Blend corrected output into original image using feather mask
+            # We use alpha (which fades smoothly) as the blending mask
+            final_bgr = laplacian_pyramid_blend(
+                src=cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
+                dst=cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR),
+                mask=alpha,
+                levels=6
+            )
+            final_image = Image.fromarray(cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB))
+            print(f"   [COMPOSITE] Laplacian pyramid blend successful")
         except Exception as e:
-            print(f"   [COMPOSITE] Poisson clone failed: {e}")
-
-        if not poisson_success:
-            # Fallback: standard alpha compositing
-            print(f"   [COMPOSITE] Falling back to alpha compositing...")
-            alpha = cv2.GaussianBlur(hull_arr, (21, 21), 8.0) / 255.0
+            print(f"   [COMPOSITE] Laplacian pyramid blend failed: {e}. Falling back to alpha blending.")
             alpha_3d = np.stack([alpha] * 3, axis=-1)
             final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
-
-        # --- POST-COMPOSITING LUMINANCE RESCUE ---
-        # Poisson clone inherently re-balances interior colors to match boundary
-        # gradients (skin tones). For white garments, this darkens the shirt.
-        # This rescue pass corrects the final image AFTER compositing so it cannot be undone.
-        if is_white_garment and lum_deficit > 15:
-            rescue_arr = np.array(final_image).astype(np.float32)
-            rescue_lum = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
-            remaining_deficit = garm_lum_fg.mean() - rescue_lum.mean()
-            print(f"   [POST-RESCUE] Pre-rescue luminance: {rescue_lum.mean():.1f} | Remaining deficit: {remaining_deficit:.1f}")
-
-            if remaining_deficit > 10:
-                # Saturation-aware rescue: only boost low-saturation (white shirt body) pixels
-                rescue_hsv = cv2.cvtColor(rescue_arr.astype(np.uint8), cv2.COLOR_RGB2HSV)
-                rescue_low_sat = rescue_hsv[:, :, 1] < 50  # S<50 = shirt body, not graphics
-                rescue_target = interior_bool & rescue_low_sat
-
-                # Phase 3: Much stronger rescue — 0.85 multiplier, 65 cap
-                # This is the FINAL pass, so we must close the full gap here
-                rescue_strength = np.clip(remaining_deficit * 0.85, 0, 65)
-                # Apply per-pixel with interior_alpha falloff (no edge artifacts)
-                for ch in range(3):
-                    rescue_arr[rescue_target, ch] = np.clip(
-                        rescue_arr[rescue_target, ch] + rescue_strength * interior_alpha[rescue_target],
-                        0, 255
-                    )
-
-                # Second micro-pass: check if still short and apply direct boost
-                post_lum_check = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
-                still_short = garm_lum_fg.mean() - post_lum_check.mean()
-                if still_short > 12:
-                    micro_boost = np.clip(still_short * 0.70, 0, 40)
-                    print(f"   [POST-RESCUE] Micro-pass: still {still_short:.1f}pts short, applying +{micro_boost:.1f}")
-                    for ch in range(3):
-                        rescue_arr[rescue_target, ch] = np.clip(
-                            rescue_arr[rescue_target, ch] + micro_boost * interior_alpha[rescue_target],
-                            0, 255
-                        )
-
-                final_image = Image.fromarray(np.clip(rescue_arr, 0, 255).astype(np.uint8))
-                post_lum = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
-                print(f"   [POST-RESCUE] Post-rescue luminance: {post_lum.mean():.1f} | Recovered: {post_lum.mean()-rescue_lum.mean():.1f} pts")
-                Image.fromarray(np.clip(rescue_arr, 0, 255).astype(np.uint8)).save("debug_phase4_post_rescue.jpg")
-                print(f"   [POST-RESCUE] [SAVED] debug_phase4_post_rescue.jpg")
-            else:
-                print(f"   [POST-RESCUE] Skipped: deficit {remaining_deficit:.1f} <= 10 (acceptable)")
 
         # Save diagnostics
         comparison_w = raw_generated.size[0] * 4
@@ -557,15 +537,14 @@ class WearCastHD:
         comparison.paste(Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)), (raw_generated.size[0] * 2, 0))
         comparison.paste(final_image, (raw_generated.size[0] * 3, 0))
         comparison.save("debug_phase4_comparison.jpg")
-        print(f"   [COMPOSITE] [SAVED] 4-panel comparison: Garment | Raw UNet | Corrected | Final")
+        print(f"   [COMPOSITE] [SAVED] 4-panel comparison: Garment | Raw UNet | Hist Matched | Final")
 
         # Post-compositing diagnostics
         final_np = np.array(final_image).astype(np.float32)
         final_in_mask = final_np[mask_bool]
         final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114
         print(f"   [COMPOSITE] Final luminance in mask: mean={final_lum.mean():.1f} (target≈{garm_lum_fg.mean():.1f})")
-        print(f"   [COMPOSITE] Compositing method: {'Poisson NORMAL_CLONE' if poisson_success else 'Alpha Blend'}")
-        print(f"   [COMPOSITE] Completed in {time.time()-t0_parse:.2f}s")
+        print(f"   [COMPOSITE] Completed in {time.time()-t_composite:.2f}s")
 
         final_image.save("debug_final_output.jpg")
         print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
