@@ -429,8 +429,8 @@ class WearCastHD:
             val_channel = gen_hsv[:, :, 2]
 
             # Only boost low-saturation pixels (protect colorful graphics)
-            # FIX: Tightened from S<50 to S<35 — protects mid-saturation graphics
-            low_sat_mask = sat_channel < 35
+            # FIX: Widened to S<45 — more white-shirt body pixels get brightness correction
+            low_sat_mask = sat_channel < 45
             correction_target = interior_bool & low_sat_mask
 
             n_target = correction_target.sum()
@@ -438,8 +438,8 @@ class WearCastHD:
 
             if n_target > 100:
                 current_val = val_channel[correction_target]
-                # FIX: Reduced aggressiveness — 0.7→0.5 multiplier, 50→30 cap
-                brightness_boost = np.clip((240.0 - current_val) * 0.5, 0, 30)
+                # FIX: Rebalanced — 0.65 multiplier, 45 cap (0.5/30 was too weak vs Poisson undoing it)
+                brightness_boost = np.clip((240.0 - current_val) * 0.65, 0, 45)
                 val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
                 gen_hsv[:, :, 2] = val_channel
 
@@ -475,8 +475,8 @@ class WearCastHD:
             src_bgr = cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             dst_bgr = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
             clone_mask = (hull_arr > 127).astype(np.uint8) * 255
-            # Slight erosion of clone mask to ensure clean Poisson boundary
-            clone_mask = cv2.erode(clone_mask, np.ones((3, 3), np.uint8), iterations=1)
+            # Erosion of clone mask to ensure clean Poisson boundary (5×5 prevents edge bleed)
+            clone_mask = cv2.erode(clone_mask, np.ones((5, 5), np.uint8), iterations=1)
 
             M = cv2.moments(clone_mask)
             if M["m00"] > 0:
@@ -490,7 +490,7 @@ class WearCastHD:
             result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.NORMAL_CLONE)
             final_image = Image.fromarray(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
             poisson_success = True
-            print(f"   [COMPOSITE] Poisson MIXED_CLONE compositing successful (center={cx},{cy})")
+            print(f"   [COMPOSITE] Poisson NORMAL_CLONE compositing successful (center={cx},{cy})")
         except Exception as e:
             print(f"   [COMPOSITE] Poisson clone failed: {e}")
 
@@ -501,6 +501,39 @@ class WearCastHD:
             alpha_3d = np.stack([alpha] * 3, axis=-1)
             final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
             final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+
+        # --- POST-COMPOSITING LUMINANCE RESCUE ---
+        # Poisson clone inherently re-balances interior colors to match boundary
+        # gradients (skin tones). For white garments, this darkens the shirt.
+        # This rescue pass corrects the final image AFTER compositing so it cannot be undone.
+        if is_white_garment and lum_deficit > 15:
+            rescue_arr = np.array(final_image).astype(np.float32)
+            rescue_lum = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
+            remaining_deficit = garm_lum_fg.mean() - rescue_lum.mean()
+            print(f"   [POST-RESCUE] Pre-rescue luminance: {rescue_lum.mean():.1f} | Remaining deficit: {remaining_deficit:.1f}")
+
+            if remaining_deficit > 10:
+                # Saturation-aware rescue: only boost low-saturation (white shirt body) pixels
+                rescue_hsv = cv2.cvtColor(rescue_arr.astype(np.uint8), cv2.COLOR_RGB2HSV)
+                rescue_low_sat = rescue_hsv[:, :, 1] < 50  # S<50 = shirt body, not graphics
+                rescue_target = interior_bool & rescue_low_sat
+
+                # Scale rescue strength by remaining deficit (diminishing returns)
+                rescue_strength = np.clip(remaining_deficit * 0.60, 0, 45)
+                # Apply per-pixel with interior_alpha falloff (no edge artifacts)
+                for ch in range(3):
+                    rescue_arr[rescue_target, ch] = np.clip(
+                        rescue_arr[rescue_target, ch] + rescue_strength * interior_alpha[rescue_target],
+                        0, 255
+                    )
+
+                final_image = Image.fromarray(np.clip(rescue_arr, 0, 255).astype(np.uint8))
+                post_lum = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
+                print(f"   [POST-RESCUE] Post-rescue luminance: {post_lum.mean():.1f} | Recovered: {post_lum.mean()-rescue_lum.mean():.1f} pts")
+                Image.fromarray(np.clip(rescue_arr, 0, 255).astype(np.uint8)).save("debug_phase4_post_rescue.jpg")
+                print(f"   [POST-RESCUE] [SAVED] debug_phase4_post_rescue.jpg")
+            else:
+                print(f"   [POST-RESCUE] Skipped: deficit {remaining_deficit:.1f} <= 10 (acceptable)")
 
         # Save diagnostics
         comparison_w = raw_generated.size[0] * 4
@@ -517,7 +550,7 @@ class WearCastHD:
         final_in_mask = final_np[mask_bool]
         final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114
         print(f"   [COMPOSITE] Final luminance in mask: mean={final_lum.mean():.1f} (target≈{garm_lum_fg.mean():.1f})")
-        print(f"   [COMPOSITE] Compositing method: {'Poisson MIXED_CLONE' if poisson_success else 'Alpha Blend'}")
+        print(f"   [COMPOSITE] Compositing method: {'Poisson NORMAL_CLONE' if poisson_success else 'Alpha Blend'}")
         print(f"   [COMPOSITE] Completed in {time.time()-t0_parse:.2f}s")
 
         final_image.save("debug_final_output.jpg")
@@ -620,8 +653,8 @@ class WearCastHD:
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
         raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
-        # FIX: Reduced V shift cap from 30→20 to prevent over-brightening
-        shift_v     = min(max(raw_shift_v, 0.0), 20.0)              # only boost, never darken; cap at 20
+        # FIX: V shift cap at 30 — needs headroom for UNet's ~55pt brightness deficit
+        shift_v     = min(max(raw_shift_v, 0.0), 30.0)              # only boost, never darken; cap at 30
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
