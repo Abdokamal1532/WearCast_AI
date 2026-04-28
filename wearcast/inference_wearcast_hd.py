@@ -424,20 +424,25 @@ class WearCastHD:
         # Recovering luminance toward studio lighting created unnatural brightness mismatch.
         print(f"   [CORR] Luminance recovery: DISABLED (let UNet handle lighting naturally)")
 
-        # Subtle saturation boost to counteract VAE color dampening
-        sat_boost = 1.05
-        gen_uint8 = np.clip(gen_arr, 0, 255).astype(np.uint8)
-        gen_hsv = cv2.cvtColor(gen_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
-        gen_hsv[:, :, 1] = np.clip(gen_hsv[:, :, 1] * sat_boost, 0, 255)
-        gen_arr = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-        print(f"   [CORR] Saturation boost: +{int((sat_boost-1)*100)}%")
+        # --- Advanced Post-Processing (OOTDiffusion Parity) ---
+        t_post = time.time()
+        print(f" -> Starting advanced color correction...")
+        # Note: self._cached_hard_mask is the true binary mask before any feathering/blurring
+        color_corrected_image = self.local_color_correction(
+            raw_generated,
+            image_garm,
+            self._cached_hard_mask if hasattr(self, '_cached_hard_mask') else mask
+        )
 
-        # --- Alpha composite (OOTDiffusion-style paste-back) ---
-        t_composite = time.time()
-        alpha_3ch = np.stack([alpha] * 3, axis=-1)
-        final_arr = gen_arr * alpha_3ch + ori_arr * (1.0 - alpha_3ch)
-        final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
-        print(f" -> Alpha compositing completed in {time.time()-t_composite:.3f}s")
+        print(f" -> Starting seamless Laplacian blending...")
+        # Laplacian blending is used to eliminate the "white halo" by blending frequencies
+        final_image = self.laplacian_pyramid_blend(
+            color_corrected_image,
+            image_ori,
+            Image.fromarray((alpha * 255).astype(np.uint8)),
+            levels=5
+        )
+        print(f" -> Post-processing completed in {time.time()-t_post:.3f}s (Correction + Laplacian)")
 
         # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
@@ -771,10 +776,25 @@ class WearCastHD:
         arms_right = (parse_array == 15).astype(np.float32)
         arms = arms_left + arms_right
 
-        parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
-        parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + \
-                                        (parse_array == label_map["pants"]).astype(np.float32)
-        parser_mask_fixed += parser_mask_fixed_lower_cloth
+        # --- High-Accuracy Category Masking ---
+        if category == "upper_body":
+            parse_mask = (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                         (parse_array == label_map["dress"]).astype(np.float32)
+            parser_mask_fixed += (parse_array == label_map["skirt"]).astype(np.float32) + \
+                                 (parse_array == label_map["pants"]).astype(np.float32)
+        elif category == "lower_body":
+            parse_mask = (parse_array == label_map["skirt"]).astype(np.float32) + \
+                         (parse_array == label_map["pants"]).astype(np.float32)
+            parser_mask_fixed += (parse_array == label_map["upper_clothes"]).astype(np.float32)
+        elif category == "dress":
+            parse_mask = (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                         (parse_array == label_map["skirt"]).astype(np.float32) + \
+                         (parse_array == label_map["pants"]).astype(np.float32) + \
+                         (parse_array == label_map["dress"]).astype(np.float32)
+        else:
+            # Fallback to standard upper_body behavior
+            parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
+
         parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
 
         # Load pose points
@@ -834,5 +854,6 @@ class WearCastHD:
         inpaint_mask = dst / 255 * 1
         mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
         mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
+        self._cached_hard_mask = mask
 
         return mask, mask_gray

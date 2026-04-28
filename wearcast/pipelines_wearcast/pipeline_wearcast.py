@@ -566,13 +566,17 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # =====================================================================
-                # HIGH-ACCURACY FIX: REMOVED SDEdit latent blending.
-                # The old code mixed noisy original-image latents at EVERY step, pulling
-                # generated colors toward the original garment (e.g. white tank top).
-                # This was the #1 cause of washed-out colors and wrong hues.
-                # We now do ONE clean pixel-space composite AFTER the full denoising is done.
-                # Result: accurate colors, sharp prints, correct garment shapes.
+                # RESTORED SDEdit latent blending (OOTDiffusion default)
+                # Mixing noisy original-image latents at every step ensures the output
+                # matches the person's original identity and background perfectly.
                 # =====================================================================
+                init_latents_proper = image_ori_latents
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    init_latents_proper = self.scheduler.add_noise(
+                        image_ori_latents, noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
+                    )
+                latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
