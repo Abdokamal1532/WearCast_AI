@@ -429,7 +429,8 @@ class WearCastHD:
             val_channel = gen_hsv[:, :, 2]
 
             # Only boost low-saturation pixels (protect colorful graphics)
-            low_sat_mask = sat_channel < 50
+            # FIX: Tightened from S<50 to S<35 — protects mid-saturation graphics
+            low_sat_mask = sat_channel < 35
             correction_target = interior_bool & low_sat_mask
 
             n_target = correction_target.sum()
@@ -437,7 +438,8 @@ class WearCastHD:
 
             if n_target > 100:
                 current_val = val_channel[correction_target]
-                brightness_boost = np.clip((240.0 - current_val) * 0.7, 0, 50)
+                # FIX: Reduced aggressiveness — 0.7→0.5 multiplier, 50→30 cap
+                brightness_boost = np.clip((240.0 - current_val) * 0.5, 0, 30)
                 val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
                 gen_hsv[:, :, 2] = val_channel
 
@@ -483,7 +485,9 @@ class WearCastHD:
             else:
                 cx, cy = clone_mask.shape[1] // 2, clone_mask.shape[0] // 2
 
-            result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.MIXED_CLONE)
+            # FIX: NORMAL_CLONE preserves generated garment colors; MIXED_CLONE was
+            # blending destination (original skin/clothes) colors into the new garment
+            result_bgr = cv2.seamlessClone(src_bgr, dst_bgr, clone_mask, (cx, cy), cv2.NORMAL_CLONE)
             final_image = Image.fromarray(cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB))
             poisson_success = True
             print(f"   [COMPOSITE] Poisson MIXED_CLONE compositing successful (center={cx},{cy})")
@@ -616,15 +620,16 @@ class WearCastHD:
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
         raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
-        shift_v     = min(max(raw_shift_v, 0.0), 30.0)              # only boost, never darken; cap at 30
+        # FIX: Reduced V shift cap from 30→20 to prevent over-brightening
+        shift_v     = min(max(raw_shift_v, 0.0), 20.0)              # only boost, never darken; cap at 20
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
         sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
-        # FIX 2: Tighter saturation guard S/80 (was S/120) — pixels with S>80 are graphic/
+        # FIX: Tightest saturation guard S/50 — pixels with S>50 are graphic/
         # illustration elements and must NOT receive any brightness boost. This prevents the
         # blue scribbles, red text, and yellow figure from being washed out.
-        sat_weight   = np.clip(1.0 - sat_mask / 80.0, 0.0, 1.0)   # S<30→weight~1.0, S>80→weight~0.0
+        sat_weight   = np.clip(1.0 - sat_mask / 50.0, 0.0, 1.0)   # S<15→weight~1.0, S>50→weight~0.0
         v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
         corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
         gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
@@ -635,9 +640,10 @@ class WearCastHD:
         gen_std_s   = gen_hsv[mask_bool,  1].std() + 1e-6
         garm_std_s  = garm_hsv[valid_garm, 1].std() + 1e-6
         if is_white_garm:
-            # White garment: compress saturation, never expand it (cap ratio at 1.0)
-            ratio_s  = min(garm_std_s / gen_std_s, 1.00)          # cap at 1.0: compress blue std → toward white
-            shift_s  = (garm_mean_s - gen_mean_s) * 1.20          # slightly stronger pull toward low-S white
+            # White garment: compress saturation gently (cap ratio at 0.85)
+            # FIX: Reduced from 1.00→0.85 and shift 1.20→0.80 to prevent washing out colored elements
+            ratio_s  = min(garm_std_s / gen_std_s, 0.85)          # cap at 0.85: gentler compression
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.80          # gentler pull toward low-S white
         else:
             # Colorful garment: allow expansion for vibrancy
             ratio_s  = min(garm_std_s / gen_std_s, 1.60)
@@ -658,7 +664,8 @@ class WearCastHD:
             corrected_h = gen_hsv[:, :, 0].copy()
             # Only shift low-saturation (near-white shirt) pixels — protect vivid graphic colors
             sat_in_mask = gen_hsv[:, :, 1][mask_bool]  # saturation at mask pixels
-            low_sat_sel = sat_in_mask < 40             # S < 40 → near-white shirt background
+            # FIX: Tightened from S<40 to S<25 — only truly white pixels get hue shift
+            low_sat_sel = sat_in_mask < 25             # S < 25 → truly near-white shirt background
             mask_rows, mask_cols = np.where(mask_bool)
             corrected_h[mask_rows[low_sat_sel], mask_cols[low_sat_sel]] += hue_shift
             gen_hsv[:, :, 0] = np.clip(corrected_h, 0, 180)  # OpenCV H range is 0–180
@@ -700,10 +707,12 @@ class WearCastHD:
             mask_pix_b = corrected_rgb[mask_bool, 2]
             lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
             blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
-            # GUARD: lum>210 = truly near-white only. Protects blue collar/trim (darker blue, lum<210)
-            blue_sel   = (blue_bias > 10) & (lum_pix > 210)
+            # FIX: Raised lum guard from 210→230 — only desaturate truly white-area blue tinting,
+            # not blue collar/trim which is legitimately blue but bright
+            blue_sel   = (blue_bias > 10) & (lum_pix > 230)
             if blue_sel.sum() > 0:
-                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.35)  # gentle: max 35% desaturation
+                # FIX: Reduced max blend from 0.35→0.20 for gentler correction
+                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.20)  # gentle: max 20% desaturation
                 r_idx, c_idx = np.where(mask_bool)
                 r_blue = r_idx[blue_sel]
                 c_blue = c_idx[blue_sel]
@@ -906,7 +915,8 @@ class WearCastHD:
         # Must be LARGER than actual shoulder to cover shirt fabric at the seam
         ARM_PAD      = int(20 / 512 * height)   # inward pad from shoulder toward neck
         SLEEVE_PAD   = int(24 / 512 * height)   # pad at elbow level for sleeves
-        SHOULDER_OUT = int(35 / 512 * height)   # outward extension past shoulder keypoint
+        # FIX: Increased from 35→42 for wider shoulder hull coverage
+        SHOULDER_OUT = int(42 / 512 * height)   # outward extension past shoulder keypoint
         SLEEVE_LAT   = int(32 / 512 * height)   # lateral extension for sleeve hull
 
         print(f"   [MASK_GEN] Hull padding params: ARM_PAD={ARM_PAD} SLEEVE_PAD={SLEEVE_PAD} SHOULDER_OUT={SHOULDER_OUT} SLEEVE_LAT={SLEEVE_LAT}")
@@ -1038,8 +1048,24 @@ class WearCastHD:
         coverage_after_protect = 100*(inpaint_mask>0).mean()
         print(f"   [MASK_GEN] After protection: {coverage_before_protect:.1f}% -> {coverage_after_protect:.1f}%  (removed {coverage_before_protect-coverage_after_protect:.1f}%)")
 
+        # ---- SHOULDER BRIDGE FILL: Guarantee shoulder-seam coverage ----
+        # Paint a horizontal band across the shoulder region to fill any gaps
+        # the parse mask or hull missed at the shirt-arm seam
+        if category == 'upperbody' and not is_off_shoulder:
+            bridge_y_min = max(0, int(min(s_r[1], s_l[1])) - 8)
+            bridge_y_max = min(height - 1, int(max(s_r[1], s_l[1])) + 12)
+            bridge_x_min = max(0, int(min(s_r[0], s_l[0])) - SHOULDER_OUT)
+            bridge_x_max = min(width - 1, int(max(s_r[0], s_l[0])) + SHOULDER_OUT)
+            bridge_before = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
+            inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] = 1.0
+            # Re-apply protection to avoid painting over face/hair
+            inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
+            bridge_after = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
+            print(f"   [MASK_GEN] SHOULDER BRIDGE: Y=[{bridge_y_min},{bridge_y_max}] X=[{bridge_x_min},{bridge_x_max}]  coverage {100*bridge_before:.0f}%→{100*bridge_after:.0f}%")
+
         # ---- STEP 7: Morphology close + dilate to fill gaps ----
-        kernel_close  = np.ones((13, 13), np.uint8)
+        # FIX: Increased close kernel from 13→17 to bridge small shoulder-zone gaps
+        kernel_close  = np.ones((17, 17), np.uint8)
         kernel_dilate = np.ones((13, 13), np.uint8)
         inpaint_mask_u8 = (inpaint_mask * 255).astype(np.uint8)
         coverage_before_morph = 100*(inpaint_mask_u8>0).mean()
