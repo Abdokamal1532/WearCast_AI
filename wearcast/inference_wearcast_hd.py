@@ -33,73 +33,9 @@ def _dbg_tensor(label, t):
     else:
         print(f"   [DBG] {label:40s} | type={type(t)}")
 
-def match_histograms(src, ref, src_mask, ref_mask):
-    """Matches the histogram of src to ref, channel by channel, using provided masks."""
-    out = src.copy()
-    for c in range(src.shape[-1]):
-        s_vals = src[..., c][src_mask]
-        r_vals = ref[..., c][ref_mask]
-        if len(s_vals) == 0 or len(r_vals) == 0:
-            continue
-            
-        # Get quantiles
-        s_quantiles = np.percentile(s_vals, np.linspace(0, 100, 256))
-        r_quantiles = np.percentile(r_vals, np.linspace(0, 100, 256))
-        
-        # Interpolate
-        matched_vals = np.interp(s_vals, s_quantiles, r_quantiles)
-        out[..., c][src_mask] = matched_vals
-        
-    return np.clip(out, 0, 255).astype(np.float32)
-
-def laplacian_pyramid_blend(src, dst, mask, levels=6):
-    """Multi-scale blend: src inside mask, dst outside, smooth transition."""
-    # Ensure all have the same shape/type
-    h, w = src.shape[:2]
-    # Ensure dimensions are divisible by 2^levels to avoid pyrUp/pyrDown shape mismatches
-    # We pad the images if needed
-    pad_h = (2**levels - h % (2**levels)) % (2**levels)
-    pad_w = (2**levels - w % (2**levels)) % (2**levels)
-    
-    if pad_h > 0 or pad_w > 0:
-        src = cv2.copyMakeBorder(src, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-        dst = cv2.copyMakeBorder(dst, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-        mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-
-    gp_src = [src.astype(np.float32)]
-    gp_dst = [dst.astype(np.float32)]
-    
-    # If mask is 2D, make it 3D for broadcasting
-    if len(mask.shape) == 2:
-        mask = np.stack([mask]*3, axis=-1)
-    gp_mask = [mask.astype(np.float32)]
-    
-    # Build Gaussian pyramids
-    for _ in range(levels):
-        gp_src.append(cv2.pyrDown(gp_src[-1]))
-        gp_dst.append(cv2.pyrDown(gp_dst[-1]))
-        gp_mask.append(cv2.pyrDown(gp_mask[-1]))
-    
-    # Build Laplacian pyramids
-    lp_src = [gp_src[i] - cv2.pyrUp(gp_src[i+1], dstsize=gp_src[i].shape[:2][::-1]) for i in range(levels)]
-    lp_src.append(gp_src[levels])
-    
-    lp_dst = [gp_dst[i] - cv2.pyrUp(gp_dst[i+1], dstsize=gp_dst[i].shape[:2][::-1]) for i in range(levels)]
-    lp_dst.append(gp_dst[levels])
-    
-    # Blend at each level
-    lp_blend = [lp_src[i] * gp_mask[i] + lp_dst[i] * (1 - gp_mask[i]) for i in range(levels + 1)]
-    
-    # Reconstruct
-    result = lp_blend[levels]
-    for i in range(levels - 1, -1, -1):
-        result = cv2.pyrUp(result, dstsize=lp_blend[i].shape[:2][::-1]) + lp_blend[i]
-        
-    # Remove padding if added
-    if pad_h > 0 or pad_w > 0:
-        result = result[:h, :w]
-        
-    return np.clip(result, 0, 255).astype(np.uint8)
+# NOTE: match_histograms and laplacian_pyramid_blend were removed.
+# They over-corrected the UNet output and introduced halo/glow artifacts.
+# OOTDiffusion uses simple Gaussian-feathered mask compositing — we do the same.
 
 
 class WearCastHD:
@@ -430,9 +366,14 @@ class WearCastHD:
             print(f" -> Pipeline returned {len(images)} image(s)")
 
         # =====================================================================
-        # Phase 4: Final Post-processing
+        # Phase 4: Final Post-processing (OOTDiffusion-style paste-back)
         # =====================================================================
-        print(f"\n[WearCast] Phase 4/4: Final Post-processing...")
+        # The UNet was trained to produce realistic try-on results that look
+        # correct when composited with simple mask-based paste-back. Complex
+        # corrections (histogram matching, Laplacian pyramid, Poisson cloning)
+        # fight against the model and create halo/glow artifacts.
+        # =====================================================================
+        print(f"\n[WearCast] Phase 4/4: Final Post-processing (clean paste-back)...")
         raw_generated = images[0]
         raw_generated.save("debug_phase4_raw_unet_output.jpg")
         print(f" -> [SAVED] Raw UNet output saved to: debug_phase4_raw_unet_output.jpg")
@@ -440,127 +381,65 @@ class WearCastHD:
 
         gen_arr = np.array(raw_generated).astype(np.float32)
         ori_arr = np.array(image_ori).astype(np.float32)
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        t0_parse = time.time()
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # Get the original inpaint hull
+        # --- Build soft compositing mask ---
+        # Get the binary mask used during inpainting
         if hasattr(self, '_cached_hard_mask'):
-            hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)).astype(np.float32)
+            mask_pil = self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)
         else:
-            hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.float32) * 255.0
+            mask_pil = mask.resize(raw_generated.size, Image.BILINEAR)
 
-        mask_bool = hull_arr > 127
+        mask_np = np.array(mask_pil).astype(np.float32)
+        if mask_np.max() > 1.0:
+            mask_np = mask_np / 255.0
 
-        # --- Step 1/3: Color Diagnostics (before any correction) ---
-        print(f"\n   [COLOR DIAG] === Per-Channel Analysis (Mask Region) ===")
-        gen_in_mask   = gen_arr[mask_bool]
-        garm_fg_mask  = np.all(garm_arr >= 240, axis=-1)
-        garm_fg_valid = ~garm_fg_mask  # foreground (non-BG) pixels of garment
-        for ch, ch_name in enumerate(['Red', 'Green', 'Blue']):
-            gen_ch_mean  = gen_in_mask[:, ch].mean() if len(gen_in_mask) > 0 else 0
-            gen_ch_std   = gen_in_mask[:, ch].std() if len(gen_in_mask) > 0 else 0
-            garm_ch_mean = garm_arr[garm_fg_valid, ch].mean() if garm_fg_valid.sum() > 0 else 0
-            garm_ch_std  = garm_arr[garm_fg_valid, ch].std() if garm_fg_valid.sum() > 0 else 0
-            delta = gen_ch_mean - garm_ch_mean
-            print(f"   [COLOR DIAG]   {ch_name:5s}: Garment FG mean={garm_ch_mean:.1f}±{garm_ch_std:.1f} | UNet output mean={gen_ch_mean:.1f}±{gen_ch_std:.1f} | Δ={delta:+.1f}")
+        # Binarize then apply thin Gaussian feather (3px sigma)
+        # This is exactly what OOTDiffusion does — a thin, smooth transition
+        binary_mask = (mask_np > 0.5).astype(np.float32)
+        feather_sigma = 3.0
+        alpha = cv2.GaussianBlur(binary_mask, (0, 0), feather_sigma)
+        alpha = np.clip(alpha, 0.0, 1.0)
 
-        gen_lum_mask  = gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114
-        garm_lum_fg   = garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114
-        print(f"   [COLOR DIAG]   Lum  : Garment FG mean={garm_lum_fg.mean():.1f} | UNet output mean={gen_lum_mask.mean():.1f} | Δ={gen_lum_mask.mean()-garm_lum_fg.mean():+.1f}")
-
-        # Detect the white-garment problem: if garment is bright but output is dim
-        is_white_garment = garm_lum_fg.mean() > 170 if len(garm_lum_fg) > 0 else False
-        lum_deficit = garm_lum_fg.mean() - gen_lum_mask.mean() if len(garm_lum_fg) > 0 else 0
-        print(f"   [COLOR DIAG]   White garment={is_white_garment} | Luminance deficit={lum_deficit:.1f}")
-
-        # --- Step 2/3: Histogram Matching ---
-        print(f"\n -> Step 2/3: Histogram Matching (interior only)...")
-        corrected_arr = gen_arr.copy()
-
-        # Create a distance-transform based feather mask
-        binary_mask = (hull_arr > 127).astype(np.uint8)
-        dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
-        feather_width = 12.0  # pixels of transition
-        alpha = np.clip(dist / feather_width, 0, 1.0)
-        
-        # We only want to histogram-match the inside of the garment
-        interior_bool = alpha > 0.99
-        
-        # We only consider foreground of the garment image for histogram matching reference
-        garm_fg_bool = ~np.all(garm_arr >= 240, axis=-1)
-
-        if interior_bool.sum() > 100 and garm_fg_bool.sum() > 100:
-            # Match histograms
-            matched_interior = match_histograms(gen_arr, garm_arr, interior_bool, garm_fg_bool)
-            
-            # Blend with original generated image based on alpha
-            # 1.0 alpha = fully matched, 0.0 alpha = raw UNet output
-            alpha_3d = np.stack([alpha] * 3, axis=-1)
-            corrected_arr = matched_interior * alpha_3d + gen_arr * (1.0 - alpha_3d)
-            
-            Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)).save("debug_phase4_hist_matched.jpg")
-            print(f"   [HIST MATCH] [SAVED] debug_phase4_hist_matched.jpg")
-        else:
-            print(f"   [HIST MATCH] Skipped: too few interior/foreground pixels")
-            
+        # Save feather mask for debugging
         Image.fromarray((alpha * 255).astype(np.uint8)).save("debug_phase4_feather_mask.jpg")
-        print(f"   [FEATHER] [SAVED] Feather mask: debug_phase4_feather_mask.jpg")
+        print(f" -> Feather mask: sigma={feather_sigma}px")
 
-        # --- Step 3/3: Compositing (Laplacian Pyramid Blending) ---
-        print(f"\n -> Step 3/3: Laplacian Pyramid Compositing...")
+        # --- Simple alpha composite ---
+        # generated * alpha + original * (1 - alpha)
         t_composite = time.time()
-        
-        try:
-            # Blend corrected output into original image using feather mask
-            # We use alpha (which fades smoothly) as the blending mask
-            final_bgr = laplacian_pyramid_blend(
-                src=cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
-                dst=cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR),
-                mask=alpha,
-                levels=6
-            )
-            final_image = Image.fromarray(cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB))
-            print(f"   [COMPOSITE] Laplacian pyramid blend successful")
-        except Exception as e:
-            print(f"   [COMPOSITE] Laplacian pyramid blend failed: {e}. Falling back to alpha blending.")
-            alpha_3d = np.stack([alpha] * 3, axis=-1)
-            final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+        alpha_3ch = np.stack([alpha] * 3, axis=-1)
+        final_arr = gen_arr * alpha_3ch + ori_arr * (1.0 - alpha_3ch)
+        final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+        print(f" -> Alpha compositing completed in {time.time()-t_composite:.3f}s")
 
-        # Save diagnostics
-        comparison_w = raw_generated.size[0] * 4
+        # --- Diagnostics ---
+        mask_bool = binary_mask > 0.5
+        gen_in_mask = gen_arr[mask_bool]
+        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
+        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
+        garm_fg_valid = ~garm_fg_mask
+        gen_lum = (gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114) if len(gen_in_mask) > 0 else np.array([0])
+        garm_lum = (garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114) if garm_fg_valid.sum() > 0 else np.array([0])
+        print(f"   [DIAG] UNet garment luminance: {gen_lum.mean():.1f} | Reference: {garm_lum.mean():.1f}")
+
+        final_np = np.array(final_image).astype(np.float32)
+        final_in_mask = final_np[mask_bool]
+        final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114 if len(final_in_mask) > 0 else np.array([0])
+        print(f"   [DIAG] Final composited luminance: {final_lum.mean():.1f}")
+
+        # Save 3-panel comparison: Garment | Raw UNet | Final
+        comparison_w = raw_generated.size[0] * 3
         comparison = Image.new('RGB', (comparison_w, raw_generated.size[1]))
         comparison.paste(image_garm.resize(raw_generated.size), (0, 0))
         comparison.paste(raw_generated, (raw_generated.size[0], 0))
-        comparison.paste(Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)), (raw_generated.size[0] * 2, 0))
-        comparison.paste(final_image, (raw_generated.size[0] * 3, 0))
+        comparison.paste(final_image, (raw_generated.size[0] * 2, 0))
         comparison.save("debug_phase4_comparison.jpg")
-        print(f"   [COMPOSITE] [SAVED] 4-panel comparison: Garment | Raw UNet | Hist Matched | Final")
-
-        # Post-compositing diagnostics
-        final_np = np.array(final_image).astype(np.float32)
-        final_in_mask = final_np[mask_bool]
-        final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114
-        print(f"   [COMPOSITE] Final luminance in mask: mean={final_lum.mean():.1f} (target≈{garm_lum_fg.mean():.1f})")
-        print(f"   [COMPOSITE] Completed in {time.time()-t_composite:.2f}s")
+        print(f" -> [SAVED] 3-panel comparison: Garment | Raw UNet | Final")
 
         final_image.save("debug_final_output.jpg")
         print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
-
-        print(f"\n   [SUMMARY] Debug images saved:")
-        print(f"     1. debug_phase2_garment_original.jpg    — Input garment")
-        print(f"     2. debug_phase2_clip_bg_replaced.jpg    — CLIP input (BG neutralized)")
-        print(f"     3. debug_phase2_clip_enhanced.jpg       — CLIP input (sharpened+contrast)")
-        print(f"     4. debug_phase2_vae_roundtrip.jpg       — VAE encode→decode fidelity")
-        print(f"     5. debug_phase3_masked_person.jpg       — Person with mask applied")
-        print(f"     6. debug_final_unet_mask.jpg            — Binary mask for UNet")
-        print(f"     7. debug_phase4_raw_unet_output.jpg     — Raw UNet output (no correction)")
-        print(f"     8. debug_phase4_color_corrected.jpg     — Interior brightness correction")
-        print(f"     9. debug_phase4_interior_mask.jpg       — Eroded interior mask")
-        print(f"    10. debug_phase4_comparison.jpg          — 4-panel: Garment|Raw|Corrected|Final")
-        print(f"    11. debug_final_output.jpg               — Final result")
 
         print("\n[WearCast] SUCCESS: Inference completed successfully!")
         print("=" * 70)
