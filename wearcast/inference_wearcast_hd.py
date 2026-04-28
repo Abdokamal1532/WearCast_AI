@@ -406,28 +406,50 @@ class WearCastHD:
         Image.fromarray((alpha * 255).astype(np.uint8)).save("debug_phase4_feather_mask.jpg")
         print(f" -> Feather mask: sigma={feather_sigma}px")
 
-        # --- Simple alpha composite ---
-        # generated * alpha + original * (1 - alpha)
+        # --- Pre-compositing diagnostics ---
+        mask_bool = binary_mask > 0.5
+        gen_in_mask = gen_arr[mask_bool]
+        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
+        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
+        garm_fg_valid = ~garm_fg_mask
+        gen_lum_mean = float((gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114).mean()) if len(gen_in_mask) > 0 else 128.0
+        garm_lum_mean = float((garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114).mean()) if garm_fg_valid.sum() > 0 else 128.0
+        lum_gap = garm_lum_mean - gen_lum_mean
+        print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
+
+        # --- Gentle luminance & color recovery (artifact-free) ---
+        # Uniform operations only — no spatial variation, so no halos possible.
+        # The UNet adapts lighting for on-body realism but often over-darkens;
+        # we recover 30% of the gap via a global multiplicative scale.
+        if lum_gap > 15:
+            correction_strength = 0.30
+            target_lum = gen_lum_mean + lum_gap * correction_strength
+            scale = target_lum / max(gen_lum_mean, 1.0)
+            gen_arr = np.clip(gen_arr * scale, 0, 255)
+            print(f"   [CORR] Luminance recovery: scale={scale:.3f} (+{lum_gap*correction_strength:.1f} lum)")
+        else:
+            print(f"   [CORR] Luminance gap <= 15, no correction needed")
+
+        # Subtle saturation boost to counteract VAE color dampening
+        sat_boost = 1.12
+        gen_uint8 = np.clip(gen_arr, 0, 255).astype(np.uint8)
+        gen_hsv = cv2.cvtColor(gen_uint8, cv2.COLOR_RGB2HSV).astype(np.float32)
+        gen_hsv[:, :, 1] = np.clip(gen_hsv[:, :, 1] * sat_boost, 0, 255)
+        gen_arr = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+        print(f"   [CORR] Saturation boost: +{int((sat_boost-1)*100)}%")
+
+        # --- Alpha composite (OOTDiffusion-style paste-back) ---
         t_composite = time.time()
         alpha_3ch = np.stack([alpha] * 3, axis=-1)
         final_arr = gen_arr * alpha_3ch + ori_arr * (1.0 - alpha_3ch)
         final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
         print(f" -> Alpha compositing completed in {time.time()-t_composite:.3f}s")
 
-        # --- Diagnostics ---
-        mask_bool = binary_mask > 0.5
-        gen_in_mask = gen_arr[mask_bool]
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
-        garm_fg_valid = ~garm_fg_mask
-        gen_lum = (gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114) if len(gen_in_mask) > 0 else np.array([0])
-        garm_lum = (garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114) if garm_fg_valid.sum() > 0 else np.array([0])
-        print(f"   [DIAG] UNet garment luminance: {gen_lum.mean():.1f} | Reference: {garm_lum.mean():.1f}")
-
+        # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
         final_in_mask = final_np[mask_bool]
-        final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114 if len(final_in_mask) > 0 else np.array([0])
-        print(f"   [DIAG] Final composited luminance: {final_lum.mean():.1f}")
+        final_lum = float((final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114).mean()) if len(final_in_mask) > 0 else 0.0
+        print(f"   [DIAG] Final composited luminance: {final_lum:.1f} (recovered from {gen_lum_mean:.1f})")
 
         # Save 3-panel comparison: Garment | Raw UNet | Final
         comparison_w = raw_generated.size[0] * 3
