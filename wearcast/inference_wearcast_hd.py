@@ -730,301 +730,109 @@ class WearCastHD:
         return refined
 
     def get_mask_location(self, model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
-        print(f"\n   [MASK_GEN] ============================================================")
-        print(f"   [MASK_GEN] get_mask_location: model_type={model_type}  category={category}  target_size=({width},{height})")
+        label_map = {
+            "background": 0,
+            "hat": 1,
+            "hair": 2,
+            "sunglasses": 3,
+            "upper_clothes": 4,
+            "skirt": 5,
+            "pants": 6,
+            "dress": 7,
+            "belt": 8,
+            "left_shoe": 9,
+            "right_shoe": 10,
+            "head": 11,
+            "left_leg": 12,
+            "right_leg": 13,
+            "left_arm": 14,
+            "right_arm": 15,
+            "bag": 16,
+            "scarf": 17,
+        }
         im_parse = model_parse.resize((width, height), Image.NEAREST)
         parse_array = np.array(im_parse)
-        print(f"   [MASK_GEN] parse_array shape={parse_array.shape}  unique_vals={np.unique(parse_array).tolist()}")
 
-        print(" -> Constructing Smart Category Mask (Off-Shoulder/Crop-Top Aware)...")
+        arm_width = 60
 
-        pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
-        scale = height / 512.0
-        pt = lambda idx: np.multiply(pose_data[idx][:2], scale)
+        parse_head = (parse_array == 1).astype(np.float32) + \
+                     (parse_array == 3).astype(np.float32) + \
+                     (parse_array == 11).astype(np.float32)
 
-        nose  = pt(0)
-        neck  = pt(1)
-        s_r, s_l = pt(2), pt(5)
-        e_r, e_l = pt(3), pt(6)
-        w_r, w_l = pt(4), pt(7)
-        hip_r = pt(8)
-        hip_l = pt(11)
+        parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
+                            (parse_array == label_map["right_shoe"]).astype(np.float32) + \
+                            (parse_array == label_map["hat"]).astype(np.float32) + \
+                            (parse_array == label_map["sunglasses"]).astype(np.float32) + \
+                            (parse_array == label_map["bag"]).astype(np.float32)
 
-        print(f"   [MASK_GEN] Key points (scaled by {scale:.3f}):")
-        print(f"              Nose={nose.tolist()}  Neck={neck.tolist()}")
-        print(f"              Shoulder R={s_r.tolist()}  L={s_l.tolist()}")
-        print(f"              Elbow    R={e_r.tolist()}  L={e_l.tolist()}")
-        print(f"              Wrist    R={w_r.tolist()}  L={w_l.tolist()}")
-        print(f"              Hip      R={hip_r.tolist()}  L={hip_l.tolist()}")
+        parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
 
-        # ---- STEP 1: Base semantic mask per category ----
-        if category == 'upperbody':
-            target_labels = [4, 7]
-            arm_labels    = [14, 15]
-        elif category == 'lowerbody':
-            target_labels = [5, 6, 12, 13]
-            arm_labels    = []
-        elif category == 'dress':
-            target_labels = [4, 5, 6, 7]
-            arm_labels    = [14, 15]
+        arms_left = (parse_array == 14).astype(np.float32)
+        arms_right = (parse_array == 15).astype(np.float32)
+        arms = arms_left + arms_right
+
+        parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
+        parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + \
+                                        (parse_array == label_map["pants"]).astype(np.float32)
+        parser_mask_fixed += parser_mask_fixed_lower_cloth
+        parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+
+        # Load pose points
+        pose_data = keypoint["pose_keypoints_2d"]
+        pose_data = np.array(pose_data)
+        pose_data = pose_data.reshape((-1, 2))
+
+        im_arms_left = Image.new('L', (width, height))
+        im_arms_right = Image.new('L', (width, height))
+        arms_draw_left = ImageDraw.Draw(im_arms_left)
+        arms_draw_right = ImageDraw.Draw(im_arms_right)
+        shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
+        shoulder_left = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
+        elbow_right = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
+        elbow_left = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
+        wrist_right = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
+        wrist_left = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+        ARM_LINE_WIDTH = int(arm_width / 512 * height)
+        size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
+        size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
+                      shoulder_right[1] + ARM_LINE_WIDTH // 2]
+
+        if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
+            im_arms_right = arms_right
         else:
-            target_labels = [4, 7]
-            arm_labels    = [14, 15]
+            wrist_right = self.extend_arm_mask(wrist_right, elbow_right, 1.2)
+            arms_draw_right.line(np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-        garment_mask = np.zeros((height, width), dtype=np.float32)
-        for label in target_labels:
-            px_count = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Label {label}: {px_count} pixels")
-            garment_mask += (parse_array == label).astype(np.float32)
-
-        # GARMENT DILATION: 7px minimum to fill boundary gaps (reduced from 13 to prevent puffy over-expansion)
-        k_size = max(int((height * 0.014)) | 1, 7)
-        print(f"   [MASK_GEN] Garment dilation kernel size: {k_size}x{k_size}")
-        kernel_garment = np.ones((k_size, k_size), np.uint8)
-        garment_mask_pre_dilate = garment_mask.copy()
-        garment_mask = cv2.dilate(garment_mask, kernel_garment, iterations=1)
-        print(f"   [MASK_GEN] Garment mask coverage before dilation: {100*(garment_mask_pre_dilate>0).mean():.1f}%")
-        print(f"   [MASK_GEN] Garment mask coverage after  dilation: {100*(garment_mask>0).mean():.1f}%")
-
-        arm_mask = np.zeros((height, width), dtype=np.float32)
-        for label in arm_labels:
-            px_count = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Arm Label {label}: {px_count} pixels")
-            arm_mask += (parse_array == label).astype(np.float32)
-
-        # ---- ARM MASK: Keep entire arm from shoulder to elbow (NO forearm clipping) ----
-        # ROOT CAUSE of shoulder holes: clipping arm_mask at 90% shoulder→elbow removes 
-        # the shoulder seam pixel band, creating a visible gap/hole at the shoulder.
-        # FIX: Keep ALL arm pixels up to the elbow, but NOT beyond (avoids forearm ghost).
-        if len(arm_labels) > 0 and category == 'upperbody':
-            arm_px_before = (arm_mask > 0).sum()
-            avg_elbow_y = (e_r[1] + e_l[1]) / 2.0
-            # Use elbow Y + small padding: covers full sleeve including hem
-            sleeve_cutoff_y = int(avg_elbow_y + int(5 / 512 * height))
-            sleeve_cutoff_y = max(0, min(height - 1, sleeve_cutoff_y))
-            arm_mask[sleeve_cutoff_y:, :] = 0
-            arm_px_after = (arm_mask > 0).sum()
-            print(f"   [MASK_GEN] ARM CLIP: zeroed arm below Y={sleeve_cutoff_y} (elbow_y={avg_elbow_y:.0f})")
-            print(f"   [MASK_GEN] ARM CLIP: arm pixels before={arm_px_before}  after={arm_px_after}  removed={arm_px_before-arm_px_after}")
+        if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
+            im_arms_left = arms_left
         else:
-            print(f"   [MASK_GEN] No arm clip applied (arm_labels={arm_labels}, cat={category}).")
+            wrist_left = self.extend_arm_mask(wrist_left, elbow_left, 1.2)
+            arms_draw_left.line(np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-        base_mask = np.clip(garment_mask + arm_mask, 0, 1)
-        print(f"   [MASK_GEN] base_mask coverage: {100*(base_mask > 0).mean():.1f}%")
+        hands_left = np.logical_and(np.logical_not(im_arms_left), arms_left)
+        hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
+        parser_mask_fixed += hands_left + hands_right
 
-        # ---- STEP 2: Detect garment sub-type ----
-        upper_clothes_rows = np.where((parse_array == 4).any(axis=1))[0]
-        if len(upper_clothes_rows) > 0:
-            garment_top_y = upper_clothes_rows.min()
-            shoulder_y    = min(s_r[1], s_l[1])
-            is_off_shoulder = garment_top_y > (shoulder_y + int(20 / 512 * height))
-            print(f"   [MASK GEOM] Garment Top Y={garment_top_y}, Shoulder Y={shoulder_y:.1f} -> Off-Shoulder={is_off_shoulder}")
-        else:
-            is_off_shoulder = False
-            print("   [MASK GEOM] No upper clothes detected in parse mask.")
+        parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
+        neck_mask = (parse_array == 18).astype(np.float32)
+        neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
+        neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
+        parse_mask = np.logical_or(parse_mask, neck_mask)
+        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
+        parse_mask += np.logical_or(parse_mask, arm_mask)
 
-        garment_pixels_y = np.where(base_mask > 0)[0]
-        is_crop_top = False
-        if len(garment_pixels_y) > 0:
-            garment_bottom_y = np.max(garment_pixels_y)
-            hip_y = (hip_r[1] + hip_l[1]) / 2
-            if hip_y > 0:
-                is_crop_top = garment_bottom_y < (hip_y * 0.85)
-                print(f"   [MASK GEOM] Garment Bottom Y={garment_bottom_y}, Hip Y={hip_y:.1f} -> Crop-Top={is_crop_top}")
+        parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
 
-        # ---- STEP 3: Build hull points ----
-        # SHOULDER_OUT: how far outward the hull extends from shoulder keypoint
-        # Must be LARGER than actual shoulder to cover shirt fabric at the seam
-        ARM_PAD      = int(20 / 512 * height)   # inward pad from shoulder toward neck
-        SLEEVE_PAD   = int(16 / 512 * height)   # pad at elbow level for sleeves (reduced from 24 to prevent puffy elbows)
-        # FIX: Reduced from 42→30 to prevent boxy/puffy shoulder over-extension
-        SHOULDER_OUT = int(30 / 512 * height)   # outward extension past shoulder keypoint
-        SLEEVE_LAT   = int(22 / 512 * height)   # lateral extension for sleeve hull (reduced from 32)
+        parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
+        inpaint_mask = 1 - parse_mask_total
+        img = np.where(inpaint_mask, 255, 0)
+        dst = self.hole_fill(img.astype(np.uint8))
+        dst = self.refine_mask(dst)
+        inpaint_mask = dst / 255 * 1
+        mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
+        mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
 
-        print(f"   [MASK_GEN] Hull padding params: ARM_PAD={ARM_PAD} SLEEVE_PAD={SLEEVE_PAD} SHOULDER_OUT={SHOULDER_OUT} SLEEVE_LAT={SLEEVE_LAT}")
-        hull_pts = []
-
-        if is_off_shoulder:
-            hull_pts += [
-                [s_r[0] + ARM_PAD,    s_r[1] + int(20/512*height)],
-                [s_l[0] - ARM_PAD,    s_l[1] + int(20/512*height)],
-                [e_r[0] + SLEEVE_PAD, e_r[1]],
-                [e_l[0] - SLEEVE_PAD, e_l[1]],
-            ]
-            protect_labels = [1, 2, 11, 18]
-            print(f"   [MASK_GEN] Off-shoulder hull: 4 pts")
-        else:
-            hull_pts += [
-                [s_r[0] - SHOULDER_OUT, s_r[1]],          # right shoulder — FAR outward
-                [s_r[0] + ARM_PAD,      s_r[1]],          # right shoulder — inward
-                [s_l[0] + SHOULDER_OUT, s_l[1]],          # left shoulder  — FAR outward
-                [s_l[0] - ARM_PAD,      s_l[1]],          # left shoulder  — inward
-                [neck[0],               neck[1] + int(2/512*height)],   # neck base
-            ]
-            print(f"   [MASK_GEN] Shoulder hull pts:")
-            print(f"              R-out=[{s_r[0]-SHOULDER_OUT:.0f},{s_r[1]:.0f}]  R-in=[{s_r[0]+ARM_PAD:.0f},{s_r[1]:.0f}]")
-            print(f"              L-out=[{s_l[0]+SHOULDER_OUT:.0f},{s_l[1]:.0f}]  L-in=[{s_l[0]-ARM_PAD:.0f},{s_l[1]:.0f}]")
-
-            # Hip-level anchor: fills torso body of shirt
-            hip_y_val = (hip_r[1] + hip_l[1]) / 2
-            if hip_y_val > 0:
-                hull_anchor_y = int(hip_y_val * 0.97)
-                hip_pad = int(12 / 512 * height)
-                hull_pts += [
-                    [hip_r[0] + hip_pad, hull_anchor_y],
-                    [hip_l[0] - hip_pad, hull_anchor_y],
-                ]
-                print(f"   [MASK_GEN] Hip hull pts: Y={hull_anchor_y}  R_x={hip_r[0]+hip_pad:.0f}  L_x={hip_l[0]-hip_pad:.0f}")
-
-            # Sleeve hull: extend outward at mid-sleeve to cover short sleeve fabric
-            has_sleeves = (parse_array == 14).sum() + (parse_array == 15).sum() > 200
-            print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm_px={(parse_array==14).sum()+(parse_array==15).sum()})")
-            if has_sleeves:
-                # Mid-sleeve Y: 50% down shoulder→elbow (not 65%) — shorter sleeves mean we need the hull earlier
-                sleeve_y_r = int(s_r[1] + 0.50 * (e_r[1] - s_r[1]))
-                sleeve_y_l = int(s_l[1] + 0.50 * (e_l[1] - s_l[1]))
-                # Also add a second point near shoulder for upper sleeve
-                upper_sleeve_y_r = int(s_r[1] + 0.20 * (e_r[1] - s_r[1]))
-                upper_sleeve_y_l = int(s_l[1] + 0.20 * (e_l[1] - s_l[1]))
-                hull_pts += [
-                    [s_r[0] - SLEEVE_LAT, upper_sleeve_y_r],  # RIGHT upper sleeve
-                    [s_r[0] - SLEEVE_LAT, sleeve_y_r],        # RIGHT lower sleeve
-                    [s_l[0] + SLEEVE_LAT, upper_sleeve_y_l],  # LEFT  upper sleeve
-                    [s_l[0] + SLEEVE_LAT, sleeve_y_l],        # LEFT  lower sleeve
-                ]
-                print(f"   [MASK_GEN] Sleeve hull: R_upper=[{s_r[0]-SLEEVE_LAT:.0f},{upper_sleeve_y_r}]  R_lower=[{s_r[0]-SLEEVE_LAT:.0f},{sleeve_y_r}]")
-                print(f"   [MASK_GEN] Sleeve hull: L_upper=[{s_l[0]+SLEEVE_LAT:.0f},{upper_sleeve_y_l}]  L_lower=[{s_l[0]+SLEEVE_LAT:.0f},{sleeve_y_l}]")
-            protect_labels = [1, 2, 11]
-
-        print(f"   [MASK_GEN] Total hull_pts: {len(hull_pts)}")
-        for i, pt_val in enumerate(hull_pts):
-            print(f"   [MASK_GEN]   hull_pt[{i}]: {pt_val}")
-
-        # ---- STEP 4: Waist / Crop-top cutoff ----
-        if is_crop_top and len(garment_pixels_y) > 0:
-            garment_bottom_y = np.max(garment_pixels_y)
-            cutoff = int(garment_bottom_y * 1.05)
-            base_mask[cutoff:, :] = 0
-            print(f"   [MASK_GEN] Crop-top cutoff applied at Y={cutoff}")
-
-        hip_y = (hip_r[1] + hip_l[1]) / 2
-        if category == 'upperbody' and hip_y > 0:
-            waist_cutoff = int(hip_y + int(25 / 512 * height))
-            base_mask[waist_cutoff:, :] = 0
-            print(f"   [MASK GEOM] Upperbody waist cutoff applied at Y={waist_cutoff}")
-
-        # ---- STEP 5: Convex hull from core torso ----
-        core_mask = np.zeros((height, width), dtype=np.float32)
-        if category == 'upperbody':
-            for label in [4, 7]:
-                core_mask += (parse_array == label).astype(np.float32)
-        else:
-            core_mask = base_mask.copy()
-
-        if is_crop_top and len(garment_pixels_y) > 0:
-            core_mask[int(np.max(garment_pixels_y) * 1.05):, :] = 0
-        if category == 'upperbody' and hip_y > 0:
-            core_mask[waist_cutoff:, :] = 0
-
-        core_pixels = np.column_stack(np.where(core_mask > 0))
-        valid = lambda p: p[0] > 1 and p[1] > 1
-        valid_hull_pts = [p for p in hull_pts if valid(p)]
-        print(f"   [MASK_GEN] core_pixels={len(core_pixels)}  valid_hull_pts={len(valid_hull_pts)}")
-
-        if len(core_pixels) > 5 and len(valid_hull_pts) >= 3:
-            core_xy = core_pixels[:, [1, 0]]
-            if len(core_xy) > 800:
-                idx = np.random.choice(len(core_xy), 800, replace=False)
-                core_xy = core_xy[idx]
-            all_pts = np.vstack([core_xy, np.array(valid_hull_pts)]).astype(np.float32)
-            hull = cv2.convexHull(all_pts)
-            hull_mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
-            hull_coverage = 100*(hull_mask > 0).mean()
-            print(f"   [MASK_GEN] Convex hull built. Hull coverage: {hull_coverage:.1f}%")
-            # DIAGNOSTIC: check if shoulder region is covered by hull
-            sh_y_min = int(min(s_r[1], s_l[1])) - 5
-            sh_y_max = int(min(s_r[1], s_l[1])) + 15
-            sh_x_min = int(min(s_r[0], s_l[0]) - SHOULDER_OUT) - 5
-            sh_x_max = int(max(s_r[0], s_l[0]) + SHOULDER_OUT) + 5
-            sh_y_min = max(0, sh_y_min); sh_y_max = min(height-1, sh_y_max)
-            sh_x_min = max(0, sh_x_min); sh_x_max = min(width-1,  sh_x_max)
-            shoulder_region = hull_mask[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-            print(f"   [MASK_GEN] SHOULDER REGION CHECK (Y={sh_y_min}:{sh_y_max}, X={sh_x_min}:{sh_x_max}): "
-                  f"coverage={100*(shoulder_region>0).mean():.1f}%  "
-                  f"({'GOOD - covered' if (shoulder_region>0).mean() > 0.3 else 'WARNING - low coverage - SHOULDER HOLE RISK'})")
-            inpaint_mask = np.logical_or(base_mask, hull_mask / 255.0).astype(np.float32)
-        else:
-            print(f"   [MASK_GEN] WARNING: Skipped convex hull (not enough points). Using raw base_mask.")
-            inpaint_mask = base_mask.copy()
-
-        # ---- STEP 6: Protect face/hair/neck ----
-        protect_mask = np.zeros((height, width), dtype=np.float32)
-        for label in protect_labels:
-            px = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Protect label {label}: {px} pixels")
-            protect_mask += (parse_array == label).astype(np.float32)
-        protect_mask = np.clip(protect_mask, 0, 1)
-        coverage_before_protect = 100*(inpaint_mask>0).mean()
-        inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-        coverage_after_protect = 100*(inpaint_mask>0).mean()
-        print(f"   [MASK_GEN] After protection: {coverage_before_protect:.1f}% -> {coverage_after_protect:.1f}%  (removed {coverage_before_protect-coverage_after_protect:.1f}%)")
-
-        # ---- SHOULDER BRIDGE FILL: Guarantee shoulder-seam coverage ----
-        # Draw thick lines between neck and shoulders, and circles at shoulders,
-        # to ensure no gaps at the seams, even if shoulders are tilted.
-        if category == 'upperbody' and not is_off_shoulder:
-            thickness = int(35 / 512 * height)
-            circle_radius = int(35 / 512 * height)
-            
-            bridge_mask = np.zeros((height, width), dtype=np.uint8)
-            
-            # Draw circles at shoulders to cover the deltoid/seam area completely
-            cv2.circle(bridge_mask, (int(s_r[0]), int(s_r[1])), circle_radius, 1, -1)
-            cv2.circle(bridge_mask, (int(s_l[0]), int(s_l[1])), circle_radius, 1, -1)
-            
-            # Draw thick lines from neck to shoulders to fill the trapezius/collarbone area
-            cv2.line(bridge_mask, (int(neck[0]), int(neck[1])), (int(s_r[0]), int(s_r[1])), 1, thickness)
-            cv2.line(bridge_mask, (int(neck[0]), int(neck[1])), (int(s_l[0]), int(s_l[1])), 1, thickness)
-            
-            inpaint_mask = np.logical_or(inpaint_mask, bridge_mask).astype(np.float32)
-            
-            # Re-apply protection to avoid painting over face/hair
-            inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-            print(f"   [MASK_GEN] SHOULDER BRIDGE: Applied geometric bridge with radius {circle_radius} and thickness {thickness}")
-
-        # ---- STEP 7: Morphology close + dilate to fill gaps ----
-        # FIX: Reduced close 17→11, dilate 13→7 to prevent puffy over-expansion
-        kernel_close  = np.ones((11, 11), np.uint8)
-        kernel_dilate = np.ones((7, 7), np.uint8)
-        inpaint_mask_u8 = (inpaint_mask * 255).astype(np.uint8)
-        coverage_before_morph = 100*(inpaint_mask_u8>0).mean()
-        inpaint_mask_u8 = cv2.morphologyEx(inpaint_mask_u8, cv2.MORPH_CLOSE, kernel_close)
-        inpaint_mask_u8 = cv2.dilate(inpaint_mask_u8, kernel_dilate, iterations=1)
-        coverage_after_morph = 100*(inpaint_mask_u8>0).mean()
-        print(f"   [MASK_GEN] Morphology: before={coverage_before_morph:.1f}%  after={coverage_after_morph:.1f}%  gained={coverage_after_morph-coverage_before_morph:.1f}%")
-
-        # DIAGNOSTIC: check shoulder area after morphology
-        sh_check = inpaint_mask_u8[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-        print(f"   [MASK_GEN] POST-MORPH SHOULDER CHECK: coverage={100*(sh_check>0).mean():.1f}%  "
-              f"({'GOOD' if (sh_check>0).mean() > 0.5 else 'STILL LOW - SHOULDER HOLE WILL APPEAR'})")
-
-        filled = self.hole_fill(inpaint_mask_u8)
-        dst    = self.refine_mask(filled)
-        print(f"   [MASK_GEN] After hole_fill+refine: dst coverage={100*(dst>0).mean():.1f}%")
-
-        # DIAGNOSTIC: final shoulder check
-        sh_final = dst[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-        print(f"   [MASK_GEN] FINAL SHOULDER CHECK: coverage={100*(sh_final>0).mean():.1f}%  "
-              f"({'GOOD' if (sh_final>0).mean() > 0.5 else 'PROBLEM: shoulder not masked - HOLE WILL APPEAR'})")
-
-        # ---- STEP 8: Soft feathered edge (tighter: 15px/σ5 instead of 21px/σ7) ----
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (15, 15), 5)
-        inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
-
-        percentage = 100 * np.sum(dst > 0) / (width * height)
-        print(f" -> Smart Category Mask: {percentage:.1f}% | OffShoulder={is_off_shoulder} | CropTop={is_crop_top}")
-        print(f"   [MASK_GEN] ============================================================")
-
-        self._cached_hard_mask = Image.fromarray(dst)
-        return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
+        return mask, mask_gray
