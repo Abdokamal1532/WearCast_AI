@@ -286,11 +286,13 @@ class WearCastHD:
             image_garm.save("debug_phase2_garment_original.jpg")
             print(f" -> [SAVED] Original garment saved to: debug_phase2_garment_original.jpg")
 
-            # --- 2b. Garment Enhancement for CLIP ---
-            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
-            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
-            garm_enhanced.save("debug_phase2_clip_enhanced.jpg")
-            print(f" -> [SAVED] CLIP enhanced garment saved to: debug_phase2_clip_enhanced.jpg")
+            # --- 2b. CLIP input preparation ---
+            # Use the processed garment directly for CLIP encoding.
+            # Heavy sharpness/contrast enhancement was removed because it
+            # over-emphasises edges and textures, causing stiff/puffy artifacts.
+            garm_enhanced = garm_proc
+            garm_enhanced.save("debug_phase2_clip_input.jpg")
+            print(f" -> [SAVED] CLIP input garment saved to: debug_phase2_clip_input.jpg")
 
             # --- 2c. CLIP Encoding ---
             prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
@@ -495,13 +497,14 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex garments (graphics, patterns, text): higher guidance forces the UNet
-            # to commit to the garment detail. OOTD image_guidance_scale sweet-spot is 3.5-5.0;
-            # values above 5.0 can cause over-saturation artifacts.
-            return {"num_steps": 40, "image_scale": 4.0}
+            # Complex garments: use moderate guidance to preserve garment detail
+            # while allowing natural fabric draping. OOTDiffusion docs recommend
+            # image_guidance_scale 2.0-2.5; >2.5 causes color distortion and puffy artifacts.
+            return {"num_steps": 25, "image_scale": 2.0}
         else:
-            # Simple/solid garments: lower guidance preserves natural draping
-            return {"num_steps": 30, "image_scale": 2.5}
+            # Simple/solid garments: gentle guidance for natural draping and fit.
+            # Lower value lets the UNet adapt the garment to body shape freely.
+            return {"num_steps": 20, "image_scale": 1.5}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
