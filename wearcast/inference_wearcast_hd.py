@@ -438,8 +438,9 @@ class WearCastHD:
 
             if n_target > 100:
                 current_val = val_channel[correction_target]
-                # FIX: Rebalanced — 0.65 multiplier, 45 cap (0.5/30 was too weak vs Poisson undoing it)
-                brightness_boost = np.clip((240.0 - current_val) * 0.65, 0, 45)
+                # Phase 3: Stronger pre-Poisson push — 0.80 multiplier, 55 cap
+                # Poisson will claw back ~40pts, so we need to over-correct significantly
+                brightness_boost = np.clip((240.0 - current_val) * 0.80, 0, 55)
                 val_channel[correction_target] = np.clip(current_val + brightness_boost, 0, 255)
                 gen_hsv[:, :, 2] = val_channel
 
@@ -475,8 +476,8 @@ class WearCastHD:
             src_bgr = cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             dst_bgr = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
             clone_mask = (hull_arr > 127).astype(np.uint8) * 255
-            # Erosion of clone mask to ensure clean Poisson boundary (5×5 prevents edge bleed)
-            clone_mask = cv2.erode(clone_mask, np.ones((5, 5), np.uint8), iterations=1)
+            # Phase 3: 7×7 erosion eliminates the visible halo/glow at garment boundaries
+            clone_mask = cv2.erode(clone_mask, np.ones((7, 7), np.uint8), iterations=1)
 
             M = cv2.moments(clone_mask)
             if M["m00"] > 0:
@@ -518,14 +519,27 @@ class WearCastHD:
                 rescue_low_sat = rescue_hsv[:, :, 1] < 50  # S<50 = shirt body, not graphics
                 rescue_target = interior_bool & rescue_low_sat
 
-                # Scale rescue strength by remaining deficit (diminishing returns)
-                rescue_strength = np.clip(remaining_deficit * 0.60, 0, 45)
+                # Phase 3: Much stronger rescue — 0.85 multiplier, 65 cap
+                # This is the FINAL pass, so we must close the full gap here
+                rescue_strength = np.clip(remaining_deficit * 0.85, 0, 65)
                 # Apply per-pixel with interior_alpha falloff (no edge artifacts)
                 for ch in range(3):
                     rescue_arr[rescue_target, ch] = np.clip(
                         rescue_arr[rescue_target, ch] + rescue_strength * interior_alpha[rescue_target],
                         0, 255
                     )
+
+                # Second micro-pass: check if still short and apply direct boost
+                post_lum_check = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
+                still_short = garm_lum_fg.mean() - post_lum_check.mean()
+                if still_short > 12:
+                    micro_boost = np.clip(still_short * 0.70, 0, 40)
+                    print(f"   [POST-RESCUE] Micro-pass: still {still_short:.1f}pts short, applying +{micro_boost:.1f}")
+                    for ch in range(3):
+                        rescue_arr[rescue_target, ch] = np.clip(
+                            rescue_arr[rescue_target, ch] + micro_boost * interior_alpha[rescue_target],
+                            0, 255
+                        )
 
                 final_image = Image.fromarray(np.clip(rescue_arr, 0, 255).astype(np.uint8))
                 post_lum = (rescue_arr[mask_bool, 0]*0.299 + rescue_arr[mask_bool, 1]*0.587 + rescue_arr[mask_bool, 2]*0.114)
