@@ -968,7 +968,10 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
             enc_ori = self.vae.encode(image_ori)
             image_ori_latents = enc_ori.latent_dist.mode()
-            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
+            # Scale ONLY the original latents used for background blending to prevent SDEdit explosion.
+            # DO NOT scale image_latents (vton conditioning) as OOTDiffusion UNet expects it unscaled.
+            image_ori_latents = image_ori_latents * self.vae.config.scaling_factor
+            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}] (after scaling)")
 
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))
