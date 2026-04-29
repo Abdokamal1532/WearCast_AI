@@ -901,9 +901,6 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 image_latents = enc_output.latent_dist.mode()
 
             print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype} range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
-            # Scale to noise latent space (same as what the denoising UNet operates in)
-            image_latents = image_latents * self.vae.config.scaling_factor
-            print(f"[DEBUG] prepare_garm_latents: SCALED latents range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
 
         if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
             additional_image_per_prompt = batch_size // image_latents.shape[0]
@@ -971,10 +968,8 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
             enc_ori = self.vae.encode(image_ori)
             image_ori_latents = enc_ori.latent_dist.mode()
-            # Scale both masked-person and original latents to noise latent space
-            # Without this, channels 4-7 (person, std≈10-20) mismatch channels 0-3 (noise, std≈1)
-            # causing UNet denoising to diverge (latent std explodes from 1→4.5 over 20 steps).
-            image_latents     = image_latents     * self.vae.config.scaling_factor
+            # Scale ONLY the original latents used for background blending to prevent SDEdit explosion.
+            # DO NOT scale image_latents (vton conditioning) as OOTDiffusion UNet expects it unscaled.
             image_ori_latents = image_ori_latents * self.vae.config.scaling_factor
             print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}] (after scaling)")
 
