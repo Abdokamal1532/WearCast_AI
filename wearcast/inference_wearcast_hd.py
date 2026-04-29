@@ -33,73 +33,9 @@ def _dbg_tensor(label, t):
     else:
         print(f"   [DBG] {label:40s} | type={type(t)}")
 
-def match_histograms(src, ref, src_mask, ref_mask):
-    """Matches the histogram of src to ref, channel by channel, using provided masks."""
-    out = src.copy()
-    for c in range(src.shape[-1]):
-        s_vals = src[..., c][src_mask]
-        r_vals = ref[..., c][ref_mask]
-        if len(s_vals) == 0 or len(r_vals) == 0:
-            continue
-            
-        # Get quantiles
-        s_quantiles = np.percentile(s_vals, np.linspace(0, 100, 256))
-        r_quantiles = np.percentile(r_vals, np.linspace(0, 100, 256))
-        
-        # Interpolate
-        matched_vals = np.interp(s_vals, s_quantiles, r_quantiles)
-        out[..., c][src_mask] = matched_vals
-        
-    return np.clip(out, 0, 255).astype(np.float32)
-
-def laplacian_pyramid_blend(src, dst, mask, levels=6):
-    """Multi-scale blend: src inside mask, dst outside, smooth transition."""
-    # Ensure all have the same shape/type
-    h, w = src.shape[:2]
-    # Ensure dimensions are divisible by 2^levels to avoid pyrUp/pyrDown shape mismatches
-    # We pad the images if needed
-    pad_h = (2**levels - h % (2**levels)) % (2**levels)
-    pad_w = (2**levels - w % (2**levels)) % (2**levels)
-    
-    if pad_h > 0 or pad_w > 0:
-        src = cv2.copyMakeBorder(src, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-        dst = cv2.copyMakeBorder(dst, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-        mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-
-    gp_src = [src.astype(np.float32)]
-    gp_dst = [dst.astype(np.float32)]
-    
-    # If mask is 2D, make it 3D for broadcasting
-    if len(mask.shape) == 2:
-        mask = np.stack([mask]*3, axis=-1)
-    gp_mask = [mask.astype(np.float32)]
-    
-    # Build Gaussian pyramids
-    for _ in range(levels):
-        gp_src.append(cv2.pyrDown(gp_src[-1]))
-        gp_dst.append(cv2.pyrDown(gp_dst[-1]))
-        gp_mask.append(cv2.pyrDown(gp_mask[-1]))
-    
-    # Build Laplacian pyramids
-    lp_src = [gp_src[i] - cv2.pyrUp(gp_src[i+1], dstsize=gp_src[i].shape[:2][::-1]) for i in range(levels)]
-    lp_src.append(gp_src[levels])
-    
-    lp_dst = [gp_dst[i] - cv2.pyrUp(gp_dst[i+1], dstsize=gp_dst[i].shape[:2][::-1]) for i in range(levels)]
-    lp_dst.append(gp_dst[levels])
-    
-    # Blend at each level
-    lp_blend = [lp_src[i] * gp_mask[i] + lp_dst[i] * (1 - gp_mask[i]) for i in range(levels + 1)]
-    
-    # Reconstruct
-    result = lp_blend[levels]
-    for i in range(levels - 1, -1, -1):
-        result = cv2.pyrUp(result, dstsize=lp_blend[i].shape[:2][::-1]) + lp_blend[i]
-        
-    # Remove padding if added
-    if pad_h > 0 or pad_w > 0:
-        result = result[:h, :w]
-        
-    return np.clip(result, 0, 255).astype(np.uint8)
+# NOTE: match_histograms and laplacian_pyramid_blend were removed.
+# They over-corrected the UNet output and introduced halo/glow artifacts.
+# OOTDiffusion uses simple Gaussian-feathered mask compositing — we do the same.
 
 
 class WearCastHD:
@@ -283,7 +219,10 @@ class WearCastHD:
 
             # 2. Sophisticated Mask Generation
             print(" -> Constructing sophisticated in-painting mask...")
-            hard_mask, mask = self.get_mask_location(model_type, category, model_parse, keypoints)
+            # get_mask_location returns (mask_255, mask_gray_127)
+            # mask_255 is the BINARY mask (0 or 255) used for UNet inpainting
+            # mask_gray_127 is the half-brightness variant (0 or 127) used as visual overlay
+            mask, mask_gray = self.get_mask_location(model_type, category, model_parse, keypoints)
 
             # Diagnostic: Check mask density
             mask_np = np.array(mask)
@@ -295,23 +234,19 @@ class WearCastHD:
             mask = mask.resize((768, 1024), Image.NEAREST)
             print(f" -> Mask after resize: {mask.size}")
 
-            # Save mask debug image
-            debug_mask_path = "debug_phase1_soft_mask.jpg"
-            mask.save(debug_mask_path)
-            print(f" -> [SAVED] Soft mask saved to: {debug_mask_path}")
-
-            hard_mask_resized = hard_mask.resize((768, 1024), Image.NEAREST)
-            debug_hard_mask_path = "debug_phase1_hard_mask.jpg"
-            hard_mask_resized.save(debug_hard_mask_path)
-            print(f" -> [SAVED] Hard mask saved to: {debug_hard_mask_path}")
+            # Save mask debug images
+            mask.save("debug_phase1_hard_mask.jpg")
+            print(f" -> [SAVED] Hard mask (255-binary) saved to: debug_phase1_hard_mask.jpg")
+            mask_gray.save("debug_phase1_soft_mask.jpg")
+            print(f" -> [SAVED] Soft mask (127-gray) saved to: debug_phase1_soft_mask.jpg")
 
             print(" -> Preprocessing Stage: SUCCESS")
 
         # Auto-detect garment complexity and choose optimal params
         is_complex = self.detect_garment_complexity(image_garm)
         auto_params = self.get_optimal_params(category, is_complex)
-        final_steps = max(num_steps, auto_params["num_steps"])   # use auto if higher
-        final_scale = max(image_scale, auto_params["image_scale"]) # use auto if higher
+        final_steps = auto_params["num_steps"]    # use auto-detected optimal steps
+        final_scale = auto_params["image_scale"]   # use auto-detected optimal guidance
         print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
         print(f"[WearCast] Using params: steps={final_steps} (UI={num_steps}), guidance_scale={final_scale} (UI={image_scale})")
 
@@ -350,11 +285,13 @@ class WearCastHD:
             image_garm.save("debug_phase2_garment_original.jpg")
             print(f" -> [SAVED] Original garment saved to: debug_phase2_garment_original.jpg")
 
-            # --- 2b. Garment Enhancement for CLIP ---
-            garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
-            garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
-            garm_enhanced.save("debug_phase2_clip_enhanced.jpg")
-            print(f" -> [SAVED] CLIP enhanced garment saved to: debug_phase2_clip_enhanced.jpg")
+            # --- 2b. CLIP input preparation ---
+            # Use the processed garment directly for CLIP encoding.
+            # Heavy sharpness/contrast enhancement was removed because it
+            # over-emphasises edges and textures, causing stiff/puffy artifacts.
+            garm_enhanced = garm_proc
+            garm_enhanced.save("debug_phase2_clip_input.jpg")
+            print(f" -> [SAVED] CLIP input garment saved to: debug_phase2_clip_input.jpg")
 
             # --- 2c. CLIP Encoding ---
             prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
@@ -430,9 +367,14 @@ class WearCastHD:
             print(f" -> Pipeline returned {len(images)} image(s)")
 
         # =====================================================================
-        # Phase 4: Final Post-processing
+        # Phase 4: Final Post-processing (OOTDiffusion-style paste-back)
         # =====================================================================
-        print(f"\n[WearCast] Phase 4/4: Final Post-processing...")
+        # The UNet was trained to produce realistic try-on results that look
+        # correct when composited with simple mask-based paste-back. Complex
+        # corrections (histogram matching, Laplacian pyramid, Poisson cloning)
+        # fight against the model and create halo/glow artifacts.
+        # =====================================================================
+        print(f"\n[WearCast] Phase 4/4: Final Post-processing (clean paste-back)...")
         raw_generated = images[0]
         raw_generated.save("debug_phase4_raw_unet_output.jpg")
         print(f" -> [SAVED] Raw UNet output saved to: debug_phase4_raw_unet_output.jpg")
@@ -440,127 +382,84 @@ class WearCastHD:
 
         gen_arr = np.array(raw_generated).astype(np.float32)
         ori_arr = np.array(image_ori).astype(np.float32)
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        t0_parse = time.time()
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # Get the original inpaint hull
+        # --- Build soft compositing mask ---
+        # Get the binary mask used during inpainting
         if hasattr(self, '_cached_hard_mask'):
-            hull_arr = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)).astype(np.float32)
+            mask_pil = self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)
         else:
-            hull_arr = (np.array(mask.resize(raw_generated.size, Image.BILINEAR)) > 127).astype(np.float32) * 255.0
+            mask_pil = mask.resize(raw_generated.size, Image.BILINEAR)
 
-        mask_bool = hull_arr > 127
+        mask_np = np.array(mask_pil).astype(np.float32)
+        if mask_np.max() > 1.0:
+            mask_np = mask_np / 255.0
 
-        # --- Step 1/3: Color Diagnostics (before any correction) ---
-        print(f"\n   [COLOR DIAG] === Per-Channel Analysis (Mask Region) ===")
-        gen_in_mask   = gen_arr[mask_bool]
-        garm_fg_mask  = np.all(garm_arr >= 240, axis=-1)
-        garm_fg_valid = ~garm_fg_mask  # foreground (non-BG) pixels of garment
-        for ch, ch_name in enumerate(['Red', 'Green', 'Blue']):
-            gen_ch_mean  = gen_in_mask[:, ch].mean() if len(gen_in_mask) > 0 else 0
-            gen_ch_std   = gen_in_mask[:, ch].std() if len(gen_in_mask) > 0 else 0
-            garm_ch_mean = garm_arr[garm_fg_valid, ch].mean() if garm_fg_valid.sum() > 0 else 0
-            garm_ch_std  = garm_arr[garm_fg_valid, ch].std() if garm_fg_valid.sum() > 0 else 0
-            delta = gen_ch_mean - garm_ch_mean
-            print(f"   [COLOR DIAG]   {ch_name:5s}: Garment FG mean={garm_ch_mean:.1f}±{garm_ch_std:.1f} | UNet output mean={gen_ch_mean:.1f}±{gen_ch_std:.1f} | Δ={delta:+.1f}")
+        # Binarize then apply thin Gaussian feather (2px sigma)
+        # This is exactly what OOTDiffusion does — a thin, smooth transition
+        binary_mask = (mask_np > 0.5).astype(np.float32)
+        feather_sigma = 2.0
+        alpha = cv2.GaussianBlur(binary_mask, (0, 0), feather_sigma)
+        alpha = np.clip(alpha, 0.0, 1.0)
 
-        gen_lum_mask  = gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114
-        garm_lum_fg   = garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114
-        print(f"   [COLOR DIAG]   Lum  : Garment FG mean={garm_lum_fg.mean():.1f} | UNet output mean={gen_lum_mask.mean():.1f} | Δ={gen_lum_mask.mean()-garm_lum_fg.mean():+.1f}")
-
-        # Detect the white-garment problem: if garment is bright but output is dim
-        is_white_garment = garm_lum_fg.mean() > 170 if len(garm_lum_fg) > 0 else False
-        lum_deficit = garm_lum_fg.mean() - gen_lum_mask.mean() if len(garm_lum_fg) > 0 else 0
-        print(f"   [COLOR DIAG]   White garment={is_white_garment} | Luminance deficit={lum_deficit:.1f}")
-
-        # --- Step 2/3: Histogram Matching ---
-        print(f"\n -> Step 2/3: Histogram Matching (interior only)...")
-        corrected_arr = gen_arr.copy()
-
-        # Create a distance-transform based feather mask
-        binary_mask = (hull_arr > 127).astype(np.uint8)
-        dist = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
-        feather_width = 12.0  # pixels of transition
-        alpha = np.clip(dist / feather_width, 0, 1.0)
-        
-        # We only want to histogram-match the inside of the garment
-        interior_bool = alpha > 0.99
-        
-        # We only consider foreground of the garment image for histogram matching reference
-        garm_fg_bool = ~np.all(garm_arr >= 240, axis=-1)
-
-        if interior_bool.sum() > 100 and garm_fg_bool.sum() > 100:
-            # Match histograms
-            matched_interior = match_histograms(gen_arr, garm_arr, interior_bool, garm_fg_bool)
-            
-            # Blend with original generated image based on alpha
-            # 1.0 alpha = fully matched, 0.0 alpha = raw UNet output
-            alpha_3d = np.stack([alpha] * 3, axis=-1)
-            corrected_arr = matched_interior * alpha_3d + gen_arr * (1.0 - alpha_3d)
-            
-            Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)).save("debug_phase4_hist_matched.jpg")
-            print(f"   [HIST MATCH] [SAVED] debug_phase4_hist_matched.jpg")
-        else:
-            print(f"   [HIST MATCH] Skipped: too few interior/foreground pixels")
-            
+        # Save feather mask for debugging
         Image.fromarray((alpha * 255).astype(np.uint8)).save("debug_phase4_feather_mask.jpg")
-        print(f"   [FEATHER] [SAVED] Feather mask: debug_phase4_feather_mask.jpg")
+        print(f" -> Feather mask: sigma={feather_sigma}px")
 
-        # --- Step 3/3: Compositing (Laplacian Pyramid Blending) ---
-        print(f"\n -> Step 3/3: Laplacian Pyramid Compositing...")
-        t_composite = time.time()
-        
-        try:
-            # Blend corrected output into original image using feather mask
-            # We use alpha (which fades smoothly) as the blending mask
-            final_bgr = laplacian_pyramid_blend(
-                src=cv2.cvtColor(np.clip(corrected_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
-                dst=cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2BGR),
-                mask=alpha,
-                levels=6
-            )
-            final_image = Image.fromarray(cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB))
-            print(f"   [COMPOSITE] Laplacian pyramid blend successful")
-        except Exception as e:
-            print(f"   [COMPOSITE] Laplacian pyramid blend failed: {e}. Falling back to alpha blending.")
-            alpha_3d = np.stack([alpha] * 3, axis=-1)
-            final_arr = corrected_arr * alpha_3d + ori_arr * (1.0 - alpha_3d)
-            final_image = Image.fromarray(np.clip(final_arr, 0, 255).astype(np.uint8))
+        # --- Pre-compositing diagnostics ---
+        mask_bool = binary_mask > 0.5
+        gen_in_mask = gen_arr[mask_bool]
+        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
+        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
+        garm_fg_valid = ~garm_fg_mask
+        gen_lum_mean = float((gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114).mean()) if len(gen_in_mask) > 0 else 128.0
+        garm_lum_mean = float((garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114).mean()) if garm_fg_valid.sum() > 0 else 128.0
+        lum_gap = garm_lum_mean - gen_lum_mean
+        print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # Save diagnostics
-        comparison_w = raw_generated.size[0] * 4
+        # --- Luminance recovery REMOVED ---
+        # The UNet naturally adapts lighting for on-body realism.
+        # Recovering luminance toward studio lighting created unnatural brightness mismatch.
+        print(f"   [CORR] Luminance recovery: DISABLED (let UNet handle lighting naturally)")
+
+        # --- Advanced Post-Processing (OOTDiffusion Parity) ---
+        t_post = time.time()
+        print(f" -> Starting advanced color correction...")
+        # Note: self._cached_hard_mask is the true binary mask before any feathering/blurring
+        color_corrected_image = self.local_color_correction(
+            raw_generated,
+            image_garm,
+            self._cached_hard_mask if hasattr(self, '_cached_hard_mask') else mask
+        )
+
+        print(f" -> Starting seamless Laplacian blending...")
+        # Laplacian blending is used to eliminate the "white halo" by blending frequencies
+        final_image = self.laplacian_pyramid_blend(
+            color_corrected_image,
+            image_ori,
+            Image.fromarray((alpha * 255).astype(np.uint8)),
+            levels=5
+        )
+        print(f" -> Post-processing completed in {time.time()-t_post:.3f}s (Correction + Laplacian)")
+
+        # --- Post-compositing diagnostics ---
+        final_np = np.array(final_image).astype(np.float32)
+        final_in_mask = final_np[mask_bool]
+        final_lum = float((final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114).mean()) if len(final_in_mask) > 0 else 0.0
+        print(f"   [DIAG] Final composited luminance: {final_lum:.1f} (recovered from {gen_lum_mean:.1f})")
+
+        # Save 3-panel comparison: Garment | Raw UNet | Final
+        comparison_w = raw_generated.size[0] * 3
         comparison = Image.new('RGB', (comparison_w, raw_generated.size[1]))
         comparison.paste(image_garm.resize(raw_generated.size), (0, 0))
         comparison.paste(raw_generated, (raw_generated.size[0], 0))
-        comparison.paste(Image.fromarray(np.clip(corrected_arr, 0, 255).astype(np.uint8)), (raw_generated.size[0] * 2, 0))
-        comparison.paste(final_image, (raw_generated.size[0] * 3, 0))
+        comparison.paste(final_image, (raw_generated.size[0] * 2, 0))
         comparison.save("debug_phase4_comparison.jpg")
-        print(f"   [COMPOSITE] [SAVED] 4-panel comparison: Garment | Raw UNet | Hist Matched | Final")
-
-        # Post-compositing diagnostics
-        final_np = np.array(final_image).astype(np.float32)
-        final_in_mask = final_np[mask_bool]
-        final_lum = final_in_mask[:, 0]*0.299 + final_in_mask[:, 1]*0.587 + final_in_mask[:, 2]*0.114
-        print(f"   [COMPOSITE] Final luminance in mask: mean={final_lum.mean():.1f} (target≈{garm_lum_fg.mean():.1f})")
-        print(f"   [COMPOSITE] Completed in {time.time()-t_composite:.2f}s")
+        print(f" -> [SAVED] 3-panel comparison: Garment | Raw UNet | Final")
 
         final_image.save("debug_final_output.jpg")
         print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
-
-        print(f"\n   [SUMMARY] Debug images saved:")
-        print(f"     1. debug_phase2_garment_original.jpg    — Input garment")
-        print(f"     2. debug_phase2_clip_bg_replaced.jpg    — CLIP input (BG neutralized)")
-        print(f"     3. debug_phase2_clip_enhanced.jpg       — CLIP input (sharpened+contrast)")
-        print(f"     4. debug_phase2_vae_roundtrip.jpg       — VAE encode→decode fidelity")
-        print(f"     5. debug_phase3_masked_person.jpg       — Person with mask applied")
-        print(f"     6. debug_final_unet_mask.jpg            — Binary mask for UNet")
-        print(f"     7. debug_phase4_raw_unet_output.jpg     — Raw UNet output (no correction)")
-        print(f"     8. debug_phase4_color_corrected.jpg     — Interior brightness correction")
-        print(f"     9. debug_phase4_interior_mask.jpg       — Eroded interior mask")
-        print(f"    10. debug_phase4_comparison.jpg          — 4-panel: Garment|Raw|Corrected|Final")
-        print(f"    11. debug_final_output.jpg               — Final result")
 
         print("\n[WearCast] SUCCESS: Inference completed successfully!")
         print("=" * 70)
@@ -594,13 +493,12 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex garments (graphics, patterns, text): higher guidance forces the UNet
-            # to commit to the garment detail. OOTD image_guidance_scale sweet-spot is 3.5-5.0;
-            # values above 5.0 can cause over-saturation artifacts.
-            return {"num_steps": 40, "image_scale": 4.0}
+            # Complex/patterned garments: OOTDiffusion recommends image_guidance_scale=2.0
+            # Going higher (2.5+) causes stiffness, colour distortion and puffy artifacts.
+            return {"num_steps": 20, "image_scale": 2.0}
         else:
-            # Simple/solid garments: lower guidance preserves natural draping
-            return {"num_steps": 30, "image_scale": 2.5}
+            # Simple/solid garments: low guidance → natural draping.
+            return {"num_steps": 20, "image_scale": 1.5}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
@@ -834,293 +732,189 @@ class WearCastHD:
         return refined
 
     def get_mask_location(self, model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
-        print(f"\n   [MASK_GEN] ============================================================")
-        print(f"   [MASK_GEN] get_mask_location: model_type={model_type}  category={category}  target_size=({width},{height})")
+        """
+        Generate the inpainting mask — ported directly from OOTDiffusion utils_ootd.py
+        with category-aware logic for upper_body / lower_body / dresses.
+
+        Category strings accepted (Gradio sends without underscore):
+          'upperbody' | 'upper_body'  -> upper garment masking
+          'lowerbody' | 'lower_body'  -> lower garment masking
+          'dresses'   | 'dress'       -> full body garment masking
+
+        Returns:
+          mask      (PIL Image 'L', values 0/255) — binary mask, WHITE = inpaint here
+          mask_gray (PIL Image 'L', values 0/127) — half-intensity visual overlay
+        """
+        # --- Normalise category strings (Gradio may omit underscores) ---
+        _cat = category.lower().replace('_', '')
+        if _cat in ('upperbody', 'upper'):
+            category_norm = 'upper_body'
+        elif _cat in ('lowerbody', 'lower'):
+            category_norm = 'lower_body'
+        elif _cat in ('dresses', 'dress'):
+            category_norm = 'dresses'
+        else:
+            category_norm = 'upper_body'  # safe default
+
+        print(f"\n   [MASK_GEN] {'='*60}")
+        print(f"   [MASK_GEN] get_mask_location: model_type={model_type}  category={category} -> normalised={category_norm}  target_size=({width},{height})")
+
+        # --- Model-type arm width (matches OOTDiffusion exactly) ---
+        if model_type == 'hd':
+            arm_width = 60
+        elif model_type == 'dc':
+            arm_width = 45
+        else:
+            arm_width = 60  # fallback
+
         im_parse = model_parse.resize((width, height), Image.NEAREST)
         parse_array = np.array(im_parse)
         print(f"   [MASK_GEN] parse_array shape={parse_array.shape}  unique_vals={np.unique(parse_array).tolist()}")
 
-        print(" -> Constructing Smart Category Mask (Off-Shoulder/Crop-Top Aware)...")
+        label_map = {
+            "background": 0, "hat": 1, "hair": 2, "sunglasses": 3,
+            "upper_clothes": 4, "skirt": 5, "pants": 6, "dress": 7,
+            "belt": 8, "left_shoe": 9, "right_shoe": 10, "head": 11,
+            "left_leg": 12, "right_leg": 13, "left_arm": 14, "right_arm": 15,
+            "bag": 16, "scarf": 17,
+        }
 
-        pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
-        scale = height / 512.0
-        pt = lambda idx: np.multiply(pose_data[idx][:2], scale)
+        # Head region — always protected (never inpainted)
+        parse_head = (parse_array == label_map["hat"]).astype(np.float32) + \
+                     (parse_array == label_map["sunglasses"]).astype(np.float32) + \
+                     (parse_array == label_map["head"]).astype(np.float32)
 
-        nose  = pt(0)
-        neck  = pt(1)
-        s_r, s_l = pt(2), pt(5)
-        e_r, e_l = pt(3), pt(6)
-        w_r, w_l = pt(4), pt(7)
-        hip_r = pt(8)
-        hip_l = pt(11)
+        # Fixed regions — accessories that must never be replaced
+        parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
+                            (parse_array == label_map["right_shoe"]).astype(np.float32) + \
+                            (parse_array == label_map["hat"]).astype(np.float32) + \
+                            (parse_array == label_map["sunglasses"]).astype(np.float32) + \
+                            (parse_array == label_map["bag"]).astype(np.float32)
 
-        print(f"   [MASK_GEN] Key points (scaled by {scale:.3f}):")
-        print(f"              Nose={nose.tolist()}  Neck={neck.tolist()}")
-        print(f"              Shoulder R={s_r.tolist()}  L={s_l.tolist()}")
-        print(f"              Elbow    R={e_r.tolist()}  L={e_l.tolist()}")
-        print(f"              Wrist    R={w_r.tolist()}  L={w_l.tolist()}")
-        print(f"              Hip      R={hip_r.tolist()}  L={hip_l.tolist()}")
+        parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
 
-        # ---- STEP 1: Base semantic mask per category ----
-        if category == 'upperbody':
-            target_labels = [4, 7]
-            arm_labels    = [14, 15]
-        elif category == 'lowerbody':
-            target_labels = [5, 6, 12, 13]
-            arm_labels    = []
-        elif category == 'dress':
-            target_labels = [4, 5, 6, 7]
-            arm_labels    = [14, 15]
+        arms_left  = (parse_array == label_map["left_arm"]).astype(np.float32)
+        arms_right = (parse_array == label_map["right_arm"]).astype(np.float32)
+
+        # ------------------------------------------------------------------
+        # Category-specific mask seed + changeable region
+        # Matches OOTDiffusion utils_ootd.py exactly
+        # ------------------------------------------------------------------
+        if category_norm == 'dresses':
+            parse_mask = (parse_array == label_map["dress"]).astype(np.float32) + \
+                         (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                         (parse_array == label_map["skirt"]).astype(np.float32) + \
+                         (parse_array == label_map["pants"]).astype(np.float32)
+            parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+
+        elif category_norm == 'upper_body':
+            parse_mask = (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                         (parse_array == label_map["dress"]).astype(np.float32)
+            # Protect lower garments — never replace trousers/skirts during upper-body try-on
+            parser_mask_fixed_lower = (parse_array == label_map["skirt"]).astype(np.float32) + \
+                                      (parse_array == label_map["pants"]).astype(np.float32)
+            parser_mask_fixed += parser_mask_fixed_lower
+            parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+
+        elif category_norm == 'lower_body':
+            parse_mask = (parse_array == label_map["pants"]).astype(np.float32) + \
+                         (parse_array == label_map["skirt"]).astype(np.float32) + \
+                         (parse_array == label_map["left_leg"]).astype(np.float32) + \
+                         (parse_array == label_map["right_leg"]).astype(np.float32)
+            # Protect upper garment + arms from being masked in lower-body mode
+            parser_mask_fixed += (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                                 (parse_array == label_map["left_arm"]).astype(np.float32) + \
+                                 (parse_array == label_map["right_arm"]).astype(np.float32)
+            parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+
         else:
-            target_labels = [4, 7]
-            arm_labels    = [14, 15]
+            # Should not reach here after normalisation, but safe fallback
+            parse_mask = (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                         (parse_array == label_map["dress"]).astype(np.float32)
+            parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
 
-        garment_mask = np.zeros((height, width), dtype=np.float32)
-        for label in target_labels:
-            px_count = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Label {label}: {px_count} pixels")
-            garment_mask += (parse_array == label).astype(np.float32)
+        # ------------------------------------------------------------------
+        # Pose-driven arm mask  (upper_body / dresses only)
+        # ------------------------------------------------------------------
+        pose_data = keypoint["pose_keypoints_2d"]
+        pose_data = np.array(pose_data).reshape((-1, 2))
 
-        # GARMENT DILATION: 13px minimum to fill boundary gaps
-        k_size = max(int((height * 0.025)) | 1, 13)
-        print(f"   [MASK_GEN] Garment dilation kernel size: {k_size}x{k_size}")
-        kernel_garment = np.ones((k_size, k_size), np.uint8)
-        garment_mask_pre_dilate = garment_mask.copy()
-        garment_mask = cv2.dilate(garment_mask, kernel_garment, iterations=1)
-        print(f"   [MASK_GEN] Garment mask coverage before dilation: {100*(garment_mask_pre_dilate>0).mean():.1f}%")
-        print(f"   [MASK_GEN] Garment mask coverage after  dilation: {100*(garment_mask>0).mean():.1f}%")
+        im_arms_left  = Image.new('L', (width, height))
+        im_arms_right = Image.new('L', (width, height))
+        arms_draw_left  = ImageDraw.Draw(im_arms_left)
+        arms_draw_right = ImageDraw.Draw(im_arms_right)
 
-        arm_mask = np.zeros((height, width), dtype=np.float32)
-        for label in arm_labels:
-            px_count = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Arm Label {label}: {px_count} pixels")
-            arm_mask += (parse_array == label).astype(np.float32)
+        if category_norm in ('upper_body', 'dresses'):
+            shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
+            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
+            elbow_right    = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
+            elbow_left     = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
+            wrist_right    = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
+            wrist_left     = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+            ARM_LINE_WIDTH = int(arm_width / 512 * height)
 
-        # ---- ARM MASK: Keep entire arm from shoulder to elbow (NO forearm clipping) ----
-        # ROOT CAUSE of shoulder holes: clipping arm_mask at 90% shoulder→elbow removes 
-        # the shoulder seam pixel band, creating a visible gap/hole at the shoulder.
-        # FIX: Keep ALL arm pixels up to the elbow, but NOT beyond (avoids forearm ghost).
-        if len(arm_labels) > 0 and category == 'upperbody':
-            arm_px_before = (arm_mask > 0).sum()
-            avg_elbow_y = (e_r[1] + e_l[1]) / 2.0
-            # Use elbow Y + small padding: covers full sleeve including hem
-            sleeve_cutoff_y = int(avg_elbow_y + int(5 / 512 * height))
-            sleeve_cutoff_y = max(0, min(height - 1, sleeve_cutoff_y))
-            arm_mask[sleeve_cutoff_y:, :] = 0
-            arm_px_after = (arm_mask > 0).sum()
-            print(f"   [MASK_GEN] ARM CLIP: zeroed arm below Y={sleeve_cutoff_y} (elbow_y={avg_elbow_y:.0f})")
-            print(f"   [MASK_GEN] ARM CLIP: arm pixels before={arm_px_before}  after={arm_px_after}  removed={arm_px_before-arm_px_after}")
-        else:
-            print(f"   [MASK_GEN] No arm clip applied (arm_labels={arm_labels}, cat={category}).")
+            size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,
+                          shoulder_left[0]  + ARM_LINE_WIDTH // 2, shoulder_left[1]  + ARM_LINE_WIDTH // 2]
+            size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2,
+                          shoulder_right[0] + ARM_LINE_WIDTH // 2, shoulder_right[1] + ARM_LINE_WIDTH // 2]
 
-        base_mask = np.clip(garment_mask + arm_mask, 0, 1)
-        print(f"   [MASK_GEN] base_mask coverage: {100*(base_mask > 0).mean():.1f}%")
+            if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
+                im_arms_right = arms_right
+            else:
+                wrist_right = self.extend_arm_mask(wrist_right, elbow_right, 1.2)
+                arms_draw_right.line(
+                    np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(),
+                    'white', ARM_LINE_WIDTH, 'curve')
+                arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-        # ---- STEP 2: Detect garment sub-type ----
-        upper_clothes_rows = np.where((parse_array == 4).any(axis=1))[0]
-        if len(upper_clothes_rows) > 0:
-            garment_top_y = upper_clothes_rows.min()
-            shoulder_y    = min(s_r[1], s_l[1])
-            is_off_shoulder = garment_top_y > (shoulder_y + int(20 / 512 * height))
-            print(f"   [MASK GEOM] Garment Top Y={garment_top_y}, Shoulder Y={shoulder_y:.1f} -> Off-Shoulder={is_off_shoulder}")
-        else:
-            is_off_shoulder = False
-            print("   [MASK GEOM] No upper clothes detected in parse mask.")
+            if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
+                im_arms_left = arms_left
+            else:
+                wrist_left = self.extend_arm_mask(wrist_left, elbow_left, 1.2)
+                arms_draw_left.line(
+                    np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(),
+                    'white', ARM_LINE_WIDTH, 'curve')
+                arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-        garment_pixels_y = np.where(base_mask > 0)[0]
-        is_crop_top = False
-        if len(garment_pixels_y) > 0:
-            garment_bottom_y = np.max(garment_pixels_y)
-            hip_y = (hip_r[1] + hip_l[1]) / 2
-            if hip_y > 0:
-                is_crop_top = garment_bottom_y < (hip_y * 0.85)
-                print(f"   [MASK GEOM] Garment Bottom Y={garment_bottom_y}, Hip Y={hip_y:.1f} -> Crop-Top={is_crop_top}")
+            # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
+            hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
+            hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
+            parser_mask_fixed += hands_left + hands_right
 
-        # ---- STEP 3: Build hull points ----
-        # SHOULDER_OUT: how far outward the hull extends from shoulder keypoint
-        # Must be LARGER than actual shoulder to cover shirt fabric at the seam
-        ARM_PAD      = int(20 / 512 * height)   # inward pad from shoulder toward neck
-        SLEEVE_PAD   = int(24 / 512 * height)   # pad at elbow level for sleeves
-        # FIX: Increased from 35→42 for wider shoulder hull coverage
-        SHOULDER_OUT = int(42 / 512 * height)   # outward extension past shoulder keypoint
-        SLEEVE_LAT   = int(32 / 512 * height)   # lateral extension for sleeve hull
+        # ------------------------------------------------------------------
+        # Merge head, dilate garment mask, add neck + arm regions
+        # ------------------------------------------------------------------
+        parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
 
-        print(f"   [MASK_GEN] Hull padding params: ARM_PAD={ARM_PAD} SLEEVE_PAD={SLEEVE_PAD} SHOULDER_OUT={SHOULDER_OUT} SLEEVE_LAT={SLEEVE_LAT}")
-        hull_pts = []
+        if category_norm in ('upper_body', 'dresses'):
+            neck_mask = (parse_array == 18).astype(np.float32)
+            neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
+            neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
+            parse_mask = np.logical_or(parse_mask, neck_mask)
+            arm_mask = cv2.dilate(
+                np.logical_or(im_arms_left, im_arms_right).astype('float32'),
+                np.ones((5, 5), np.uint16), iterations=4)
+            parse_mask += np.logical_or(parse_mask, arm_mask)
 
-        if is_off_shoulder:
-            hull_pts += [
-                [s_r[0] + ARM_PAD,    s_r[1] + int(20/512*height)],
-                [s_l[0] - ARM_PAD,    s_l[1] + int(20/512*height)],
-                [e_r[0] + SLEEVE_PAD, e_r[1]],
-                [e_l[0] - SLEEVE_PAD, e_l[1]],
-            ]
-            protect_labels = [1, 2, 11, 18]
-            print(f"   [MASK_GEN] Off-shoulder hull: 4 pts")
-        else:
-            hull_pts += [
-                [s_r[0] - SHOULDER_OUT, s_r[1]],          # right shoulder — FAR outward
-                [s_r[0] + ARM_PAD,      s_r[1]],          # right shoulder — inward
-                [s_l[0] + SHOULDER_OUT, s_l[1]],          # left shoulder  — FAR outward
-                [s_l[0] - ARM_PAD,      s_l[1]],          # left shoulder  — inward
-                [neck[0],               neck[1] + int(2/512*height)],   # neck base
-            ]
-            print(f"   [MASK_GEN] Shoulder hull pts:")
-            print(f"              R-out=[{s_r[0]-SHOULDER_OUT:.0f},{s_r[1]:.0f}]  R-in=[{s_r[0]+ARM_PAD:.0f},{s_r[1]:.0f}]")
-            print(f"              L-out=[{s_l[0]+SHOULDER_OUT:.0f},{s_l[1]:.0f}]  L-in=[{s_l[0]-ARM_PAD:.0f},{s_l[1]:.0f}]")
+        # Invert: changeable pixels that are NOT part of the garment region
+        parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
 
-            # Hip-level anchor: fills torso body of shirt
-            hip_y_val = (hip_r[1] + hip_l[1]) / 2
-            if hip_y_val > 0:
-                hull_anchor_y = int(hip_y_val * 0.97)
-                hip_pad = int(12 / 512 * height)
-                hull_pts += [
-                    [hip_r[0] + hip_pad, hull_anchor_y],
-                    [hip_l[0] - hip_pad, hull_anchor_y],
-                ]
-                print(f"   [MASK_GEN] Hip hull pts: Y={hull_anchor_y}  R_x={hip_r[0]+hip_pad:.0f}  L_x={hip_l[0]-hip_pad:.0f}")
+        parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
+        inpaint_mask = 1 - parse_mask_total
+        img = np.where(inpaint_mask, 255, 0)
+        dst = self.hole_fill(img.astype(np.uint8))
+        dst = self.refine_mask(dst)
+        inpaint_mask = dst / 255 * 1
 
-            # Sleeve hull: extend outward at mid-sleeve to cover short sleeve fabric
-            has_sleeves = (parse_array == 14).sum() + (parse_array == 15).sum() > 200
-            print(f"   [MASK_GEN] has_sleeves={has_sleeves}  (arm_px={(parse_array==14).sum()+(parse_array==15).sum()})")
-            if has_sleeves:
-                # Mid-sleeve Y: 50% down shoulder→elbow (not 65%) — shorter sleeves mean we need the hull earlier
-                sleeve_y_r = int(s_r[1] + 0.50 * (e_r[1] - s_r[1]))
-                sleeve_y_l = int(s_l[1] + 0.50 * (e_l[1] - s_l[1]))
-                # Also add a second point near shoulder for upper sleeve
-                upper_sleeve_y_r = int(s_r[1] + 0.20 * (e_r[1] - s_r[1]))
-                upper_sleeve_y_l = int(s_l[1] + 0.20 * (e_l[1] - s_l[1]))
-                hull_pts += [
-                    [s_r[0] - SLEEVE_LAT, upper_sleeve_y_r],  # RIGHT upper sleeve
-                    [s_r[0] - SLEEVE_LAT, sleeve_y_r],        # RIGHT lower sleeve
-                    [s_l[0] + SLEEVE_LAT, upper_sleeve_y_l],  # LEFT  upper sleeve
-                    [s_l[0] + SLEEVE_LAT, sleeve_y_l],        # LEFT  lower sleeve
-                ]
-                print(f"   [MASK_GEN] Sleeve hull: R_upper=[{s_r[0]-SLEEVE_LAT:.0f},{upper_sleeve_y_r}]  R_lower=[{s_r[0]-SLEEVE_LAT:.0f},{sleeve_y_r}]")
-                print(f"   [MASK_GEN] Sleeve hull: L_upper=[{s_l[0]+SLEEVE_LAT:.0f},{upper_sleeve_y_l}]  L_lower=[{s_l[0]+SLEEVE_LAT:.0f},{sleeve_y_l}]")
-            protect_labels = [1, 2, 11]
+        mask      = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)  # binary 0/255
+        mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)  # visual overlay 0/127
 
-        print(f"   [MASK_GEN] Total hull_pts: {len(hull_pts)}")
-        for i, pt_val in enumerate(hull_pts):
-            print(f"   [MASK_GEN]   hull_pt[{i}]: {pt_val}")
+        coverage = inpaint_mask.mean() * 100
+        print(f"   [MASK_GEN] Final mask coverage: {coverage:.1f}%  (category={category_norm})")
+        print(f"   [MASK_GEN] {'='*60}")
 
-        # ---- STEP 4: Waist / Crop-top cutoff ----
-        if is_crop_top and len(garment_pixels_y) > 0:
-            garment_bottom_y = np.max(garment_pixels_y)
-            cutoff = int(garment_bottom_y * 1.05)
-            base_mask[cutoff:, :] = 0
-            print(f"   [MASK_GEN] Crop-top cutoff applied at Y={cutoff}")
+        # Cache the binary mask for post-processing (color correction + blending)
+        self._cached_hard_mask = mask
 
-        hip_y = (hip_r[1] + hip_l[1]) / 2
-        if category == 'upperbody' and hip_y > 0:
-            waist_cutoff = int(hip_y + int(25 / 512 * height))
-            base_mask[waist_cutoff:, :] = 0
-            print(f"   [MASK GEOM] Upperbody waist cutoff applied at Y={waist_cutoff}")
-
-        # ---- STEP 5: Convex hull from core torso ----
-        core_mask = np.zeros((height, width), dtype=np.float32)
-        if category == 'upperbody':
-            for label in [4, 7]:
-                core_mask += (parse_array == label).astype(np.float32)
-        else:
-            core_mask = base_mask.copy()
-
-        if is_crop_top and len(garment_pixels_y) > 0:
-            core_mask[int(np.max(garment_pixels_y) * 1.05):, :] = 0
-        if category == 'upperbody' and hip_y > 0:
-            core_mask[waist_cutoff:, :] = 0
-
-        core_pixels = np.column_stack(np.where(core_mask > 0))
-        valid = lambda p: p[0] > 1 and p[1] > 1
-        valid_hull_pts = [p for p in hull_pts if valid(p)]
-        print(f"   [MASK_GEN] core_pixels={len(core_pixels)}  valid_hull_pts={len(valid_hull_pts)}")
-
-        if len(core_pixels) > 5 and len(valid_hull_pts) >= 3:
-            core_xy = core_pixels[:, [1, 0]]
-            if len(core_xy) > 800:
-                idx = np.random.choice(len(core_xy), 800, replace=False)
-                core_xy = core_xy[idx]
-            all_pts = np.vstack([core_xy, np.array(valid_hull_pts)]).astype(np.float32)
-            hull = cv2.convexHull(all_pts)
-            hull_mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
-            hull_coverage = 100*(hull_mask > 0).mean()
-            print(f"   [MASK_GEN] Convex hull built. Hull coverage: {hull_coverage:.1f}%")
-            # DIAGNOSTIC: check if shoulder region is covered by hull
-            sh_y_min = int(min(s_r[1], s_l[1])) - 5
-            sh_y_max = int(min(s_r[1], s_l[1])) + 15
-            sh_x_min = int(min(s_r[0], s_l[0]) - SHOULDER_OUT) - 5
-            sh_x_max = int(max(s_r[0], s_l[0]) + SHOULDER_OUT) + 5
-            sh_y_min = max(0, sh_y_min); sh_y_max = min(height-1, sh_y_max)
-            sh_x_min = max(0, sh_x_min); sh_x_max = min(width-1,  sh_x_max)
-            shoulder_region = hull_mask[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-            print(f"   [MASK_GEN] SHOULDER REGION CHECK (Y={sh_y_min}:{sh_y_max}, X={sh_x_min}:{sh_x_max}): "
-                  f"coverage={100*(shoulder_region>0).mean():.1f}%  "
-                  f"({'GOOD - covered' if (shoulder_region>0).mean() > 0.3 else 'WARNING - low coverage - SHOULDER HOLE RISK'})")
-            inpaint_mask = np.logical_or(base_mask, hull_mask / 255.0).astype(np.float32)
-        else:
-            print(f"   [MASK_GEN] WARNING: Skipped convex hull (not enough points). Using raw base_mask.")
-            inpaint_mask = base_mask.copy()
-
-        # ---- STEP 6: Protect face/hair/neck ----
-        protect_mask = np.zeros((height, width), dtype=np.float32)
-        for label in protect_labels:
-            px = (parse_array == label).sum()
-            print(f"   [MASK_GEN] Protect label {label}: {px} pixels")
-            protect_mask += (parse_array == label).astype(np.float32)
-        protect_mask = np.clip(protect_mask, 0, 1)
-        coverage_before_protect = 100*(inpaint_mask>0).mean()
-        inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-        coverage_after_protect = 100*(inpaint_mask>0).mean()
-        print(f"   [MASK_GEN] After protection: {coverage_before_protect:.1f}% -> {coverage_after_protect:.1f}%  (removed {coverage_before_protect-coverage_after_protect:.1f}%)")
-
-        # ---- SHOULDER BRIDGE FILL: Guarantee shoulder-seam coverage ----
-        # Paint a horizontal band across the shoulder region to fill any gaps
-        # the parse mask or hull missed at the shirt-arm seam
-        if category == 'upperbody' and not is_off_shoulder:
-            bridge_y_min = max(0, int(min(s_r[1], s_l[1])) - 8)
-            bridge_y_max = min(height - 1, int(max(s_r[1], s_l[1])) + 12)
-            bridge_x_min = max(0, int(min(s_r[0], s_l[0])) - SHOULDER_OUT)
-            bridge_x_max = min(width - 1, int(max(s_r[0], s_l[0])) + SHOULDER_OUT)
-            bridge_before = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
-            inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] = 1.0
-            # Re-apply protection to avoid painting over face/hair
-            inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(protect_mask)).astype(np.float32)
-            bridge_after = (inpaint_mask[bridge_y_min:bridge_y_max, bridge_x_min:bridge_x_max] > 0).mean()
-            print(f"   [MASK_GEN] SHOULDER BRIDGE: Y=[{bridge_y_min},{bridge_y_max}] X=[{bridge_x_min},{bridge_x_max}]  coverage {100*bridge_before:.0f}%→{100*bridge_after:.0f}%")
-
-        # ---- STEP 7: Morphology close + dilate to fill gaps ----
-        # FIX: Increased close kernel from 13→17 to bridge small shoulder-zone gaps
-        kernel_close  = np.ones((17, 17), np.uint8)
-        kernel_dilate = np.ones((13, 13), np.uint8)
-        inpaint_mask_u8 = (inpaint_mask * 255).astype(np.uint8)
-        coverage_before_morph = 100*(inpaint_mask_u8>0).mean()
-        inpaint_mask_u8 = cv2.morphologyEx(inpaint_mask_u8, cv2.MORPH_CLOSE, kernel_close)
-        inpaint_mask_u8 = cv2.dilate(inpaint_mask_u8, kernel_dilate, iterations=1)
-        coverage_after_morph = 100*(inpaint_mask_u8>0).mean()
-        print(f"   [MASK_GEN] Morphology: before={coverage_before_morph:.1f}%  after={coverage_after_morph:.1f}%  gained={coverage_after_morph-coverage_before_morph:.1f}%")
-
-        # DIAGNOSTIC: check shoulder area after morphology
-        sh_check = inpaint_mask_u8[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-        print(f"   [MASK_GEN] POST-MORPH SHOULDER CHECK: coverage={100*(sh_check>0).mean():.1f}%  "
-              f"({'GOOD' if (sh_check>0).mean() > 0.5 else 'STILL LOW - SHOULDER HOLE WILL APPEAR'})")
-
-        filled = self.hole_fill(inpaint_mask_u8)
-        dst    = self.refine_mask(filled)
-        print(f"   [MASK_GEN] After hole_fill+refine: dst coverage={100*(dst>0).mean():.1f}%")
-
-        # DIAGNOSTIC: final shoulder check
-        sh_final = dst[sh_y_min:sh_y_max, sh_x_min:sh_x_max]
-        print(f"   [MASK_GEN] FINAL SHOULDER CHECK: coverage={100*(sh_final>0).mean():.1f}%  "
-              f"({'GOOD' if (sh_final>0).mean() > 0.5 else 'PROBLEM: shoulder not masked - HOLE WILL APPEAR'})")
-
-        # ---- STEP 8: Soft feathered edge ----
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
-        inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
-
-        percentage = 100 * np.sum(dst > 0) / (width * height)
-        print(f" -> Smart Category Mask: {percentage:.1f}% | OffShoulder={is_off_shoulder} | CropTop={is_crop_top}")
-        print(f"   [MASK_GEN] ============================================================")
-
-        self._cached_hard_mask = Image.fromarray(dst)
-        return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
+        return mask, mask_gray

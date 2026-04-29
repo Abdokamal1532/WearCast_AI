@@ -338,8 +338,8 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         # Soft mask for pixel-space composite
         mask_soft_np = mask.astype(np.float32) / 255.0
         import cv2 as _cv2
-        # === ACCURACY FIX 9: Tighter pixel-space mask blur (15→09px) → sharper compositing edges ===
-        mask_soft_np = _cv2.GaussianBlur(mask_soft_np, (9, 9), 3)
+        # === ACCURACY FIX 9: Tighter pixel-space mask blur (9→5px, σ3→σ2) → sharper compositing edges ===
+        mask_soft_np = _cv2.GaussianBlur(mask_soft_np, (5, 5), 2)
         mask_soft_np = np.clip(mask_soft_np, 0, 1)
         mask_pixel = torch.tensor(mask_soft_np, device=device, dtype=torch.float32)
         mask_pixel = mask_pixel.reshape(1, 1, mask_pixel.size(-2), mask_pixel.size(-1))
@@ -347,10 +347,10 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
         print(f"[PIPELINE] mask_pixel (soft, pixel-space): shape={list(mask_pixel.shape)}")
 
         # Hard mask for latent-space operations
-        # === ACCURACY FIX 10: Lower binarization threshold 127→110 → capture more soft-edge pixels ===
-        mask[mask < 110] = 0
-        mask[mask >= 110] = 255
-        print(f"[PIPELINE] Hard-binarized mask (thresh=110): white_px={np.sum(mask==255)} black_px={np.sum(mask==0)} coverage={100*np.mean(mask==255):.1f}%")
+        # === ACCURACY FIX 10: Raise binarization threshold 110→127 → stricter latent mask boundary ===
+        mask[mask < 127] = 0
+        mask[mask >= 127] = 255
+        print(f"[PIPELINE] Hard-binarized mask (thresh=127): white_px={np.sum(mask==255)} black_px={np.sum(mask==0)} coverage={100*np.mean(mask==255):.1f}%")
         mask = torch.tensor(mask, device=device, dtype=prompt_embeds.dtype)
         mask = mask / 255.0
         mask = mask.reshape(-1, 1, mask.size(-2), mask.size(-1))
@@ -566,13 +566,17 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # =====================================================================
-                # HIGH-ACCURACY FIX: REMOVED SDEdit latent blending.
-                # The old code mixed noisy original-image latents at EVERY step, pulling
-                # generated colors toward the original garment (e.g. white tank top).
-                # This was the #1 cause of washed-out colors and wrong hues.
-                # We now do ONE clean pixel-space composite AFTER the full denoising is done.
-                # Result: accurate colors, sharp prints, correct garment shapes.
+                # RESTORED SDEdit latent blending (OOTDiffusion default)
+                # Mixing noisy original-image latents at every step ensures the output
+                # matches the person's original identity and background perfectly.
                 # =====================================================================
+                init_latents_proper = image_ori_latents
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    init_latents_proper = self.scheduler.add_noise(
+                        image_ori_latents, noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
+                    )
+                latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
