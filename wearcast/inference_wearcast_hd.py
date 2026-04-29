@@ -425,23 +425,9 @@ class WearCastHD:
 
         # --- Advanced Post-Processing (OOTDiffusion Parity) ---
         t_post = time.time()
-        print(f" -> Starting advanced color correction...")
-        # Note: self._cached_hard_mask is the true binary mask before any feathering/blurring
-        color_corrected_image = self.local_color_correction(
-            raw_generated,
-            image_garm,
-            self._cached_hard_mask if hasattr(self, '_cached_hard_mask') else mask
-        )
-
-        print(f" -> Starting seamless Laplacian blending...")
-        # Laplacian blending is used to eliminate the "white halo" by blending frequencies
-        final_image = self.laplacian_pyramid_blend(
-            color_corrected_image,
-            image_ori,
-            Image.fromarray((alpha * 255).astype(np.uint8)),
-            levels=5
-        )
-        print(f" -> Post-processing completed in {time.time()-t_post:.3f}s (Correction + Laplacian)")
+        print(f" -> Bypassing legacy color correction and Laplacian blending.")
+        print(f" -> (The stabilized latent pipeline now handles boundaries and lighting natively).")
+        final_image = raw_generated
 
         # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
