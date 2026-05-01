@@ -81,12 +81,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Ngrok Setup
-# EXACT token from dashboard screenshot: 37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJScX2a
-NGROK_TOKEN = "37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJScX2a"
+# EXACT token from user: 37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a
+NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
 PORT = 8000
 
 def start_ngrok():
     print(f"[DEBUG] Starting Ngrok with token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
+    try:
+        # Cleanup existing tunnels
+        for t in ngrok.get_tunnels():
+            ngrok.disconnect(t.public_url)
+    except:
+        pass
+    
     ngrok.set_auth_token(NGROK_TOKEN)
     public_url = ngrok.connect(PORT).public_url
     print("\n" + "="*70)
@@ -196,8 +203,13 @@ async def stream_progress(task_id: str):
                 yield f"data: {{\"status\": \"failed\", \"error\": \"{tasks[task_id].get('error')}\"}}\n\n"
                 break
             
-            # Send professional update every 2 seconds
-            yield f"data: {{\"status\": \"{current_status}\", \"remaining\": {remaining}}}\n\n"
+            # Professional 3-second initialization delay
+            if elapsed < 3:
+                yield f"data: {{\"status\": \"initializing\", \"message\": \"Analyzing images and preparing GPU...\", \"remaining\": {total_estimate}}}\n\n"
+            else:
+                # Send professional update every 2 seconds
+                yield f"data: {{\"status\": \"{current_status}\", \"remaining\": {remaining}}}\n\n"
+            
             time.sleep(2)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
