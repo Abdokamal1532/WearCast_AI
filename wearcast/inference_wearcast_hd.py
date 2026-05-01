@@ -141,7 +141,7 @@ class WearCastHD:
                 mask=None,
                 image_ori=None,
                 num_samples=1,
-                num_steps=30,
+                num_steps=20,
                 image_scale=1.0,
                 seed=-1,
     ):
@@ -241,10 +241,6 @@ class WearCastHD:
             print(f" -> [SAVED] Soft mask (127-gray) saved to: debug_phase1_soft_mask.jpg")
 
             print(" -> Preprocessing Stage: SUCCESS")
-        else:
-            # User provided a mask, cache it for post-processing
-            self._cached_hard_mask = mask
-            mask_gray = mask # for dummy assignment if needed
 
         # Auto-detect garment complexity and choose optimal params
         is_complex = self.detect_garment_complexity(image_garm)
@@ -429,17 +425,9 @@ class WearCastHD:
 
         # --- Advanced Post-Processing (OOTDiffusion Parity) ---
         t_post = time.time()
-        print(f" -> Applying Skin-Safe Color Correction...")
-        
-        # We pass the parsing mask to ensure we only correct garment pixels, protecting skin.
-        final_image = self.local_color_correction(
-            raw_generated, 
-            image_garm, 
-            self._cached_hard_mask,
-            model_parse if 'model_parse' in locals() else None
-        )
-        
-        print(f" -> Color correction completed in {time.time() - t_post:.2f}s")
+        print(f" -> Bypassing legacy color correction and Laplacian blending.")
+        print(f" -> (The stabilized latent pipeline now handles boundaries and lighting natively).")
+        final_image = raw_generated
 
         # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
@@ -479,30 +467,29 @@ class WearCastHD:
             return False
 
         color_std = np.std(fg_pixels, axis=0).mean()
-        is_patterned = color_std > 30.0
+        is_patterned = color_std > 38.0
 
         gray = cv2.cvtColor(garm_np, cv2.COLOR_RGB2GRAY)
         edges = cv2.Canny(gray, 50, 150)
         edge_density = np.sum(edges > 0) / edges.size
-        is_complex_shape = edge_density > 0.04
+        is_complex_shape = edge_density > 0.06
 
-        print(f"   [COMPLEXITY] FG pixel count={len(fg_pixels)} | color_std={color_std:.2f} (>30=patterned:{is_patterned}) | edge_density={edge_density:.4f} (>0.04=complex:{is_complex_shape})")
+        print(f"   [COMPLEXITY] FG pixel count={len(fg_pixels)} | color_std={color_std:.2f} (>38=patterned:{is_patterned}) | edge_density={edge_density:.4f} (>0.06=complex:{is_complex_shape})")
         return is_patterned or is_complex_shape
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Complex/patterned garments require more steps for high accuracy (>98%)
-            # We use 50 steps and 3.0 scale for maximum detail retention
-            return {"num_steps": 50, "image_scale": 3.0}
+            # We use 40 steps and 2.5 scale for maximum detail retention
+            return {"num_steps": 40, "image_scale": 2.5}
         else:
-            # Simple/solid garments: default to 30 steps for speed/quality balance
-            return {"num_steps": 30, "image_scale": 2.5}
+            # Simple/solid garments: increased steps (30) for better quality and realism
+            return {"num_steps": 30, "image_scale": 2.0}
 
-    def local_color_correction(self, generated, original_garment, mask_hard, parse_pil=None):
+    def local_color_correction(self, generated, original_garment, mask_hard):
         """
         Match overall H/S/V stats of the generated garment to the original garment,
         restricted precisely to the mask boundary, and gently capped.
-        PROTECTS SKIN: Uses human parsing to avoid correcting skin tones.
         """
         print(f"   [COLOR] Starting correction. Gen shape: {generated.size}, Garm shape: {original_garment.size}")
         gen_np  = np.array(generated).astype(np.float32)
@@ -513,17 +500,7 @@ class WearCastHD:
         garm_hsv = cv2.cvtColor(garm_np.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
 
         mask_bool = msk_np > 0.5
-        
-        # --- SKIN PROTECTION ---
-        if parse_pil is not None:
-            parse_np = np.array(parse_pil.resize(generated.size, Image.NEAREST))
-            # Skin indices: Face(11), LeftLeg(12), RightLeg(13), LeftArm(14), RightArm(15), Neck(18)
-            skin_mask = np.isin(parse_np, [11, 12, 13, 14, 15, 18])
-            # Remove skin from the correction region
-            mask_bool = mask_bool & (~skin_mask)
-            print(f"   [COLOR] Skin protection: Excluded {skin_mask.sum()} skin pixels from correction.")
-
-        print(f"   [COLOR] Target correction area (garment only): {mask_bool.sum()} pixels  ({100*mask_bool.mean():.1f}% of image)")
+        print(f"   [COLOR] Mask interior area: {mask_bool.sum()} pixels  ({100*mask_bool.mean():.1f}% of image)")
 
         if mask_bool.sum() < 100:
             print("   [COLOR] Skipped: Mask interior area too small (<100px).")
@@ -894,8 +871,7 @@ class WearCastHD:
         # Merge head, dilate garment mask, add neck + arm regions
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-        # Tighter masking: reduce dilation iterations from 5 to 3 to better preserve edges
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=3)
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
 
         if category_norm in ('upper_body', 'dresses'):
             neck_mask = (parse_array == 18).astype(np.float32)
@@ -904,7 +880,7 @@ class WearCastHD:
             parse_mask = np.logical_or(parse_mask, neck_mask)
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=2) # Tighter arms: 4 -> 2
+                np.ones((5, 5), np.uint16), iterations=4)
             parse_mask += np.logical_or(parse_mask, arm_mask)
 
         # Invert: changeable pixels that are NOT part of the garment region
