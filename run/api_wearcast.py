@@ -86,7 +86,12 @@ NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
 PORT = 8000
 
 def start_ngrok():
-    print(f"[DEBUG] Starting Ngrok with token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
+    from pyngrok import conf, ngrok
+    print(f"[DEBUG] Force-setting Ngrok token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
+    
+    # 1. Update the global configuration directly
+    conf.get_default().auth_token = NGROK_TOKEN
+    
     try:
         # Cleanup existing tunnels
         for t in ngrok.get_tunnels():
@@ -94,7 +99,7 @@ def start_ngrok():
     except:
         pass
     
-    ngrok.set_auth_token(NGROK_TOKEN)
+    # 2. Connect with the explicit token
     public_url = ngrok.connect(PORT).public_url
     print("\n" + "="*70)
     print(f"🚀 WEARCAST API IS LIVE!")
