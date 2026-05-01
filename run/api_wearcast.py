@@ -81,11 +81,12 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Ngrok Setup
-# Note: Fixed potential typo in token (v -> c) based on screenshot
+# EXACT token from dashboard screenshot: 37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJScX2a
 NGROK_TOKEN = "37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJScX2a"
 PORT = 8000
 
 def start_ngrok():
+    print(f"[DEBUG] Starting Ngrok with token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
     ngrok.set_auth_token(NGROK_TOKEN)
     public_url = ngrok.connect(PORT).public_url
     print("\n" + "="*70)
