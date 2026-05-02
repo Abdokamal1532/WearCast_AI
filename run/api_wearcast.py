@@ -16,6 +16,7 @@ import sys
 import time
 import uuid
 import threading
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
@@ -160,6 +161,7 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     
     tasks[task_id]["preprocess_start_time"] = time.time()
     tasks[task_id]["unet_start_time"] = None
+    tasks[task_id]["last_step_time"] = None
     tasks[task_id]["avg_time_per_step"] = avg_step_est
 
     def progress_callback(step, t, latents):
@@ -169,22 +171,22 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
         # 1. Handle end of preprocessing / start of UNet
         if tasks[task_id]["unet_start_time"] is None:
             tasks[task_id]["unet_start_time"] = now
+            tasks[task_id]["last_step_time"] = now
             # Record actual preprocessing duration
             actual_preprocess = now - tasks[task_id]["preprocess_start_time"]
             GLOBAL_PERFORMANCE["preprocess_time"] = actual_preprocess
             return
 
-        # 2. Update Step Timing (EMA)
-        elapsed_unet = now - tasks[task_id]["unet_start_time"]
-        safe_step = max(1, step)
-        current_avg = elapsed_unet / safe_step
+        # 2. Update Step Timing (EMA) avoiding first step warmup spike
+        step_duration = now - tasks[task_id]["last_step_time"]
+        tasks[task_id]["last_step_time"] = now
         
-        # Smoothed Step Time
-        tasks[task_id]["avg_time_per_step"] = 0.6 * tasks[task_id]["avg_time_per_step"] + 0.4 * current_avg
-        GLOBAL_PERFORMANCE["avg_step_time"] = tasks[task_id]["avg_time_per_step"]
+        if step > 1:
+            tasks[task_id]["avg_time_per_step"] = 0.7 * tasks[task_id]["avg_time_per_step"] + 0.3 * step_duration
+            GLOBAL_PERFORMANCE["avg_step_time"] = tasks[task_id]["avg_time_per_step"]
             
         # 3. Dynamic Finish Time Recalculation
-        remaining_steps = max(0, tasks[task_id]["total_steps"] - safe_step)
+        remaining_steps = max(0, tasks[task_id]["total_steps"] - step)
         buffer = 6 # Post-processing buffer
         
         new_est = now + (tasks[task_id]["avg_time_per_step"] * remaining_steps) + buffer
@@ -234,237 +236,12 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
 # ============================================================
 # 4. API ENDPOINTS
 # ============================================================
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WearCast AI API Developer Portal</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --primary: #8a2be2;
-            --secondary: #ff1493;
-            --dark: #0f0c29;
-            --glass: rgba(255, 255, 255, 0.05);
-            --border: rgba(255, 255, 255, 0.1);
-            --method-get: #61affe;
-            --method-post: #49cc90;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Outfit', sans-serif;
-            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-            color: #fff;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 2rem;
-            background-size: 400% 400%;
-            animation: gradientBG 15s ease infinite;
-        }
-        @keyframes gradientBG {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-        .container {
-            width: 100%;
-            max-width: 1000px;
-            background: var(--glass);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid var(--border);
-            border-radius: 24px;
-            padding: 3rem;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-        }
-        h1 {
-            font-size: 3rem;
-            text-align: center;
-            background: linear-gradient(to right, #00f2fe, #4facfe);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.5rem;
-            letter-spacing: -1px;
-        }
-        p.subtitle {
-            text-align: center;
-            color: #a0aec0;
-            margin-bottom: 3rem;
-            font-size: 1.1rem;
-        }
-        .endpoint-list {
-            display: grid;
-            gap: 1.5rem;
-        }
-        .endpoint {
-            background: rgba(0,0,0,0.2);
-            border-radius: 16px;
-            padding: 1.5rem;
-            border: 1px solid var(--border);
-            transition: transform 0.2s, border-color 0.2s;
-        }
-        .endpoint:hover {
-            transform: translateY(-2px);
-            border-color: rgba(255,255,255,0.3);
-        }
-        .endpoint-header {
-            display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 1rem;
-        }
-        .method {
-            padding: 0.3rem 0.8rem;
-            border-radius: 6px;
-            font-weight: 800;
-            font-size: 0.9rem;
-            letter-spacing: 1px;
-            text-transform: uppercase;
-        }
-        .method.get { background: rgba(97, 175, 254, 0.2); color: var(--method-get); border: 1px solid rgba(97, 175, 254, 0.5); }
-        .method.post { background: rgba(73, 204, 144, 0.2); color: var(--method-post); border: 1px solid rgba(73, 204, 144, 0.5); }
-        
-        .path {
-            font-size: 1.3rem;
-            font-family: monospace;
-            color: #e2e8f0;
-        }
-        .description {
-            color: #a0aec0;
-            font-size: 1rem;
-            line-height: 1.5;
-            margin-bottom: 1rem;
-        }
-        .params {
-            background: rgba(0,0,0,0.3);
-            border-radius: 8px;
-            padding: 1rem;
-            font-size: 0.9rem;
-        }
-        .params h4 { color: #cbd5e0; margin-bottom: 0.5rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
-        .param-item { display: flex; gap: 1rem; margin-bottom: 0.4rem; }
-        .param-name { color: #4facfe; font-family: monospace; }
-        .param-type { color: #ff1493; font-family: monospace; }
-        .param-desc { color: #a0aec0; }
-        
-        .interactive-docs {
-            margin-top: 3rem;
-            text-align: center;
-            padding-top: 2rem;
-            border-top: 1px solid var(--border);
-        }
-        .btn {
-            display: inline-block;
-            padding: 1rem 2rem;
-            border-radius: 12px;
-            background: linear-gradient(45deg, var(--primary), var(--secondary));
-            color: white;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 1.1rem;
-            transition: transform 0.2s, box-shadow 0.2s;
-            margin: 0 0.5rem;
-        }
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(138, 43, 226, 0.4);
-        }
-        .btn.outline {
-            background: transparent;
-            border: 2px solid var(--primary);
-        }
-        .btn.outline:hover {
-            background: rgba(138, 43, 226, 0.1);
-            box-shadow: 0 5px 15px rgba(138, 43, 226, 0.2);
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>✨ WearCast AI API</h1>
-        <p class="subtitle">Developer Portal & Endpoint Reference</p>
-        
-        <div class="endpoint-list">
-            
-            <div class="endpoint">
-                <div class="endpoint-header">
-                    <span class="method post">POST</span>
-                    <span class="path">/tryon</span>
-                </div>
-                <div class="description">
-                    Initiates a new Virtual Try-On task. Submits person and garment images and returns a unique Task ID for tracking.
-                </div>
-                <div class="params">
-                    <h4>Form Data (multipart/form-data)</h4>
-                    <div class="param-item">
-                        <span class="param-name">person</span>
-                        <span class="param-type">file</span>
-                        <span class="param-desc">Image of the person (JPEG/PNG)</span>
-                    </div>
-                    <div class="param-item">
-                        <span class="param-name">garment</span>
-                        <span class="param-type">file</span>
-                        <span class="param-desc">Image of the garment to try on (JPEG/PNG)</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="endpoint">
-                <div class="endpoint-header">
-                    <span class="method get">GET</span>
-                    <span class="path">/stream/{task_id}</span>
-                </div>
-                <div class="description">
-                    Server-Sent Events (SSE) endpoint to monitor real-time task progress. Provides dynamic time estimations and status updates.
-                </div>
-                <div class="params">
-                    <h4>Path Parameters</h4>
-                    <div class="param-item">
-                        <span class="param-name">task_id</span>
-                        <span class="param-type">string</span>
-                        <span class="param-desc">The UUID returned from the /tryon endpoint</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="endpoint">
-                <div class="endpoint-header">
-                    <span class="method get">GET</span>
-                    <span class="path">/result/{task_id}</span>
-                </div>
-                <div class="description">
-                    Retrieves the final generated try-on image once the task is completed.
-                </div>
-                <div class="params">
-                    <h4>Path Parameters</h4>
-                    <div class="param-item">
-                        <span class="param-name">task_id</span>
-                        <span class="param-type">string</span>
-                        <span class="param-desc">The UUID of the completed task</span>
-                    </div>
-                </div>
-            </div>
-
-        </div>
-
-        <div class="interactive-docs">
-            <h2 style="margin-bottom: 1.5rem; font-weight: 600;">Interactive Documentation</h2>
-            <a href="/docs" class="btn">🚀 Swagger UI</a>
-            <a href="/redoc" class="btn outline">📖 ReDoc</a>
-        </div>
-    </div>
-</body>
-</html>
-"""
+from fastapi.openapi.docs import get_swagger_ui_html
 
 @app.get("/")
 async def root_dashboard():
-    """Returns a beautiful, interactive web dashboard to test the API."""
-    return HTMLResponse(content=DASHBOARD_HTML)
+    """Returns the interactive FastAPI Swagger UI dashboard."""
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="WearCast API Dashboard")
 
 @app.post("/tryon")
 async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...), garment: UploadFile = File(...)):
@@ -514,22 +291,14 @@ async def stream_progress(task_id: str):
             # Calculate remaining time dynamically
             raw_remaining = int(est_finish - now)
             
-            # MONOTONIC LOGIC: During processing, the timer must ONLY go down.
+            # MONOTONIC LOGIC: During processing, the timer should reflect our smoothed estimate
             if current_status == "processing":
-                # Ensure it never jumps UP, and always stays at least 1s until done
-                remaining = min(last_remaining, raw_remaining)
-                
-                # If the raw estimate jumped up (e.g. step was slow), 
-                # we just stick to the last value or count down 1s
-                if raw_remaining > last_remaining:
-                    remaining = max(1, last_remaining - 1)
-                
-                remaining = max(1, remaining)
+                remaining = max(1, raw_remaining)
             elif current_status == "completed":
                 remaining = 0
             else:
                 # Queued state: allow initial estimate
-                remaining = raw_remaining
+                remaining = max(1, raw_remaining)
             
             last_remaining = remaining
             
