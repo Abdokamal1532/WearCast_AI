@@ -484,7 +484,7 @@ class WearCastHD:
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Complex/patterned garments: 30 steps for high quality
-            return {"num_steps": 30, "image_scale": 2.5}
+            return {"num_steps": 20, "image_scale": 2.0}
         else:
             # Simple/solid garments: 20 steps for speed and realism
             return {"num_steps": 20, "image_scale": 2.0}
