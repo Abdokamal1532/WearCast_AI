@@ -115,7 +115,23 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     global wearcast_model
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
+    tasks[task_id]["total_steps"] = 30
+    tasks[task_id]["current_step"] = 0
+    tasks[task_id]["remaining"] = 60 # Initial guess
     
+    def progress_callback(step, t, latents):
+        tasks[task_id]["current_step"] = step
+        elapsed = time.time() - tasks[task_id]["start_time"]
+        
+        if step > 0:
+            avg_time_per_step = elapsed / (step + 1)
+            remaining_steps = tasks[task_id]["total_steps"] - (step + 1)
+            # Add a small buffer for post-processing (approx 5s)
+            tasks[task_id]["remaining"] = int(avg_time_per_step * remaining_steps) + 5
+        else:
+            # First step might be slower due to warm-up
+            tasks[task_id]["remaining"] = 55 
+
     try:
         with gpu_lock:
             print(f"[PROCESS] Task {task_id} started on GPU.")
@@ -129,9 +145,11 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
                     mask=None,
                     image_ori=vton_img.resize((768, 1024)),
                     num_samples=1,
-                    num_steps=30,  # Adjusted for speed/quality balance
+                    num_steps=tasks[task_id]["total_steps"],
                     image_scale=2.5,
                     seed=-1,
+                    callback=progress_callback,
+                    callback_steps=1
                 )
             
             if images:
@@ -139,6 +157,7 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 images[0].save(output_path)
                 tasks[task_id]["status"] = "completed"
+                tasks[task_id]["remaining"] = 0
                 tasks[task_id]["result_path"] = output_path
                 print(f"[SUCCESS] Task {task_id} finished.")
             else:
@@ -169,7 +188,7 @@ async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...
         
         tasks[task_id] = {
             "status": "queued",
-            "estimate": 35,  # Standard estimate for HD processing
+            "remaining": 65,  # Default starting point
             "created_at": time.time()
         }
         
@@ -179,7 +198,7 @@ async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...
         return {
             "task_id": task_id,
             "message": "Task started successfully",
-            "estimated_time_seconds": 35
+            "estimated_time_seconds": 65
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid images: {e}")
@@ -193,13 +212,9 @@ async def stream_progress(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
 
     def event_generator():
-        start_time = tasks[task_id]["created_at"]
-        total_estimate = tasks[task_id]["estimate"]
-        
         while True:
             current_status = tasks[task_id]["status"]
-            elapsed = time.time() - start_time
-            remaining = max(1, int(total_estimate - elapsed))
+            remaining = tasks[task_id].get("remaining", 0)
             
             if current_status == "completed":
                 yield f"data: {{\"status\": \"completed\", \"remaining\": 0, \"url\": \"/result/{task_id}\"}}\n\n"
@@ -208,16 +223,25 @@ async def stream_progress(task_id: str):
                 yield f"data: {{\"status\": \"failed\", \"error\": \"{tasks[task_id].get('error')}\"}}\n\n"
                 break
             
-            # Professional 3-second initialization delay
-            if elapsed < 3:
-                yield f"data: {{\"status\": \"initializing\", \"message\": \"Analyzing images and preparing GPU...\", \"remaining\": {total_estimate}}}\n\n"
-            else:
-                # Send professional update every 2 seconds
-                yield f"data: {{\"status\": \"{current_status}\", \"remaining\": {remaining}}}\n\n"
+            # Message mapping based on status
+            message = "Processing..."
+            if current_status == "queued":
+                message = "Waiting for GPU resources..."
+            elif current_status == "processing":
+                step = tasks[task_id].get("current_step", 0)
+                total = tasks[task_id].get("total_steps", 30)
+                message = f"Generating textures (Step {step}/{total})..."
+                if step < 2:
+                    message = "Analyzing images and preparing GPU..."
+                elif remaining < 5:
+                    message = "Finalizing pixels and saving result..."
             
-            time.sleep(2)
+            yield f"data: {{\"status\": \"{current_status}\", \"message\": \"{message}\", \"remaining\": {remaining}}}\n\n"
+            
+            time.sleep(1) # More frequent updates for real-time feel
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 @app.get("/result/{task_id}")
 async def get_result(task_id: str):

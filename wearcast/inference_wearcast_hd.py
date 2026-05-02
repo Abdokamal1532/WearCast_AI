@@ -144,6 +144,8 @@ class WearCastHD:
                 num_steps=20,
                 image_scale=1.0,
                 seed=-1,
+                callback=None,
+                callback_steps=1,
     ):
         print("\n" + "=" * 70)
         print("[WearCastHD.__call__] Starting inference...")
@@ -356,6 +358,8 @@ class WearCastHD:
                 image_guidance_scale=final_scale,
                 num_images_per_prompt=num_samples,
                 generator=generator,
+                callback=callback,
+                callback_steps=callback_steps,
             ).images
             t_unet_end = time.time()
 
