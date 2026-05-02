@@ -483,12 +483,11 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex/patterned garments require more steps for high accuracy (>98%)
-            # We use 40 steps and 2.5 scale for maximum detail retention
-            return {"num_steps": 40, "image_scale": 2.5}
+            # Complex/patterned garments: 30 steps for high quality
+            return {"num_steps": 30, "image_scale": 2.5}
         else:
-            # Simple/solid garments: increased steps (30) for better quality and realism
-            return {"num_steps": 30, "image_scale": 2.0}
+            # Simple/solid garments: 20 steps for speed and realism
+            return {"num_steps": 20, "image_scale": 2.0}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """

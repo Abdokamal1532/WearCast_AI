@@ -141,3 +141,34 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
 
     return mask, mask_gray
+
+def smart_resize(img: Image.Image, target_size=(768, 1024), fill_color=(255, 255, 255)):
+    """
+    Resizes image while maintaining aspect ratio, adding padding to reach target_size.
+    This prevents the 'stretched' look common in naive resizing.
+    """
+    img_w, img_h = img.size
+    target_w, target_h = target_size
+    
+    # Calculate aspect ratios
+    aspect = img_w / img_h
+    target_aspect = target_w / target_h
+    
+    if aspect > target_aspect:
+        # Image is wider than target: fit to width
+        new_w = target_w
+        new_h = int(target_w / aspect)
+    else:
+        # Image is taller than target: fit to height
+        new_h = target_h
+        new_w = int(target_h * aspect)
+        
+    img_resized = img.resize((new_w, new_h), Image.LANCZOS)
+    
+    # Create background and paste
+    new_img = Image.new("RGB", target_size, fill_color)
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    new_img.paste(img_resized, (paste_x, paste_y))
+    
+    return new_img
