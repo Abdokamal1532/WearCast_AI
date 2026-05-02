@@ -50,6 +50,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from wearcast.inference_wearcast_hd import WearCastHD
+from utils_wearcast import smart_resize
 
 # Global State
 tasks: Dict[str, dict] = {}
@@ -142,11 +143,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
     
-    # 1. Detect Garment Complexity to sync step count with model logic
-    print(f"[PROCESS] Task {task_id}: Detecting garment complexity...")
-    is_complex = wearcast_model.detect_garment_complexity(garm_img)
-    # Match WearCastHD.get_optimal_params logic (30 for complex, 20 for simple)
-    total_steps = 30 if is_complex else 20
+    # Use fixed 20 steps as requested by user (previously was dynamic 15-20)
+    total_steps = 20
     
     tasks[task_id]["total_steps"] = total_steps
     tasks[task_id]["current_step"] = 0
@@ -200,17 +198,26 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
         with gpu_lock:
             print(f"[PROCESS] Task {task_id} started on GPU.")
             # Standard settings for high quality
+            # Pre-process images using smart_resize
+            vton_smart = smart_resize(vton_img)
+            garm_smart = smart_resize(garm_img)
+            
+            # GPU memory snapshot
+            if torch.cuda.is_available():
+                m_alloc = torch.cuda.memory_allocated(0) / (1024**3)
+                print(f"[PROCESS] Task {task_id} VRAM: {m_alloc:.2f}GB used")
+
             with torch.no_grad():
                 images = wearcast_model(
                     model_type='hd',
                     category='upperbody',
-                    image_garm=garm_img.resize((768, 1024)),
-                    image_vton=vton_img.resize((768, 1024)),
+                    image_garm=garm_smart,
+                    image_vton=vton_smart,
                     mask=None,
-                    image_ori=vton_img.resize((768, 1024)),
+                    image_ori=vton_smart,
                     num_samples=1,
-                    num_steps=tasks[task_id]["total_steps"],
-                    image_scale=2.5 if is_complex else 2.0,
+                    num_steps=total_steps,
+                    image_scale=2.5,
                     seed=-1,
                     callback=progress_callback,
                     callback_steps=1
@@ -303,10 +310,19 @@ async def stream_progress(task_id: str):
             last_remaining = remaining
             
             if current_status == "completed":
-                yield f"data: {{\"status\": \"completed\", \"remaining\": 0, \"url\": \"/result/{task_id}\"}}\n\n"
+                data = {
+                    "status": "completed",
+                    "remaining": 0,
+                    "url": f"/result/{task_id}"
+                }
+                yield f"data: {json.dumps(data)}\n\n"
                 break
             elif current_status == "failed":
-                yield f"data: {{\"status\": \"failed\", \"error\": \"{tasks[task_id].get('error')}\"}}\n\n"
+                data = {
+                    "status": "failed",
+                    "error": tasks[task_id].get('error')
+                }
+                yield f"data: {json.dumps(data)}\n\n"
                 break
             
             # Message mapping based on status
@@ -324,7 +340,12 @@ async def stream_progress(task_id: str):
                 else:
                     message = f"Generating textures (Step {step}/{total})..."
             
-            yield f"data: {{\"status\": \"{current_status}\", \"message\": \"{message}\", \"remaining\": {remaining}}}\n\n"
+            data = {
+                "status": current_status,
+                "message": message,
+                "remaining": remaining
+            }
+            yield f"data: {json.dumps(data)}\n\n"
             
             await asyncio.sleep(1) 
 

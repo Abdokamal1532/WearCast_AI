@@ -55,6 +55,7 @@ def check_gpu():
         print("CRITICAL: No GPU detected. Please enable GPU in Kaggle settings.")
 
 from wearcast.inference_wearcast_hd import WearCastHD
+from utils_wearcast import smart_resize
 
 if __name__ == '__main__':
     check_gpu()
@@ -76,14 +77,17 @@ if __name__ == '__main__':
     model_img = Image.open(args.model_path).convert('RGB')
     cloth_img = Image.open(args.cloth_path).convert('RGB')
     
+    model_img_smart = smart_resize(model_img)
+    cloth_img_smart = smart_resize(cloth_img)
+    
     # Run inference
     result = model(
         model_type='hd',
         category=category_str,
-        image_garm=cloth_img,
-        image_vton=model_img,
+        image_garm=cloth_img_smart,
+        image_vton=model_img_smart,
         mask=None,
-        image_ori=model_img,
+        image_ori=model_img_smart,
         num_samples=1,
         num_steps=20,
         image_scale=2.0,
