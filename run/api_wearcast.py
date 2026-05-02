@@ -82,7 +82,7 @@ def detect_hardware_defaults():
         elif "L4" in name:
             GLOBAL_PERFORMANCE = {"avg_step_time": 0.8, "preprocess_time": 12.0, "last_total_time": 30.0}
         elif "T4" in name:
-            GLOBAL_PERFORMANCE = {"avg_step_time": 1.45, "preprocess_time": 18.0, "last_total_time": 50.0}
+            GLOBAL_PERFORMANCE = {"avg_step_time": 2.0, "preprocess_time": 25.0, "last_total_time": 85.0}
         elif any(x in name for x in ["3090", "4090", "3080", "4080"]):
             GLOBAL_PERFORMANCE = {"avg_step_time": 0.55, "preprocess_time": 10.0, "last_total_time": 22.0}
     else:
@@ -139,7 +139,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     global wearcast_model, GLOBAL_PERFORMANCE
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
-    tasks[task_id]["total_steps"] = 20
+    # Default to 30 for HD, 20 for standard. We'll adjust if callback shows otherwise.
+    tasks[task_id]["total_steps"] = 20 
     tasks[task_id]["current_step"] = 0
     
     # Use cached performance for initial estimate
@@ -271,19 +272,22 @@ async def stream_progress(task_id: str):
             # Calculate remaining time dynamically
             raw_remaining = int(est_finish - now)
             
-            # Monotonic logic: during processing, don't let it jump UP significantly
-            if current_status != "completed":
-                # Final phase smoothing
-                if raw_remaining < 5:
-                    remaining = min(last_remaining, raw_remaining)
-                    remaining = max(1, remaining)
-                else:
-                    # Allow slight jumps if estimate improves, but clamp to avoid jitter
-                    remaining = max(1, raw_remaining)
-                    if last_remaining - remaining > 10: # If it jumps DOWN too fast, smooth it
-                         remaining = last_remaining - 1
-            else:
+            # MONOTONIC LOGIC: During processing, the timer must ONLY go down.
+            if current_status == "processing":
+                # Ensure it never jumps UP, and always stays at least 1s until done
+                remaining = min(last_remaining, raw_remaining)
+                
+                # If the raw estimate jumped up (e.g. step was slow), 
+                # we just stick to the last value or count down 1s
+                if raw_remaining > last_remaining:
+                    remaining = max(1, last_remaining - 1)
+                
+                remaining = max(1, remaining)
+            elif current_status == "completed":
                 remaining = 0
+            else:
+                # Queued state: allow initial estimate
+                remaining = raw_remaining
             
             last_remaining = remaining
             
