@@ -63,9 +63,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global Task Storage
-tasks: Dict[str, dict] = {}
-gpu_lock = threading.Lock()
+# Global Performance Cache (to share timing across tasks)
+GLOBAL_PERFORMANCE = {
+    "avg_step_time": 1.5,   # Default for T4-like performance
+    "preprocess_time": 20.0, # Loading and preprocessing
+    "last_total_time": 65.0
+}
+
+def detect_hardware_defaults():
+    global GLOBAL_PERFORMANCE
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0).upper()
+        print(f"[STARTUP] Detected Hardware: {name}")
+        if "A100" in name:
+            GLOBAL_PERFORMANCE = {"avg_step_time": 0.45, "preprocess_time": 8.0, "last_total_time": 20.0}
+        elif "V100" in name:
+            GLOBAL_PERFORMANCE = {"avg_step_time": 0.65, "preprocess_time": 10.0, "last_total_time": 25.0}
+        elif "L4" in name:
+            GLOBAL_PERFORMANCE = {"avg_step_time": 0.8, "preprocess_time": 12.0, "last_total_time": 30.0}
+        elif "T4" in name:
+            GLOBAL_PERFORMANCE = {"avg_step_time": 1.45, "preprocess_time": 18.0, "last_total_time": 50.0}
+        elif any(x in name for x in ["3090", "4090", "3080", "4080"]):
+            GLOBAL_PERFORMANCE = {"avg_step_time": 0.55, "preprocess_time": 10.0, "last_total_time": 22.0}
+    else:
+        print("[STARTUP] No GPU detected. Using CPU defaults.")
+        GLOBAL_PERFORMANCE = {"avg_step_time": 15.0, "preprocess_time": 30.0, "last_total_time": 350.0}
+
+detect_hardware_defaults()
 
 print("[STARTUP] Initializing WearCast Engine (GPU)...")
 # Initialize the model on GPU 0
@@ -112,30 +136,51 @@ def start_ngrok():
 # 3. CORE INFERENCE LOGIC (Background)
 # ============================================================
 def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
-    global wearcast_model
+    global wearcast_model, GLOBAL_PERFORMANCE
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
     tasks[task_id]["total_steps"] = 20
     tasks[task_id]["current_step"] = 0
-    tasks[task_id]["est_finish_time"] = time.time() + 65 # Initial estimate
     
+    # Use cached performance for initial estimate
+    init_total = GLOBAL_PERFORMANCE["last_total_time"]
+    tasks[task_id]["est_finish_time"] = time.time() + init_total
+    
+    tasks[task_id]["preprocess_start_time"] = time.time()
+    tasks[task_id]["unet_start_time"] = None
+    tasks[task_id]["avg_time_per_step"] = GLOBAL_PERFORMANCE["avg_step_time"]
+
     def progress_callback(step, t, latents):
-        tasks[task_id]["current_step"] = step
         now = time.time()
-        elapsed = now - tasks[task_id]["start_time"]
+        tasks[task_id]["current_step"] = step
         
-        # Clamp step to avoid math errors if callback is called with step > total_steps
-        safe_step = min(step + 1, tasks[task_id]["total_steps"])
+        # 1. Handle end of preprocessing / start of UNet
+        if tasks[task_id]["unet_start_time"] is None:
+            tasks[task_id]["unet_start_time"] = now
+            # Record actual preprocessing duration
+            actual_preprocess = now - tasks[task_id]["preprocess_start_time"]
+            GLOBAL_PERFORMANCE["preprocess_time"] = actual_preprocess
+            return
+
+        # 2. Update Step Timing (EMA)
+        elapsed_unet = now - tasks[task_id]["unet_start_time"]
+        safe_step = max(1, step)
+        current_avg = elapsed_unet / safe_step
         
-        if safe_step > 1:
-            # More stable average (skipping potential first-step lag)
-            avg_time_per_step = elapsed / safe_step
-            remaining_steps = tasks[task_id]["total_steps"] - safe_step
-            # Update estimated finish time (with a 5s buffer for post-processing)
-            tasks[task_id]["est_finish_time"] = now + (avg_time_per_step * remaining_steps) + 5
-        else:
-            # Keep initial estimate moving naturally during first step
-            pass
+        # Smoothed Step Time
+        tasks[task_id]["avg_time_per_step"] = 0.6 * tasks[task_id]["avg_time_per_step"] + 0.4 * current_avg
+        GLOBAL_PERFORMANCE["avg_step_time"] = tasks[task_id]["avg_time_per_step"]
+            
+        # 3. Dynamic Finish Time Recalculation
+        remaining_steps = max(0, tasks[task_id]["total_steps"] - safe_step)
+        buffer = 6 # Post-processing buffer
+        
+        new_est = now + (tasks[task_id]["avg_time_per_step"] * remaining_steps) + buffer
+        tasks[task_id]["est_finish_time"] = new_est
+        
+        # Update global total for next task
+        total_so_far = now - tasks[task_id]["start_time"]
+        GLOBAL_PERFORMANCE["last_total_time"] = total_so_far + (tasks[task_id]["avg_time_per_step"] * remaining_steps) + buffer
 
     try:
         with gpu_lock:
@@ -193,7 +238,7 @@ async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...
         
         tasks[task_id] = {
             "status": "queued",
-            "est_finish_time": time.time() + 65,
+            "est_finish_time": time.time() + GLOBAL_PERFORMANCE["last_total_time"],
             "created_at": time.time()
         }
         
@@ -203,7 +248,7 @@ async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...
         return {
             "task_id": task_id,
             "message": "Task started successfully",
-            "estimated_time_seconds": 65
+            "estimated_time_seconds": int(GLOBAL_PERFORMANCE["last_total_time"])
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid images: {e}")
@@ -217,19 +262,30 @@ async def stream_progress(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
 
     def event_generator():
+        last_remaining = int(GLOBAL_PERFORMANCE["last_total_time"])
         while True:
             now = time.time()
             current_status = tasks[task_id]["status"]
-            est_finish = tasks[task_id].get("est_finish_time", now + 60)
+            est_finish = tasks[task_id].get("est_finish_time", now + last_remaining)
             
             # Calculate remaining time dynamically
-            remaining = int(est_finish - now)
+            raw_remaining = int(est_finish - now)
             
-            # Professional clamping: Never show <= 0 if not actually done
+            # Monotonic logic: during processing, don't let it jump UP significantly
             if current_status != "completed":
-                remaining = max(1, remaining)
+                # Final phase smoothing
+                if raw_remaining < 5:
+                    remaining = min(last_remaining, raw_remaining)
+                    remaining = max(1, remaining)
+                else:
+                    # Allow slight jumps if estimate improves, but clamp to avoid jitter
+                    remaining = max(1, raw_remaining)
+                    if last_remaining - remaining > 10: # If it jumps DOWN too fast, smooth it
+                         remaining = last_remaining - 1
             else:
                 remaining = 0
+            
+            last_remaining = remaining
             
             if current_status == "completed":
                 yield f"data: {{\"status\": \"completed\", \"remaining\": 0, \"url\": \"/result/{task_id}\"}}\n\n"
@@ -246,9 +302,9 @@ async def stream_progress(task_id: str):
                 step = tasks[task_id].get("current_step", 0)
                 total = tasks[task_id].get("total_steps", 20)
                 
-                if step < 2:
+                if step < 1:
                     message = "Analyzing images and preparing GPU..."
-                elif remaining < 8:
+                elif remaining < 10:
                     message = "Finalizing pixels and saving result..."
                 else:
                     message = f"Generating textures (Step {step}/{total})..."
