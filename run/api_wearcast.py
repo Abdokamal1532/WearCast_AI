@@ -145,8 +145,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     # 1. Detect Garment Complexity to sync step count with model logic
     print(f"[PROCESS] Task {task_id}: Detecting garment complexity...")
     is_complex = wearcast_model.detect_garment_complexity(garm_img)
-    # Match WearCastHD.get_optimal_params logic (40 for complex, 30 for simple)
-    total_steps = 40 if is_complex else 30
+    # Match WearCastHD.get_optimal_params logic (30 for complex, 20 for simple)
+    total_steps = 30 if is_complex else 20
     
     tasks[task_id]["total_steps"] = total_steps
     tasks[task_id]["current_step"] = 0
