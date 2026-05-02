@@ -37,7 +37,7 @@ def install_dependencies():
 install_dependencies()
 
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pyngrok import ngrok
 import torch
@@ -234,6 +234,383 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
 # ============================================================
 # 4. API ENDPOINTS
 # ============================================================
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WearCast AI Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #8a2be2;
+            --secondary: #ff1493;
+            --dark: #0f0c29;
+            --glass: rgba(255, 255, 255, 0.05);
+            --border: rgba(255, 255, 255, 0.1);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
+            background-size: 400% 400%;
+            animation: gradientBG 15s ease infinite;
+        }
+        @keyframes gradientBG {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            background: var(--glass);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 3rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 3rem;
+        }
+        h1 {
+            grid-column: 1 / -1;
+            font-size: 3rem;
+            text-align: center;
+            background: linear-gradient(to right, #00f2fe, #4facfe);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 2rem;
+            letter-spacing: -1px;
+        }
+        .panel {
+            background: rgba(0,0,0,0.2);
+            border-radius: 16px;
+            padding: 2rem;
+            border: 1px solid var(--border);
+        }
+        h2 { font-size: 1.5rem; margin-bottom: 1.5rem; font-weight: 600; }
+        .upload-group { margin-bottom: 1.5rem; }
+        label { display: block; margin-bottom: 0.5rem; color: #a0aec0; font-size: 0.9rem; }
+        input[type="file"] {
+            display: none;
+        }
+        .file-drop {
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 150px;
+            background-size: cover;
+            background-repeat: no-repeat;
+            background-position: center;
+        }
+        .file-drop:hover {
+            border-color: var(--primary);
+            background-color: rgba(138, 43, 226, 0.1);
+        }
+        .file-drop span {
+            background: rgba(0,0,0,0.5);
+            padding: 5px 15px;
+            border-radius: 20px;
+            backdrop-filter: blur(5px);
+        }
+        button {
+            width: 100%;
+            padding: 1rem;
+            border: none;
+            border-radius: 12px;
+            background: linear-gradient(45deg, var(--primary), var(--secondary));
+            color: white;
+            font-size: 1.2rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 1rem;
+            font-family: 'Outfit', sans-serif;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(138, 43, 226, 0.4);
+        }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .result-panel {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            position: relative;
+            min-height: 400px;
+        }
+        #resultImage {
+            max-width: 100%;
+            max-height: 500px;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            display: none;
+            opacity: 0;
+            transition: opacity 1s ease-in-out;
+        }
+        .progress-container {
+            width: 100%;
+            display: none;
+            flex-direction: column;
+            gap: 1rem;
+            margin-top: 2rem;
+        }
+        .progress-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #00f2fe, #4facfe);
+            transition: width 0.3s ease;
+            box-shadow: 0 0 10px #4facfe;
+        }
+        .status-text {
+            font-size: 1rem;
+            color: #cbd5e0;
+            display: flex;
+            justify-content: space-between;
+        }
+        .loader {
+            border: 4px solid rgba(255,255,255,0.1);
+            border-top: 4px solid #4facfe;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            display: none;
+            margin-bottom: 1rem;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .api-links {
+            grid-column: 1 / -1;
+            text-align: center;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            color: #a0aec0;
+        }
+        .api-links a { color: #4facfe; text-decoration: none; margin: 0 10px; }
+        .api-links a:hover { text-decoration: underline; }
+        
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>✨ WearCast AI</h1>
+        
+        <div class="panel">
+            <h2>Virtual Try-On</h2>
+            <form id="tryonForm">
+                <div class="upload-group">
+                    <label>Person Image</label>
+                    <div class="file-drop" id="personDrop" onclick="document.getElementById('personInput').click()">
+                        <span>Select Person Image</span>
+                    </div>
+                    <input type="file" id="personInput" accept="image/*" required>
+                </div>
+                
+                <div class="upload-group">
+                    <label>Garment Image</label>
+                    <div class="file-drop" id="garmentDrop" onclick="document.getElementById('garmentInput').click()">
+                        <span>Select Garment Image</span>
+                    </div>
+                    <input type="file" id="garmentInput" accept="image/*" required>
+                </div>
+                
+                <button type="submit" id="submitBtn">Generate Try-On 🚀</button>
+            </form>
+        </div>
+
+        <div class="panel result-panel">
+            <h2>Result</h2>
+            
+            <div class="loader" id="loader"></div>
+            
+            <div class="progress-container" id="progressContainer">
+                <div class="status-text">
+                    <span id="statusMsg">Initializing...</span>
+                    <span id="timeRemaining">-- s</span>
+                </div>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="progressBar"></div>
+                </div>
+            </div>
+            
+            <img id="resultImage" alt="Generated Try-On Result">
+        </div>
+        
+        <div class="api-links">
+            <a href="/docs" target="_blank">📚 Swagger API Docs</a> | 
+            <a href="/redoc" target="_blank">📖 ReDoc</a>
+        </div>
+    </div>
+
+    <script>
+        // Setup image previews
+        function setupPreview(inputId, dropId) {
+            const input = document.getElementById(inputId);
+            const drop = document.getElementById(dropId);
+            
+            input.addEventListener('change', function(e) {
+                if (e.target.files && e.target.files[0]) {
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        drop.style.backgroundImage = `url('${e.target.result}')`;
+                        drop.querySelector('span').style.display = 'none';
+                    }
+                    reader.readAsDataURL(e.target.files[0]);
+                }
+            });
+        }
+        
+        setupPreview('personInput', 'personDrop');
+        setupPreview('garmentInput', 'garmentDrop');
+
+        const form = document.getElementById('tryonForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const statusMsg = document.getElementById('statusMsg');
+        const timeRemaining = document.getElementById('timeRemaining');
+        const resultImage = document.getElementById('resultImage');
+        const loader = document.getElementById('loader');
+
+        let initialTimeEstimate = 0;
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const personFile = document.getElementById('personInput').files[0];
+            const garmentFile = document.getElementById('garmentInput').files[0];
+            
+            if (!personFile || !garmentFile) return alert("Please select both images.");
+            
+            // UI Reset
+            submitBtn.disabled = true;
+            submitBtn.innerText = "Processing...";
+            resultImage.style.opacity = '0';
+            setTimeout(() => resultImage.style.display = 'none', 500);
+            loader.style.display = 'block';
+            progressContainer.style.display = 'flex';
+            progressBar.style.width = '0%';
+            statusMsg.innerText = "Uploading images...";
+            timeRemaining.innerText = "Estimating...";
+
+            const formData = new FormData();
+            formData.append('person', personFile);
+            formData.append('garment', garmentFile);
+
+            try {
+                // 1. Submit task
+                const response = await fetch('/tryon', { method: 'POST', body: formData });
+                const data = await response.json();
+                
+                if (!response.ok) throw new Error(data.detail || "Upload failed");
+                
+                const taskId = data.task_id;
+                initialTimeEstimate = data.estimated_time_seconds || 60;
+                
+                // 2. Connect to SSE stream
+                const evtSource = new EventSource(`/stream/${taskId}`);
+                
+                evtSource.onmessage = function(event) {
+                    const msg = JSON.parse(event.data);
+                    
+                    if (msg.status === 'completed') {
+                        evtSource.close();
+                        statusMsg.innerText = "✨ Done!";
+                        timeRemaining.innerText = "0s";
+                        progressBar.style.width = '100%';
+                        
+                        // Load image
+                        loader.style.display = 'none';
+                        resultImage.src = msg.url;
+                        resultImage.style.display = 'block';
+                        // Add a small delay for image load before fade-in
+                        setTimeout(() => resultImage.style.opacity = '1', 50);
+                        
+                        submitBtn.disabled = false;
+                        submitBtn.innerText = "Generate Another Try-On 🚀";
+                    } 
+                    else if (msg.status === 'failed') {
+                        evtSource.close();
+                        statusMsg.innerText = `❌ Error: ${msg.error || 'Task Failed'}`;
+                        loader.style.display = 'none';
+                        submitBtn.disabled = false;
+                        submitBtn.innerText = "Try Again 🚀";
+                    }
+                    else {
+                        statusMsg.innerText = msg.message || "Processing...";
+                        timeRemaining.innerText = msg.remaining + "s";
+                        
+                        // Calculate progress bar %
+                        let progress = 0;
+                        if(initialTimeEstimate > 0) {
+                            progress = Math.max(0, Math.min(100, 100 - ((msg.remaining / initialTimeEstimate) * 100)));
+                        }
+                        progressBar.style.width = `${progress}%`;
+                    }
+                };
+                
+                evtSource.onerror = function() {
+                    console.error("SSE Connection Error");
+                    evtSource.close();
+                    statusMsg.innerText = "⚠️ Connection lost, checking result...";
+                    submitBtn.disabled = false;
+                    submitBtn.innerText = "Try Again 🚀";
+                };
+
+            } catch (error) {
+                console.error(error);
+                alert("Error: " + error.message);
+                submitBtn.disabled = false;
+                submitBtn.innerText = "Generate Try-On 🚀";
+                loader.style.display = 'none';
+                progressContainer.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/")
+async def root_dashboard():
+    """Returns a beautiful, interactive web dashboard to test the API."""
+    return HTMLResponse(content=DASHBOARD_HTML)
 
 @app.post("/tryon")
 async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...), garment: UploadFile = File(...)):
