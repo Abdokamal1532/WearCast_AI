@@ -117,20 +117,25 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     tasks[task_id]["start_time"] = time.time()
     tasks[task_id]["total_steps"] = 20
     tasks[task_id]["current_step"] = 0
-    tasks[task_id]["remaining"] = 60 # Initial guess
+    tasks[task_id]["est_finish_time"] = time.time() + 65 # Initial estimate
     
     def progress_callback(step, t, latents):
         tasks[task_id]["current_step"] = step
-        elapsed = time.time() - tasks[task_id]["start_time"]
+        now = time.time()
+        elapsed = now - tasks[task_id]["start_time"]
         
-        if step > 0:
-            avg_time_per_step = elapsed / (step + 1)
-            remaining_steps = tasks[task_id]["total_steps"] - (step + 1)
-            # Add a small buffer for post-processing (approx 5s)
-            tasks[task_id]["remaining"] = int(avg_time_per_step * remaining_steps) + 5
+        # Clamp step to avoid math errors if callback is called with step > total_steps
+        safe_step = min(step + 1, tasks[task_id]["total_steps"])
+        
+        if safe_step > 1:
+            # More stable average (skipping potential first-step lag)
+            avg_time_per_step = elapsed / safe_step
+            remaining_steps = tasks[task_id]["total_steps"] - safe_step
+            # Update estimated finish time (with a 5s buffer for post-processing)
+            tasks[task_id]["est_finish_time"] = now + (avg_time_per_step * remaining_steps) + 5
         else:
-            # First step might be slower due to warm-up
-            tasks[task_id]["remaining"] = 55 
+            # Keep initial estimate moving naturally during first step
+            pass
 
     try:
         with gpu_lock:
@@ -157,7 +162,7 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 images[0].save(output_path)
                 tasks[task_id]["status"] = "completed"
-                tasks[task_id]["remaining"] = 0
+                tasks[task_id]["est_finish_time"] = time.time()
                 tasks[task_id]["result_path"] = output_path
                 print(f"[SUCCESS] Task {task_id} finished.")
             else:
@@ -188,7 +193,7 @@ async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...
         
         tasks[task_id] = {
             "status": "queued",
-            "remaining": 65,  # Default starting point
+            "est_finish_time": time.time() + 65,
             "created_at": time.time()
         }
         
@@ -213,8 +218,18 @@ async def stream_progress(task_id: str):
 
     def event_generator():
         while True:
+            now = time.time()
             current_status = tasks[task_id]["status"]
-            remaining = tasks[task_id].get("remaining", 0)
+            est_finish = tasks[task_id].get("est_finish_time", now + 60)
+            
+            # Calculate remaining time dynamically
+            remaining = int(est_finish - now)
+            
+            # Professional clamping: Never show <= 0 if not actually done
+            if current_status != "completed":
+                remaining = max(1, remaining)
+            else:
+                remaining = 0
             
             if current_status == "completed":
                 yield f"data: {{\"status\": \"completed\", \"remaining\": 0, \"url\": \"/result/{task_id}\"}}\n\n"
@@ -230,15 +245,17 @@ async def stream_progress(task_id: str):
             elif current_status == "processing":
                 step = tasks[task_id].get("current_step", 0)
                 total = tasks[task_id].get("total_steps", 20)
-                message = f"Generating textures (Step {step}/{total})..."
+                
                 if step < 2:
                     message = "Analyzing images and preparing GPU..."
-                elif remaining < 5:
+                elif remaining < 8:
                     message = "Finalizing pixels and saving result..."
+                else:
+                    message = f"Generating textures (Step {step}/{total})..."
             
             yield f"data: {{\"status\": \"{current_status}\", \"message\": \"{message}\", \"remaining\": {remaining}}}\n\n"
             
-            time.sleep(1) # More frequent updates for real-time feel
+            time.sleep(1) 
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
