@@ -50,9 +50,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from wearcast.inference_wearcast_hd import WearCastHD
 
-# ============================================================
-# 2. CONFIGURATION & INITIALIZATION
-# ============================================================
+# Global State
+tasks: Dict[str, dict] = {}
+gpu_lock = threading.Lock()
+
 app = FastAPI(title="WearCast AI Professional API")
 
 # Enable CORS for frontend access
@@ -139,17 +140,27 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     global wearcast_model, GLOBAL_PERFORMANCE
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
-    # Default to 30 for HD, 20 for standard. We'll adjust if callback shows otherwise.
-    tasks[task_id]["total_steps"] = 20 
+    
+    # 1. Detect Garment Complexity to sync step count with model logic
+    print(f"[PROCESS] Task {task_id}: Detecting garment complexity...")
+    is_complex = wearcast_model.detect_garment_complexity(garm_img)
+    # Match WearCastHD.get_optimal_params logic (40 for complex, 30 for simple)
+    total_steps = 40 if is_complex else 30
+    
+    tasks[task_id]["total_steps"] = total_steps
     tasks[task_id]["current_step"] = 0
     
-    # Use cached performance for initial estimate
-    init_total = GLOBAL_PERFORMANCE["last_total_time"]
+    # 2. Refined Initial Estimate based on complexity
+    preprocess_est = GLOBAL_PERFORMANCE.get("preprocess_time", 15)
+    avg_step_est = GLOBAL_PERFORMANCE.get("avg_step_time", 1.5)
+    buffer = 6
+    # Total = Preprocess + (Steps * Avg) + Buffer
+    init_total = preprocess_est + (total_steps * avg_step_est) + buffer
     tasks[task_id]["est_finish_time"] = time.time() + init_total
     
     tasks[task_id]["preprocess_start_time"] = time.time()
     tasks[task_id]["unet_start_time"] = None
-    tasks[task_id]["avg_time_per_step"] = GLOBAL_PERFORMANCE["avg_step_time"]
+    tasks[task_id]["avg_time_per_step"] = avg_step_est
 
     def progress_callback(step, t, latents):
         now = time.time()
@@ -197,7 +208,7 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
                     image_ori=vton_img.resize((768, 1024)),
                     num_samples=1,
                     num_steps=tasks[task_id]["total_steps"],
-                    image_scale=2.5,
+                    image_scale=2.5 if is_complex else 2.0,
                     seed=-1,
                     callback=progress_callback,
                     callback_steps=1
@@ -262,7 +273,7 @@ async def stream_progress(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    def event_generator():
+    async def event_generator():
         last_remaining = int(GLOBAL_PERFORMANCE["last_total_time"])
         while True:
             now = time.time()
@@ -315,7 +326,7 @@ async def stream_progress(task_id: str):
             
             yield f"data: {{\"status\": \"{current_status}\", \"message\": \"{message}\", \"remaining\": {remaining}}}\n\n"
             
-            time.sleep(1) 
+            await asyncio.sleep(1) 
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
