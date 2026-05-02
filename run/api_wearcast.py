@@ -234,14 +234,13 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
 # ============================================================
 # 4. API ENDPOINTS
 # ============================================================
-
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WearCast AI Dashboard</title>
+    <title>WearCast AI API Developer Portal</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -250,6 +249,8 @@ DASHBOARD_HTML = """
             --dark: #0f0c29;
             --glass: rgba(255, 255, 255, 0.05);
             --border: rgba(255, 255, 255, 0.1);
+            --method-get: #61affe;
+            --method-post: #49cc90;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -271,7 +272,7 @@ DASHBOARD_HTML = """
         }
         .container {
             width: 100%;
-            max-width: 1200px;
+            max-width: 1000px;
             background: var(--glass);
             backdrop-filter: blur(20px);
             -webkit-backdrop-filter: blur(20px);
@@ -279,330 +280,183 @@ DASHBOARD_HTML = """
             border-radius: 24px;
             padding: 3rem;
             box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 3rem;
         }
         h1 {
-            grid-column: 1 / -1;
             font-size: 3rem;
             text-align: center;
             background: linear-gradient(to right, #00f2fe, #4facfe);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 2rem;
+            margin-bottom: 0.5rem;
             letter-spacing: -1px;
         }
-        .panel {
+        p.subtitle {
+            text-align: center;
+            color: #a0aec0;
+            margin-bottom: 3rem;
+            font-size: 1.1rem;
+        }
+        .endpoint-list {
+            display: grid;
+            gap: 1.5rem;
+        }
+        .endpoint {
             background: rgba(0,0,0,0.2);
             border-radius: 16px;
-            padding: 2rem;
+            padding: 1.5rem;
             border: 1px solid var(--border);
+            transition: transform 0.2s, border-color 0.2s;
         }
-        h2 { font-size: 1.5rem; margin-bottom: 1.5rem; font-weight: 600; }
-        .upload-group { margin-bottom: 1.5rem; }
-        label { display: block; margin-bottom: 0.5rem; color: #a0aec0; font-size: 0.9rem; }
-        input[type="file"] {
-            display: none;
+        .endpoint:hover {
+            transform: translateY(-2px);
+            border-color: rgba(255,255,255,0.3);
         }
-        .file-drop {
-            border: 2px dashed var(--border);
-            border-radius: 12px;
-            padding: 2rem;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
+        .endpoint-header {
             display: flex;
             align-items: center;
-            justify-content: center;
-            min-height: 150px;
-            background-size: cover;
-            background-repeat: no-repeat;
-            background-position: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
         }
-        .file-drop:hover {
-            border-color: var(--primary);
-            background-color: rgba(138, 43, 226, 0.1);
+        .method {
+            padding: 0.3rem 0.8rem;
+            border-radius: 6px;
+            font-weight: 800;
+            font-size: 0.9rem;
+            letter-spacing: 1px;
+            text-transform: uppercase;
         }
-        .file-drop span {
-            background: rgba(0,0,0,0.5);
-            padding: 5px 15px;
-            border-radius: 20px;
-            backdrop-filter: blur(5px);
+        .method.get { background: rgba(97, 175, 254, 0.2); color: var(--method-get); border: 1px solid rgba(97, 175, 254, 0.5); }
+        .method.post { background: rgba(73, 204, 144, 0.2); color: var(--method-post); border: 1px solid rgba(73, 204, 144, 0.5); }
+        
+        .path {
+            font-size: 1.3rem;
+            font-family: monospace;
+            color: #e2e8f0;
         }
-        button {
-            width: 100%;
+        .description {
+            color: #a0aec0;
+            font-size: 1rem;
+            line-height: 1.5;
+            margin-bottom: 1rem;
+        }
+        .params {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
             padding: 1rem;
-            border: none;
+            font-size: 0.9rem;
+        }
+        .params h4 { color: #cbd5e0; margin-bottom: 0.5rem; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
+        .param-item { display: flex; gap: 1rem; margin-bottom: 0.4rem; }
+        .param-name { color: #4facfe; font-family: monospace; }
+        .param-type { color: #ff1493; font-family: monospace; }
+        .param-desc { color: #a0aec0; }
+        
+        .interactive-docs {
+            margin-top: 3rem;
+            text-align: center;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border);
+        }
+        .btn {
+            display: inline-block;
+            padding: 1rem 2rem;
             border-radius: 12px;
             background: linear-gradient(45deg, var(--primary), var(--secondary));
             color: white;
-            font-size: 1.2rem;
+            text-decoration: none;
             font-weight: 600;
-            cursor: pointer;
+            font-size: 1.1rem;
             transition: transform 0.2s, box-shadow 0.2s;
-            margin-top: 1rem;
-            font-family: 'Outfit', sans-serif;
+            margin: 0 0.5rem;
         }
-        button:hover {
+        .btn:hover {
             transform: translateY(-2px);
             box-shadow: 0 10px 20px rgba(138, 43, 226, 0.4);
         }
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
+        .btn.outline {
+            background: transparent;
+            border: 2px solid var(--primary);
         }
-        .result-panel {
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            text-align: center;
-            position: relative;
-            min-height: 400px;
-        }
-        #resultImage {
-            max-width: 100%;
-            max-height: 500px;
-            border-radius: 12px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-            display: none;
-            opacity: 0;
-            transition: opacity 1s ease-in-out;
-        }
-        .progress-container {
-            width: 100%;
-            display: none;
-            flex-direction: column;
-            gap: 1rem;
-            margin-top: 2rem;
-        }
-        .progress-bar-bg {
-            width: 100%;
-            height: 8px;
-            background: rgba(255,255,255,0.1);
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        .progress-bar-fill {
-            height: 100%;
-            width: 0%;
-            background: linear-gradient(90deg, #00f2fe, #4facfe);
-            transition: width 0.3s ease;
-            box-shadow: 0 0 10px #4facfe;
-        }
-        .status-text {
-            font-size: 1rem;
-            color: #cbd5e0;
-            display: flex;
-            justify-content: space-between;
-        }
-        .loader {
-            border: 4px solid rgba(255,255,255,0.1);
-            border-top: 4px solid #4facfe;
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-            display: none;
-            margin-bottom: 1rem;
-        }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        
-        .api-links {
-            grid-column: 1 / -1;
-            text-align: center;
-            margin-top: 1rem;
-            font-size: 0.9rem;
-            color: #a0aec0;
-        }
-        .api-links a { color: #4facfe; text-decoration: none; margin: 0 10px; }
-        .api-links a:hover { text-decoration: underline; }
-        
-        @media (max-width: 768px) {
-            .container { grid-template-columns: 1fr; }
+        .btn.outline:hover {
+            background: rgba(138, 43, 226, 0.1);
+            box-shadow: 0 5px 15px rgba(138, 43, 226, 0.2);
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>✨ WearCast AI</h1>
+        <h1>✨ WearCast AI API</h1>
+        <p class="subtitle">Developer Portal & Endpoint Reference</p>
         
-        <div class="panel">
-            <h2>Virtual Try-On</h2>
-            <form id="tryonForm">
-                <div class="upload-group">
-                    <label>Person Image</label>
-                    <div class="file-drop" id="personDrop" onclick="document.getElementById('personInput').click()">
-                        <span>Select Person Image</span>
-                    </div>
-                    <input type="file" id="personInput" accept="image/*" required>
-                </div>
-                
-                <div class="upload-group">
-                    <label>Garment Image</label>
-                    <div class="file-drop" id="garmentDrop" onclick="document.getElementById('garmentInput').click()">
-                        <span>Select Garment Image</span>
-                    </div>
-                    <input type="file" id="garmentInput" accept="image/*" required>
-                </div>
-                
-                <button type="submit" id="submitBtn">Generate Try-On 🚀</button>
-            </form>
-        </div>
-
-        <div class="panel result-panel">
-            <h2>Result</h2>
+        <div class="endpoint-list">
             
-            <div class="loader" id="loader"></div>
-            
-            <div class="progress-container" id="progressContainer">
-                <div class="status-text">
-                    <span id="statusMsg">Initializing...</span>
-                    <span id="timeRemaining">-- s</span>
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <span class="path">/tryon</span>
                 </div>
-                <div class="progress-bar-bg">
-                    <div class="progress-bar-fill" id="progressBar"></div>
+                <div class="description">
+                    Initiates a new Virtual Try-On task. Submits person and garment images and returns a unique Task ID for tracking.
+                </div>
+                <div class="params">
+                    <h4>Form Data (multipart/form-data)</h4>
+                    <div class="param-item">
+                        <span class="param-name">person</span>
+                        <span class="param-type">file</span>
+                        <span class="param-desc">Image of the person (JPEG/PNG)</span>
+                    </div>
+                    <div class="param-item">
+                        <span class="param-name">garment</span>
+                        <span class="param-type">file</span>
+                        <span class="param-desc">Image of the garment to try on (JPEG/PNG)</span>
+                    </div>
                 </div>
             </div>
-            
-            <img id="resultImage" alt="Generated Try-On Result">
+
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <span class="path">/stream/{task_id}</span>
+                </div>
+                <div class="description">
+                    Server-Sent Events (SSE) endpoint to monitor real-time task progress. Provides dynamic time estimations and status updates.
+                </div>
+                <div class="params">
+                    <h4>Path Parameters</h4>
+                    <div class="param-item">
+                        <span class="param-name">task_id</span>
+                        <span class="param-type">string</span>
+                        <span class="param-desc">The UUID returned from the /tryon endpoint</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <span class="path">/result/{task_id}</span>
+                </div>
+                <div class="description">
+                    Retrieves the final generated try-on image once the task is completed.
+                </div>
+                <div class="params">
+                    <h4>Path Parameters</h4>
+                    <div class="param-item">
+                        <span class="param-name">task_id</span>
+                        <span class="param-type">string</span>
+                        <span class="param-desc">The UUID of the completed task</span>
+                    </div>
+                </div>
+            </div>
+
         </div>
-        
-        <div class="api-links">
-            <a href="/docs" target="_blank">📚 Swagger API Docs</a> | 
-            <a href="/redoc" target="_blank">📖 ReDoc</a>
+
+        <div class="interactive-docs">
+            <h2 style="margin-bottom: 1.5rem; font-weight: 600;">Interactive Documentation</h2>
+            <a href="/docs" class="btn">🚀 Swagger UI</a>
+            <a href="/redoc" class="btn outline">📖 ReDoc</a>
         </div>
     </div>
-
-    <script>
-        // Setup image previews
-        function setupPreview(inputId, dropId) {
-            const input = document.getElementById(inputId);
-            const drop = document.getElementById(dropId);
-            
-            input.addEventListener('change', function(e) {
-                if (e.target.files && e.target.files[0]) {
-                    const reader = new FileReader();
-                    reader.onload = function(e) {
-                        drop.style.backgroundImage = `url('${e.target.result}')`;
-                        drop.querySelector('span').style.display = 'none';
-                    }
-                    reader.readAsDataURL(e.target.files[0]);
-                }
-            });
-        }
-        
-        setupPreview('personInput', 'personDrop');
-        setupPreview('garmentInput', 'garmentDrop');
-
-        const form = document.getElementById('tryonForm');
-        const submitBtn = document.getElementById('submitBtn');
-        const progressContainer = document.getElementById('progressContainer');
-        const progressBar = document.getElementById('progressBar');
-        const statusMsg = document.getElementById('statusMsg');
-        const timeRemaining = document.getElementById('timeRemaining');
-        const resultImage = document.getElementById('resultImage');
-        const loader = document.getElementById('loader');
-
-        let initialTimeEstimate = 0;
-
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const personFile = document.getElementById('personInput').files[0];
-            const garmentFile = document.getElementById('garmentInput').files[0];
-            
-            if (!personFile || !garmentFile) return alert("Please select both images.");
-            
-            // UI Reset
-            submitBtn.disabled = true;
-            submitBtn.innerText = "Processing...";
-            resultImage.style.opacity = '0';
-            setTimeout(() => resultImage.style.display = 'none', 500);
-            loader.style.display = 'block';
-            progressContainer.style.display = 'flex';
-            progressBar.style.width = '0%';
-            statusMsg.innerText = "Uploading images...";
-            timeRemaining.innerText = "Estimating...";
-
-            const formData = new FormData();
-            formData.append('person', personFile);
-            formData.append('garment', garmentFile);
-
-            try {
-                // 1. Submit task
-                const response = await fetch('/tryon', { method: 'POST', body: formData });
-                const data = await response.json();
-                
-                if (!response.ok) throw new Error(data.detail || "Upload failed");
-                
-                const taskId = data.task_id;
-                initialTimeEstimate = data.estimated_time_seconds || 60;
-                
-                // 2. Connect to SSE stream
-                const evtSource = new EventSource(`/stream/${taskId}`);
-                
-                evtSource.onmessage = function(event) {
-                    const msg = JSON.parse(event.data);
-                    
-                    if (msg.status === 'completed') {
-                        evtSource.close();
-                        statusMsg.innerText = "✨ Done!";
-                        timeRemaining.innerText = "0s";
-                        progressBar.style.width = '100%';
-                        
-                        // Load image
-                        loader.style.display = 'none';
-                        resultImage.src = msg.url;
-                        resultImage.style.display = 'block';
-                        // Add a small delay for image load before fade-in
-                        setTimeout(() => resultImage.style.opacity = '1', 50);
-                        
-                        submitBtn.disabled = false;
-                        submitBtn.innerText = "Generate Another Try-On 🚀";
-                    } 
-                    else if (msg.status === 'failed') {
-                        evtSource.close();
-                        statusMsg.innerText = `❌ Error: ${msg.error || 'Task Failed'}`;
-                        loader.style.display = 'none';
-                        submitBtn.disabled = false;
-                        submitBtn.innerText = "Try Again 🚀";
-                    }
-                    else {
-                        statusMsg.innerText = msg.message || "Processing...";
-                        timeRemaining.innerText = msg.remaining + "s";
-                        
-                        // Calculate progress bar %
-                        let progress = 0;
-                        if(initialTimeEstimate > 0) {
-                            progress = Math.max(0, Math.min(100, 100 - ((msg.remaining / initialTimeEstimate) * 100)));
-                        }
-                        progressBar.style.width = `${progress}%`;
-                    }
-                };
-                
-                evtSource.onerror = function() {
-                    console.error("SSE Connection Error");
-                    evtSource.close();
-                    statusMsg.innerText = "⚠️ Connection lost, checking result...";
-                    submitBtn.disabled = false;
-                    submitBtn.innerText = "Try Again 🚀";
-                };
-
-            } catch (error) {
-                console.error(error);
-                alert("Error: " + error.message);
-                submitBtn.disabled = false;
-                submitBtn.innerText = "Generate Try-On 🚀";
-                loader.style.display = 'none';
-                progressContainer.style.display = 'none';
-            }
-        });
-    </script>
 </body>
 </html>
 """
