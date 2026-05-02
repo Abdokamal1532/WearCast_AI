@@ -76,8 +76,13 @@ except Exception as e:
     print(f"[STARTUP] ERROR: Could not initialize model: {e}")
     wearcast_model = None
 
+# Suppress harmless CUDA/XLA warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 # Ngrok Setup
-NGROK_TOKEN = "37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJSvX2a"
+# Note: Fixed potential typo in token (v -> c) based on screenshot
+NGROK_TOKEN = "37TuVJJpQ5gDI1YioSL045Zj6WS_3fRgJK5Huea4d9pJScX2a"
 PORT = 8000
 
 def start_ngrok():
