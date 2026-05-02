@@ -115,7 +115,7 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     global wearcast_model
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
-    tasks[task_id]["total_steps"] = 30
+    tasks[task_id]["total_steps"] = 20
     tasks[task_id]["current_step"] = 0
     tasks[task_id]["remaining"] = 60 # Initial guess
     
@@ -229,7 +229,7 @@ async def stream_progress(task_id: str):
                 message = "Waiting for GPU resources..."
             elif current_status == "processing":
                 step = tasks[task_id].get("current_step", 0)
-                total = tasks[task_id].get("total_steps", 30)
+                total = tasks[task_id].get("total_steps", 20)
                 message = f"Generating textures (Step {step}/{total})..."
                 if step < 2:
                     message = "Analyzing images and preparing GPU..."
