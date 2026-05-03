@@ -447,14 +447,18 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: Professional Luminance Match ---
-        # Balances the UNet lighting to match the original garment reference
-        if abs(lum_gap) > 3.0:
-            shift = np.clip(lum_gap * 0.5, -20, 20)
-            gen_arr = np.clip(gen_arr + shift, 0, 255)
-            print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
+        # --- NEW: VFX Grade Histogram Match ---
+        # Matches the entire color distribution (shadows, midtones, highlights)
+        if len(gen_in_mask) > 100:
+            from skimage import exposure
+            # Match generated shirt to studio reference shirt
+            matched = exposure.match_histograms(gen_arr.astype(np.uint8), garm_arr.astype(np.uint8), channel_axis=-1)
+            # 60/40 blend ensures we keep AI details but use real-world lighting
+            gen_arr = (gen_arr * 0.60 + matched.astype(np.float32) * 0.40).clip(0, 255)
+            print(f"   [CORR] VFX Grade Histogram Match Applied (Soft 40% blend)")
         else:
-            print(f"   [CORR] Luminance match already within tolerance (gap={lum_gap:.1f})")
+            print(f"   [CORR] Histogram match skipped (insufficient mask pixels)")
+
 
 
         # --- Final Compositing (The "Cape" Killer) ---
@@ -528,10 +532,11 @@ class WearCastHD:
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Complex/patterned garments: 30 steps for maximum fidelity
-            return {"num_steps": 30, "image_scale": 2.0}
+            return {"num_steps": 30, "image_scale": 3.5}
         else:
             # Simple garments: 30 steps for premium realism
-            return {"num_steps": 30, "image_scale": 2.0}
+            return {"num_steps": 30, "image_scale": 3.5}
+
 
 
     def local_color_correction(self, generated, original_garment, mask_hard):
@@ -934,10 +939,11 @@ class WearCastHD:
                 # Draw neck/spine line for connectivity
                 cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
                 
-                # Draw arm tubes (Tightened)
-                def draw_arm(p1, p2, thick=15):
+                # Draw arm tubes (Tightened but widened slightly for natural drape)
+                def draw_arm(p1, p2, thick=25):
                     if p1[0] > 1 and p2[0] > 1:
                         cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
+
                 
                 draw_arm(shoulder_right, elbow_right)
                 draw_arm(elbow_right, wrist_right)
