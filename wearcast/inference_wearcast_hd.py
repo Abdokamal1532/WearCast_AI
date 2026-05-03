@@ -19,6 +19,10 @@ import torch.nn.functional as F
 from transformers import AutoProcessor, CLIPVisionModelWithProjection
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# --- PREPROCESSORS ---
+from preprocess.humanparsing.run_parsing import Parsing
+from preprocess.openpose.run_openpose import OpenPose
+
 # Absolute Pathing
 PROJECT_ROOT = Path(__file__).absolute().parents[1].absolute()  # WearCast_AI root
 VIT_PATH = os.path.join(PROJECT_ROOT, "checkpoints/clip-vit-large-patch14")
@@ -125,6 +129,13 @@ class WearCastHD:
         # Use UniPC scheduler (what OOTD was designed for)
         self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
         print(f"[WearCastHD] Scheduler replaced with UniPCMultistepScheduler.")
+        
+        # 6. Preprocessors (Parsing & OpenPose) - Global Cache
+        print("[WearCastHD] Loading Preprocessors (Parsing & OpenPose)...")
+        device_id = int(self.gpu_id.split(':')[1])
+        self.parsing_model = Parsing(device_id)
+        self.openpose_model = OpenPose(device_id)
+        print("[WearCastHD] Preprocessors loaded and ready.")
         print("=" * 70)
 
     def tokenize_captions(self, captions, max_length):
@@ -181,23 +192,12 @@ class WearCastHD:
         # PHASE 1 — AI Preprocessing (OpenPose + HumanParsing + Mask)
         # =========================================================
         if mask is None:
-            print(f"\n[WearCast] Phase 1/4: Starting AI Preprocessing...")
-            from preprocess.humanparsing.run_parsing import Parsing
-            from preprocess.openpose.run_openpose import OpenPose
-
-            if not hasattr(self, 'parsing_model'):
-                print(" -> Loading Human-Parsing model checkpoints...")
-                self.parsing_model = Parsing(int(self.gpu_id.split(':')[1]))
-                print(" -> Loading OpenPose model checkpoints...")
-                self.openpose_model = OpenPose(int(self.gpu_id.split(':')[1]))
-            else:
-                print(" -> Reusing cached Parsing and OpenPose models.")
-
-            print(" -> Running OpenPose inference (Human Keypoints)...")
+            print(f"\n[WearCast] Phase 1/4: Starting AI Preprocessing (Human Keypoints)...")
             t0 = time.time()
             keypoints = self.openpose_model(image_vton)
             t1 = time.time()
             pose_data = np.array(keypoints["pose_keypoints_2d"])
+
             print(f"    [POSE] Keypoints count : {len(keypoints['pose_keypoints_2d'])}")
             print(f"    [POSE] pose_data shape  : {pose_data.shape}")
             print(f"    [POSE] Inference time   : {t1 - t0:.2f}s")
@@ -867,10 +867,13 @@ class WearCastHD:
         elif category_norm == 'upper_body':
             parse_mask = (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
                          (parse_array == label_map["dress"]).astype(np.float32)
-            # Protect lower garments — never replace trousers/skirts during upper-body try-on
+            # Protect lower garments and skin — never replace trousers/skirts or real legs during upper-body try-on
             parser_mask_fixed_lower = (parse_array == label_map["skirt"]).astype(np.float32) + \
-                                      (parse_array == label_map["pants"]).astype(np.float32)
+                                      (parse_array == label_map["pants"]).astype(np.float32) + \
+                                      (parse_array == label_map["left_leg"]).astype(np.float32) + \
+                                      (parse_array == label_map["right_leg"]).astype(np.float32)
             parser_mask_fixed += parser_mask_fixed_lower
+
             parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
 
         elif category_norm == 'lower_body':
@@ -1074,6 +1077,13 @@ class WearCastHD:
         dst = self.hole_fill(img.astype(np.uint8))
         dst = self.refine_mask(dst)
         inpaint_mask = dst / 255 * 1
+        
+        # --- NEW: Fabric Micro-Physics (Edge Fuzzing) ---
+        # Adds subtle randomized noise to the mask edges to simulate real fabric fibers.
+        # This kills the "perfectly clean" AI look for a more professional, natural feel.
+        noise = np.random.normal(0, 0.02, inpaint_mask.shape).astype(np.float32)
+        inpaint_mask = np.clip(inpaint_mask + noise * (inpaint_mask > 0.1), 0, 1)
+
 
 
         mask      = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)  # binary 0/255
