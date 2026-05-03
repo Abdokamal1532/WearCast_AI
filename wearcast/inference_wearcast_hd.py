@@ -850,7 +850,11 @@ class WearCastHD:
         arms_draw_right = ImageDraw.Draw(im_arms_right)
 
         if category_norm in ('upper_body', 'dresses'):
-            # IMPORTANT: pose_data is generat            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+            # IMPORTANT: pose_data is generated from a 1024px height image.
+            # We scale it to the 512px height mask space.
+            scale_factor = model_parse.height / 1024.0
+            
+            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
             shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
             elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
             elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
@@ -859,6 +863,7 @@ class WearCastHD:
             neck           = np.multiply(tuple(pose_data[1][:2]), scale_factor)
             hip_r          = np.multiply(tuple(pose_data[8][:2]), scale_factor)
             hip_l          = np.multiply(tuple(pose_data[11][:2]), scale_factor)
+
             
             # ------------------------------------------------------------------
             # Skeletal Prior & Torso-Centric Blob Filtering
