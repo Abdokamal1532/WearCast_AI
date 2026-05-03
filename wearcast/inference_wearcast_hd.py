@@ -907,6 +907,41 @@ class WearCastHD:
                 np.ones((5, 5), np.uint16), iterations=4)
             parse_mask += np.logical_or(parse_mask, arm_mask)
 
+        # ------------------------------------------------------------------
+        # Torso-Centric Blob Filtering
+        # Removes background artifacts that the parser might mistake for clothes
+        # ------------------------------------------------------------------
+        if category_norm in ('upper_body', 'dresses'):
+            # Convert to uint8 for cv2
+            parse_mask_uint8 = (parse_mask > 0).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(parse_mask_uint8)
+            
+            if num_labels > 1:
+                # Calculate Torso Center (average of shoulders if available)
+                # Keypoints: 2 (RShoulder), 5 (LShoulder)
+                s_r = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+                s_l = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+                
+                # Fallback to Neck (1) if shoulders are missing
+                neck = np.multiply(tuple(pose_data[1][:2]), scale_factor)
+                
+                torso_y_target = neck[1] if neck[1] > 1 else (s_r[1] + s_l[1]) / 2
+                torso_x_target = neck[0] if neck[0] > 1 else (s_r[0] + s_l[0]) / 2
+                
+                if torso_y_target > 1:
+                    new_parse_mask = np.zeros_like(parse_mask)
+                    for i in range(1, num_labels):
+                        # Check if this blob overlaps with the expected torso area
+                        x, y, w, h, area = stats[i]
+                        # If the torso target is inside or very close to this blob, keep it
+                        padding = 50 
+                        if (x - padding <= torso_x_target <= x + w + padding) and \
+                           (y - padding <= torso_y_target <= y + h + padding):
+                            new_parse_mask[labels == i] = 1
+                    
+                    parse_mask = new_parse_mask
+                    print(f"   [MASK_GEN] Blob filtering: Kept torso-related regions.")
+
         # Invert: changeable pixels that are NOT part of the garment region
         parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
 
