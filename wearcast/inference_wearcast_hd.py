@@ -261,12 +261,14 @@ class WearCastHD:
         is_complex = self.detect_garment_complexity(image_garm)
         auto_params = self.get_optimal_params(category, is_complex)
         
-        # Respect UI parameters if they are valid (not -1 or similar)
-        final_steps = num_steps if num_steps > 0 else auto_params["num_steps"]
+        # PRO-PRIORITY: Always use at least 30 steps for Typically-level quality,
+        # unless the user explicitly requested a very high value.
+        final_steps = max(30, num_steps if num_steps > 30 else auto_params["num_steps"])
         final_scale = image_scale if image_scale > 0 else auto_params["image_scale"]
         
-        print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
-        print(f"[WearCast] Using params: steps={final_steps} (Request={num_steps}), guidance_scale={final_scale} (Request={image_scale})")
+        print(f"\n[WearCast] Pro-Engine: complex={is_complex} | auto_params={auto_params}")
+        print(f"[WearCast] Quality Lock: steps={final_steps} (Professional Mode) | guidance_scale={final_scale}")
+
 
         # =========================================================
         # PHASE 2 — CLIP Vision Encoding
@@ -929,17 +931,18 @@ class WearCastHD:
                 draw_bone(shoulder_left, elbow_left)
                 draw_bone(elbow_left, wrist_left)
                 
-                # Dilate to cover torso. Increased slightly to 0.50x for looser fits
-                body_radius = int(max(s_width * 0.50, 30))
+                # Dilate to cover torso. Tightened to 0.40x to strictly exclude background gaps.
+                body_radius = int(max(s_width * 0.40, 25))
 
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Spine-centric clipping (widened to 0.85x for looser shirt bottoms/drapes)
+                # Spine-centric clipping (Aggressively tightened to 0.65x to KILL THE CAPE)
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.85
-                    r_bound = mid_shoulder[0] + s_width * 0.85
+                    l_bound = mid_shoulder[0] - s_width * 0.65
+                    r_bound = mid_shoulder[0] + s_width * 0.65
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+
 
 
                 physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
