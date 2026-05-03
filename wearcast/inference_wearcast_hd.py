@@ -426,8 +426,14 @@ class WearCastHD:
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
         
-        # Feathering: 3.0 sigma provides a professional "studio" blend
-        feather_sigma = 3.0
+        # --- NEW: Graphic Sharpening Pass ---
+        # Sharpens the "LOVE" graphic and fabric texture for high-fidelity output
+        gen_blurred = cv2.GaussianBlur(gen_arr, (0, 0), 2.0)
+        gen_arr = cv2.addWeighted(gen_arr, 1.3, gen_blurred, -0.3, 0).clip(0, 255)
+        
+        # --- NEW: Ultra-Smooth Feathering ---
+        # Smooths the transition between skin and fabric
+        feather_sigma = 5.0
         alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -938,14 +944,22 @@ class WearCastHD:
                 else:
                     spine_proj = np.array([mid_shoulder[0], bottom_y])
 
-                # --- NEW: Silhouette Lock (Perfect Physique) ---
-                # Instead of a boxy polygon, we use your REAL body shape from the photo.
-                # Torso, Arms, and Neck labels from the original parsing.
-                body_labels = [4, 5, 6, 14, 15, 18] 
-                spatial_prior = np.isin(parse_array, body_labels).astype(np.uint8)
+                # --- NEW: Silhouette Lock with Collar Protection ---
+                # Torso and arms
+                torso_labels = [4, 5, 6, 14, 15]
+                torso_mask = np.isin(parse_array, torso_labels).astype(np.uint8)
                 
-                # Dilate slightly to ensure the fabric can "hang" naturally
-                spatial_prior = cv2.dilate(spatial_prior, np.ones((15, 15), np.uint8), iterations=1)
+                # Neck label (18) with "Collar Protection" (Strong Erosion)
+                # This prevents the shirt from climbing too high on your neck
+                neck_mask = (parse_array == 18).astype(np.uint8)
+                neck_mask = cv2.erode(neck_mask, np.ones((15, 15), np.uint8), iterations=1)
+                
+                # Combine into the final Silhouette
+                spatial_prior = cv2.bitwise_or(torso_mask, neck_mask)
+                
+                # Dilate slightly for natural hang
+                spatial_prior = cv2.dilate(spatial_prior, np.ones((10, 10), np.uint8), iterations=1)
+
 
                 # Strict "Cape Killer" Clipping
                 # Even with the silhouette, we clip the horizontal bounds to prevent bleed
