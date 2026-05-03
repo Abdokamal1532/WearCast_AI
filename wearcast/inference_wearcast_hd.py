@@ -855,6 +855,47 @@ class WearCastHD:
             source_height = model_parse.height
             scale_factor = height / float(source_height)
             
+            # ------------------------------------------------------------------
+            # Torso-Centric Blob Filtering (BEFORE Dilation)
+            # Includes Morphological Opening to sever weak bridges to floating background objects
+            # ------------------------------------------------------------------
+            if category_norm in ('upper_body', 'dresses'):
+                parse_mask_uint8 = (parse_mask > 0).astype(np.uint8)
+                
+                # Erode to break thin bridges between shirt and background noise
+                kernel_erode = np.ones((15, 15), np.uint8)
+                eroded_mask = cv2.erode(parse_mask_uint8, kernel_erode, iterations=1)
+                
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
+                
+                if num_labels > 1:
+                    # Target: Torso Center
+                    s_r = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+                    s_l = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+                    neck = np.multiply(tuple(pose_data[1][:2]), scale_factor)
+                    t_x = neck[0] if neck[0] > 1 else (s_r[0] + s_l[0]) / 2
+                    t_y = neck[1] if neck[1] > 1 else (s_r[1] + s_l[1]) / 2
+                    
+                    if t_y > 1:
+                        # Find blob with centroid closest to torso target
+                        best_label = -1
+                        min_dist = 999999
+                        for i in range(1, num_labels):
+                            dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
+                            # Area check: ignore tiny dust blobs
+                            if stats[i][cv2.CC_STAT_AREA] > 500 and dist < min_dist:
+                                min_dist = dist
+                                best_label = i
+                        
+                        if best_label != -1:
+                            # Keep only the best blob
+                            isolated_blob = (labels == best_label).astype(np.uint8)
+                            # Dilate back to restore original boundaries lost during erosion
+                            isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
+                            # Intersect with original mask to ensure we don't expand beyond original parsing
+                            parse_mask = np.logical_and(parse_mask_uint8, isolated_blob).astype(np.float32)
+                            print(f"   [MASK_GEN] Kept eroded blob #{best_label} (dist={min_dist:.1f}px) and severed background connections.")
+            
             shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
             shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
             elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
