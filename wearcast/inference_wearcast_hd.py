@@ -247,10 +247,13 @@ class WearCastHD:
         # Auto-detect garment complexity and choose optimal params
         is_complex = self.detect_garment_complexity(image_garm)
         auto_params = self.get_optimal_params(category, is_complex)
-        final_steps = auto_params["num_steps"]    # use auto-detected optimal steps
-        final_scale = auto_params["image_scale"]   # use auto-detected optimal guidance
+        
+        # Respect UI parameters if they are valid (not -1 or similar)
+        final_steps = num_steps if num_steps > 0 else auto_params["num_steps"]
+        final_scale = image_scale if image_scale > 0 else auto_params["image_scale"]
+        
         print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
-        print(f"[WearCast] Using params: steps={final_steps} (UI={num_steps}), guidance_scale={final_scale} (UI={image_scale})")
+        print(f"[WearCast] Using params: steps={final_steps} (Request={num_steps}), guidance_scale={final_scale} (Request={image_scale})")
 
         # =========================================================
         # PHASE 2 — CLIP Vision Encoding
@@ -834,12 +837,17 @@ class WearCastHD:
         arms_draw_right = ImageDraw.Draw(im_arms_right)
 
         if category_norm in ('upper_body', 'dresses'):
-            shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
-            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
-            elbow_right    = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
-            elbow_left     = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
-            wrist_right    = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
-            wrist_left     = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+            # IMPORTANT: Calculate scale based on the actual height of model_parse (source image)
+            # instead of hardcoding 512.0. This fixes the pose-offset bug.
+            source_height = model_parse.height
+            scale_factor = height / float(source_height)
+            
+            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+            elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
+            elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
+            wrist_right    = np.multiply(tuple(pose_data[4][:2]), scale_factor)
+            wrist_left     = np.multiply(tuple(pose_data[7][:2]), scale_factor)
             ARM_LINE_WIDTH = int(arm_width / 512 * height)
 
             size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,

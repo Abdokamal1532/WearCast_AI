@@ -29,11 +29,18 @@ def test_tryon():
     # 2. Start the Try-On Task
     print("\n[1/3] Sending images to /tryon...")
     
-    person_path = 'run/examples/model/model_1.png'
-    garment_path = 'run/examples/garment/03244_00.jpg'
+    # Path to your specific images
+    person_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg')
+    garment_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'pp.jpg.jpeg')
     
+    if not os.path.exists(person_path):
+        # Fallback to current dir if root join fails
+        person_path = 'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg'
+        garment_path = 'pp.jpg.jpeg'
+
     if not os.path.exists(person_path) or not os.path.exists(garment_path):
-        print(f"❌ Error: Example images not found at {person_path} or {garment_path}")
+        print(f"❌ Error: Images not found at {person_path} or {garment_path}")
+        print("Please ensure the images are in the project root directory.")
         return
 
     try:
