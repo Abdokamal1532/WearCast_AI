@@ -443,11 +443,25 @@ class WearCastHD:
         # Recovering luminance toward studio lighting created unnatural brightness mismatch.
         print(f"   [CORR] Luminance recovery: DISABLED (let UNet handle lighting naturally)")
 
-        # --- Advanced Post-Processing (OOTDiffusion Parity) ---
+        # --- Final Compositing (The "Cape" Killer) ---
+        # We forcefully paste the AI-generated garment onto the ORIGINAL background.
+        # This physically deletes any background noise or "capes" the AI created.
         t_post = time.time()
-        print(f" -> Bypassing legacy color correction and Laplacian blending.")
-        print(f" -> (The stabilized latent pipeline now handles boundaries and lighting natively).")
-        final_image = raw_generated
+        print(f" -> [COMPOSITE] Blending generated garment onto original background...")
+        
+        # Ensure RGB mode and matching sizes
+        gen_final = np.array(raw_generated.convert('RGB')).astype(np.float32)
+        ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+        
+        # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
+        alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
+        
+        # Alpha Blend: result = (new * alpha) + (old * (1 - alpha))
+        final_np = (gen_final * alpha_3d) + (ori_final * (1.0 - alpha_3d))
+        final_image = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+        
+        print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
+
 
         # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
