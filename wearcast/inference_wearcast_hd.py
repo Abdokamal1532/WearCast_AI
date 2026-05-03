@@ -447,10 +447,15 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- Luminance recovery REMOVED ---
-        # The UNet naturally adapts lighting for on-body realism.
-        # Recovering luminance toward studio lighting created unnatural brightness mismatch.
-        print(f"   [CORR] Luminance recovery: DISABLED (let UNet handle lighting naturally)")
+        # --- NEW: Professional Luminance Match ---
+        # Balances the UNet lighting to match the original garment reference
+        if abs(lum_gap) > 3.0:
+            shift = np.clip(lum_gap * 0.5, -20, 20)
+            gen_arr = np.clip(gen_arr + shift, 0, 255)
+            print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
+        else:
+            print(f"   [CORR] Luminance match already within tolerance (gap={lum_gap:.1f})")
+
 
         # --- Final Compositing (The "Cape" Killer) ---
         # We forcefully paste the AI-generated garment onto the ORIGINAL background.
@@ -916,32 +921,41 @@ class WearCastHD:
                 else:
                     spine_proj = np.array([mid_shoulder[0], bottom_y])
 
-                # Draw Spine and Shoulder bones
-                cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=5)
-                cv2.line(spatial_prior, (int(mid_shoulder[0]), int(mid_shoulder[1])), (int(spine_proj[0]), int(spine_proj[1])), 1, thickness=5)
-                cv2.line(spatial_prior, (int(shoulder_right[0]), int(shoulder_right[1])), (int(shoulder_left[0]), int(shoulder_left[1])), 1, thickness=5)
+                # --- NEW: Anatomical Hull (Torso Polygon) ---
+                # Creates a solid block of "allowed" area between shoulders and hips
+                torso_pts = np.array([
+                    shoulder_right,
+                    shoulder_left,
+                    [shoulder_left[0], model_parse.height],
+                    [shoulder_right[0], model_parse.height]
+                ], dtype=np.int32)
+                cv2.fillPoly(spatial_prior, [torso_pts], 1)
+
+                # Draw neck/spine line for connectivity
+                cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
                 
-                # Draw arm bones to protect sleeves
-                def draw_bone(p1, p2, thick=5):
+                # Draw arm tubes (Tightened)
+                def draw_arm(p1, p2, thick=15):
                     if p1[0] > 1 and p2[0] > 1:
                         cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
                 
-                draw_bone(shoulder_right, elbow_right)
-                draw_bone(elbow_right, wrist_right)
-                draw_bone(shoulder_left, elbow_left)
-                draw_bone(elbow_left, wrist_left)
+                draw_arm(shoulder_right, elbow_right)
+                draw_arm(elbow_right, wrist_right)
+                draw_arm(shoulder_left, elbow_left)
+                draw_arm(elbow_left, wrist_left)
                 
-                # Dilate to cover torso. Tightened to 0.40x to strictly exclude background gaps.
-                body_radius = int(max(s_width * 0.40, 25))
-
+                # Dilate slightly to catch fabric drapes
+                body_radius = int(max(s_width * 0.15, 15))
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Spine-centric clipping (Aggressively tightened to 0.65x to KILL THE CAPE)
+                # Strict Horizontal Corridor (The "Cape Killer")
+                # Any pixel outside 0.6x shoulder width is KILLED
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.65
-                    r_bound = mid_shoulder[0] + s_width * 0.65
+                    l_bound = mid_shoulder[0] - s_width * 0.60
+                    r_bound = mid_shoulder[0] + s_width * 0.60
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+
 
 
 
