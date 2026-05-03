@@ -221,7 +221,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
                     image_scale=2.5,
                     seed=-1,
                     callback=progress_callback,
-                    callback_steps=1
+                    callback_steps=1,
+                    output_dir=os.path.join(PROJECT_ROOT, f"run/outputs/{task_id}")
                 )
             
             if images:
@@ -379,6 +380,20 @@ async def get_result(task_id: str):
     
     file_path = tasks[task_id]["result_path"]
     return FileResponse(file_path, media_type="image/png")
+
+@app.get("/debug/{task_id}/{filename}")
+async def get_debug_image(task_id: str, filename: str):
+    """
+    Download a specific debug image for a task.
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    file_path = os.path.join(PROJECT_ROOT, f"run/outputs/{task_id}/{filename}")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Debug image not found")
+    
+    return FileResponse(file_path, media_type="image/jpeg")
 
 # ============================================================
 # 5. EXECUTION
