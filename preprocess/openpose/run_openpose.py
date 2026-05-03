@@ -60,10 +60,12 @@ class OpenPose:
 
             candidate = pose['bodies']['candidate']
             subset    = pose['bodies']['subset']
-            print(f"   [OpenPose.__call__] Raw candidate count: {len(candidate)}")
-            print(f"   [OpenPose.__call__] Raw subset count   : {len(subset)}")
-            if len(subset) > 0:
-                print(f"   [OpenPose.__call__] subset[0] (18 joints): {subset[0][:18].tolist() if hasattr(subset[0], 'tolist') else list(subset[0][:18])}")
+            if len(subset) == 0:
+                print("   [OpenPose.__call__] WARNING: No person detected in the image.")
+                # Return zeroed keypoints for all 18 joints
+                candidate = [[0, 0] for _ in range(18)]
+                keypoints = {"pose_keypoints_2d": candidate}
+                return keypoints
 
             subset = subset[0][:18]
             for i in range(18):

@@ -24,6 +24,7 @@ import gradio as gr
 import torch
 from PIL import Image
 from wearcast.inference_wearcast_hd import WearCastHD
+from utils_wearcast import smart_resize
 
 # ============================================================
 # STARTUP: System & Environment Diagnostics
@@ -120,10 +121,10 @@ def process_hd(vton_img_path, garm_img_path, n_samples, n_steps, image_scale, se
         print(f"[Gradio]   Person  raw size : {vton_img_raw.size}  mode={vton_img_raw.mode}")
         print(f"[Gradio]   Garment raw size : {garm_img_raw.size}  mode={garm_img_raw.mode}")
 
-        vton_img = vton_img_raw.resize((768, 1024))
-        garm_img = garm_img_raw.resize((768, 1024))
-        print(f"[Gradio]   Person  resized  : {vton_img.size}")
-        print(f"[Gradio]   Garment resized  : {garm_img.size}")
+        vton_img = smart_resize(vton_img_raw)
+        garm_img = smart_resize(garm_img_raw)
+        print(f"[Gradio]   Person  smart-resized: {vton_img.size}")
+        print(f"[Gradio]   Garment smart-resized: {garm_img.size}")
 
         # GPU memory snapshot before inference
         if torch.cuda.is_available():
@@ -217,7 +218,7 @@ with gr.Blocks(title="WearCast AI: Premium Virtual Try-On", theme=gr.themes.Soft
     with gr.Accordion("Advanced Settings", open=False):
         with gr.Row():
             n_samples = gr.Slider(label="Number of Samples", minimum=1, maximum=4, value=1, step=1)
-            n_steps = gr.Slider(label="Inference Steps", minimum=10, maximum=50, value=40, step=5)
+            n_steps = gr.Slider(label="Inference Steps", minimum=10, maximum=50, value=20, step=5)
             image_scale = gr.Slider(label="Guidance Scale", minimum=1.0, maximum=7.5, value=2.5, step=0.1)
             seed = gr.Number(label="Seed (-1 for Random)", value=-1)
 
