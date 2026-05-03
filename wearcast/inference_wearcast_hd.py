@@ -680,8 +680,8 @@ class WearCastHD:
                     corrected_rgb[r_blue, c_blue, ch] = ch_vals * (1 - blend_str) + lum_b * blend_str
                 print(f"   [COLOR] Blue-desaturation (near-white only): {blue_sel.sum()} px (guarded from {(blue_bias>10).sum()} total blue-biased)")
 
-        # Blend zone: 19px tight feather — avoids the 51px halo while still blending mask boundary
-        blend_mask    = cv2.GaussianBlur(msk_np, (19, 19), 4)   # tightened: 51→19px kills white halo glow
+        # Blend zone: 9px tight feather — eliminates gray halo while blending silhouette
+        blend_mask    = cv2.GaussianBlur(msk_np, (9, 9), 2)   # TIGHTENED: 19->9px kills AI background bleed
         blend_mask_3d = np.stack([blend_mask]*3, axis=-1)
 
         result_float = corrected_rgb * blend_mask_3d + gen_np * (1.0 - blend_mask_3d)
@@ -795,7 +795,8 @@ class WearCastHD:
 
         # --- Model-type arm width (matches OOTDiffusion exactly) ---
         if model_type == 'hd':
-            arm_width = 60
+            # Surgical Arm Masking: 30px is enough for target_w=384
+            arm_width = 30
         elif model_type == 'dc':
             arm_width = 45
         else:
@@ -817,6 +818,12 @@ class WearCastHD:
         parse_head = (parse_array == label_map["hat"]).astype(np.float32) + \
                      (parse_array == label_map["sunglasses"]).astype(np.float32) + \
                      (parse_array == label_map["head"]).astype(np.float32)
+
+        # --- UNIVERSAL SILHOUETTE LOCK ---
+        # Label 0 is background. Everything else is the person.
+        person_silhouette = (parse_array > 0).astype(np.float32)
+        # 5px buffer allows for small fabric expansion without causing "massiveness"
+        silhouette_lock = cv2.dilate(person_silhouette, np.ones((5, 5), np.uint16), iterations=1)
 
         # Fixed regions — accessories that must never be replaced
         parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
@@ -1020,10 +1027,24 @@ class WearCastHD:
                 arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
             # Combine arm masks into final garment mask
+            # TIGHTENED: Reduced dilation (4 -> 1) to prevent background bloat
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=4)
+                np.ones((5, 5), np.uint16), iterations=1)
             parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
+
+            # ------------------------------------------------------------------
+            # FINAL LOCK: Apply Silhouette Lock and Cape Killer to the WHOLE mask
+            # ------------------------------------------------------------------
+            # Any pixel outside the 5px silhouette buffer is KILLED
+            parse_mask = np.logical_and(parse_mask, silhouette_lock).astype(np.float32)
+
+            # Re-apply Cape Killer corridor to the final combined mask
+            if s_width > 10:
+                l_bound = mid_shoulder[0] - s_width * 0.52
+                r_bound = mid_shoulder[0] + s_width * 0.52
+                parse_mask[:, :max(0, int(l_bound))] = 0
+                parse_mask[:, min(parse_mask.shape[1], int(r_bound)):] = 0
 
             # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
             hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
@@ -1035,8 +1056,8 @@ class WearCastHD:
         # Final Assembly: Head, Neck, and Inversion
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-        # TIGHTENED: Reduced from 5 iterations (25px) to 2 (10px) to prevent "massive" bloating
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=2)
+        # TIGHTENED: Minimum dilation (1 iteration) for seamless edges only
+        parse_mask = cv2.dilate(parse_mask, np.ones((3, 3), np.uint16), iterations=1)
 
         if category_norm in ('upper_body', 'dresses'):
             neck_mask = (parse_array == 18).astype(np.float32)
