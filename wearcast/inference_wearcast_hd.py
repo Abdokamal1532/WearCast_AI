@@ -921,13 +921,18 @@ class WearCastHD:
                 else:
                     spine_proj = np.array([mid_shoulder[0], bottom_y])
 
-                # --- NEW: Anatomical Hull (Torso Polygon) ---
-                # Creates a solid block of "allowed" area between shoulders and hips
+                # --- IMPROVED: Anatomical Hull (Tapered Torso) ---
+                # Creates a tapered block that follows shoulders and hips to preserve physique
+                h_r_pts = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
+                h_l_pts = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
+                
                 torso_pts = np.array([
                     shoulder_right,
                     shoulder_left,
-                    [shoulder_left[0], model_parse.height],
-                    [shoulder_right[0], model_parse.height]
+                    h_l_pts,
+                    [h_l_pts[0], model_parse.height],
+                    [h_r_pts[0], model_parse.height],
+                    h_r_pts
                 ], dtype=np.int32)
                 cv2.fillPoly(spatial_prior, [torso_pts], 1)
 
@@ -944,15 +949,15 @@ class WearCastHD:
                 draw_arm(shoulder_left, elbow_left)
                 draw_arm(elbow_left, wrist_left)
                 
-                # Dilate slightly to catch fabric drapes
-                body_radius = int(max(s_width * 0.15, 15))
+                # Dilate slightly to catch fabric drapes (TIGHTENED: 0.15 -> 0.05)
+                body_radius = int(max(s_width * 0.05, 8))
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Strict Horizontal Corridor (The "Cape Killer")
-                # Any pixel outside 0.6x shoulder width is KILLED
+                # Strict Horizontal Corridor (The "Cape Killer" - TIGHTENED: 0.6 -> 0.52)
+                # Any pixel outside 0.52x shoulder width is KILLED
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.60
-                    r_bound = mid_shoulder[0] + s_width * 0.60
+                    l_bound = mid_shoulder[0] - s_width * 0.52
+                    r_bound = mid_shoulder[0] + s_width * 0.52
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
@@ -1030,7 +1035,8 @@ class WearCastHD:
         # Final Assembly: Head, Neck, and Inversion
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
+        # TIGHTENED: Reduced from 5 iterations (25px) to 2 (10px) to prevent "massive" bloating
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=2)
 
         if category_norm in ('upper_body', 'dresses'):
             neck_mask = (parse_array == 18).astype(np.float32)
