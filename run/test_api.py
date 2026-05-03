@@ -34,15 +34,15 @@ def test_tryon():
     # ======================================================================
     
     # This is the human photo
-    person_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Gemini_Generated_Image_aabxrvaabxrvaabx.png')
+    person_path = r"C:\Users\pc\PycharmProjects\WearCast_AI\run\examples\model\model_5.png"
     
     # This is the shirt photo
-    garment_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Gemini_Generated_Image_jqklycjqklycjqkl.png')
+    garment_path = r"C:\Users\pc\PycharmProjects\WearCast_AI\run\examples\garment\06123_00.jpg"
     
     if not os.path.exists(person_path):
         # Fallback to current dir if root join fails
-        person_path = 'Gemini_Generated_Image_aabxrvaabxrvaabx.png'
-        garment_path = 'Gemini_Generated_Image_jqklycjqklycjqkl.png'
+        person_path = r"C:\Users\pc\PycharmProjects\WearCast_AI\run\examples\model\model_5.png"
+        garment_path = r"C:\Users\pc\PycharmProjects\WearCast_AI\run\examples\garment\06123_00.jpg"
 
     if not os.path.exists(person_path) or not os.path.exists(garment_path):
         print(f"❌ Error: Images not found at {person_path} or {garment_path}")
