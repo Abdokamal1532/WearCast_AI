@@ -985,71 +985,73 @@ class WearCastHD:
             # Apply the silhouette lock
             physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
 
+            # --- 2. Morphological Isolation ---
+            kernel_erode = np.ones((5, 5), np.uint8)
+            eroded_mask = cv2.erode(physically_severed_mask, kernel_erode, iterations=1)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
+            
+            if num_labels > 1:
+                t_x, t_y = neck[0], neck[1]
+                if t_x <= 1: t_x, t_y = mid_shoulder[0], mid_shoulder[1]
                 
-                # --- 2. Morphological Isolation ---
-                kernel_erode = np.ones((5, 5), np.uint8)
-                eroded_mask = cv2.erode(physically_severed_mask, kernel_erode, iterations=1)
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
+                best_label = -1
+                min_dist = 999999
+                for i in range(1, num_labels):
+                    dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
+                    if stats[i][cv2.CC_STAT_AREA] > 200 and dist < min_dist:
+                        min_dist = dist
+                        best_label = i
                 
-                if num_labels > 1:
-                    t_x, t_y = neck[0], neck[1]
-                    if t_x <= 1: t_x, t_y = mid_shoulder[0], mid_shoulder[1]
-                    
-                    best_label = -1
-                    min_dist = 999999
-                    for i in range(1, num_labels):
-                        dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
-                        if stats[i][cv2.CC_STAT_AREA] > 200 and dist < min_dist:
-                            min_dist = dist
-                            best_label = i
-                    
-                    if best_label != -1:
-                        isolated_blob = (labels == best_label).astype(np.uint8)
-                        isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
-                        parse_mask = np.logical_and(physically_severed_mask, isolated_blob).astype(np.float32)
-                        print(f"   [MASK_GEN] Skeletal Prior kept blob #{best_label} (dist={min_dist:.1f}px).")
-                    else:
-                        parse_mask = physically_severed_mask.astype(np.float32)
+                if best_label != -1:
+                    isolated_blob = (labels == best_label).astype(np.uint8)
+                    isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
+                    parse_mask = np.logical_and(physically_severed_mask, isolated_blob).astype(np.float32)
+                    print(f"   [MASK_GEN] Skeletal Prior kept blob #{best_label} (dist={min_dist:.1f}px).")
                 else:
                     parse_mask = physically_severed_mask.astype(np.float32)
-
-            # --- Arm Drawing & Integration ---
-            ARM_LINE_WIDTH = int(arm_width / 512 * height)
-
-            size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,
-                          shoulder_left[0]  + ARM_LINE_WIDTH // 2, shoulder_left[1]  + ARM_LINE_WIDTH // 2]
-            size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2,
-                          shoulder_right[0] + ARM_LINE_WIDTH // 2, shoulder_right[1] + ARM_LINE_WIDTH // 2]
-
-            if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
-                im_arms_right = arms_right
             else:
-                wrist_right = self.extend_arm_mask(wrist_right, elbow_right, 1.2)
-                arms_draw_right.line(
-                    np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(),
-                    'white', ARM_LINE_WIDTH, 'curve')
-                arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+                parse_mask = physically_severed_mask.astype(np.float32)
 
-            if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
-                im_arms_left = arms_left
-            else:
-                wrist_left = self.extend_arm_mask(wrist_left, elbow_left, 1.2)
-                arms_draw_left.line(
-                    np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(),
-                    'white', ARM_LINE_WIDTH, 'curve')
-                arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-            # Combine arm masks into final garment mask
-            arm_mask = cv2.dilate(
-                np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=4)
-            parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
+            # --- Arm Drawing & Integration (Upper Body / Dresses only) ---
+            if category_norm in ('upper_body', 'dresses'):
+                ARM_LINE_WIDTH = int(arm_width / 512 * height)
 
-            # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
-            hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
-            hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
-            parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_left)
-            parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_right).astype(np.float32)
+                size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,
+                              shoulder_left[0]  + ARM_LINE_WIDTH // 2, shoulder_left[1]  + ARM_LINE_WIDTH // 2]
+                size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2,
+                              shoulder_right[0] + ARM_LINE_WIDTH // 2, shoulder_right[1] + ARM_LINE_WIDTH // 2]
+
+                if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
+                    im_arms_right = arms_right
+                else:
+                    wrist_right = self.extend_arm_mask(wrist_right, elbow_right, 1.2)
+                    arms_draw_right.line(
+                        np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(),
+                        'white', ARM_LINE_WIDTH, 'curve')
+                    arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+
+                if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
+                    im_arms_left = arms_left
+                else:
+                    wrist_left = self.extend_arm_mask(wrist_left, elbow_left, 1.2)
+                    arms_draw_left.line(
+                        np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(),
+                        'white', ARM_LINE_WIDTH, 'curve')
+                    arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+
+                # Combine arm masks into final garment mask
+                arm_mask = cv2.dilate(
+                    np.logical_or(im_arms_left, im_arms_right).astype('float32'),
+                    np.ones((5, 5), np.uint16), iterations=4)
+                parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
+
+                # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
+                hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
+                hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
+                parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_left)
+                parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_right).astype(np.float32)
+
 
         # ------------------------------------------------------------------
         # Final Assembly: Head, Neck, and Inversion
