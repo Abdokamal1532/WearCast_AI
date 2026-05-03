@@ -850,12 +850,7 @@ class WearCastHD:
         arms_draw_right = ImageDraw.Draw(im_arms_right)
 
         if category_norm in ('upper_body', 'dresses'):
-            # IMPORTANT: pose_data is generated from a 1024px height image.
-            # model_parse was just resized to 512px height above.
-            # We MUST scale the 1024px pose coordinates down to the 512px mask space.
-            scale_factor = model_parse.height / 1024.0
-            
-            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+            # IMPORTANT: pose_data is generat            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
             shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
             elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
             elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
@@ -866,85 +861,78 @@ class WearCastHD:
             hip_l          = np.multiply(tuple(pose_data[11][:2]), scale_factor)
             
             # ------------------------------------------------------------------
-            # Torso-Centric Blob Filtering (BEFORE Dilation)
-            # Includes Spatial Prior Masking to physically sever thick background connections
+            # Skeletal Prior & Torso-Centric Blob Filtering
+            # Physically severs background artifacts (capes) using OpenPose bones
             # ------------------------------------------------------------------
             if category_norm in ('upper_body', 'dresses'):
                 parse_mask_uint8 = (parse_mask > 0).astype(np.uint8)
                 
-                # --- 1. Create Spatial Prior Mask based on OpenPose Skeleton ---
+                # --- 1. Create Skeletal Prior (The "Body Tube") ---
                 spatial_prior = np.zeros_like(parse_mask_uint8)
                 
-                # If hips are missing, estimate them at the bottom of the image
                 h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
                 h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
                 
-                # Draw Torso Polygon (Trapezoid from shoulders down)
-                pts = np.array([neck, shoulder_right, h_r, h_l, shoulder_left], np.int32)
-                cv2.fillPoly(spatial_prior, [pts.reshape((-1, 1, 2))], 1)
+                mid_shoulder = (shoulder_right + shoulder_left) / 2
+                spine_end    = (h_r + h_l) / 2
+                s_width      = abs(shoulder_left[0] - shoulder_right[0])
                 
-                # Draw thick arms to protect sleeves
-                def draw_arm(p1, p2):
+                # Draw Spine and Shoulder bones
+                cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=5)
+                cv2.line(spatial_prior, (int(mid_shoulder[0]), int(mid_shoulder[1])), (int(spine_end[0]), int(spine_end[1])), 1, thickness=5)
+                cv2.line(spatial_prior, (int(shoulder_right[0]), int(shoulder_right[1])), (int(shoulder_left[0]), int(shoulder_left[1])), 1, thickness=5)
+                
+                # Draw arm bones to protect sleeves
+                def draw_bone(p1, p2, thick=5):
                     if p1[0] > 1 and p2[0] > 1:
-                        cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=20)
+                        cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
                 
-                draw_arm(shoulder_right, elbow_right)
-                draw_arm(elbow_right, wrist_right)
-                draw_arm(shoulder_left, elbow_left)
-                draw_arm(elbow_left, wrist_left)
+                draw_bone(shoulder_right, elbow_right)
+                draw_bone(elbow_right, wrist_right)
+                draw_bone(shoulder_left, elbow_left)
+                draw_bone(elbow_left, wrist_left)
                 
-                # Dilate the prior gently (20px instead of 40px to keep it tight)
-                spatial_prior = cv2.dilate(spatial_prior, np.ones((20, 20), np.uint8), iterations=1)
+                # Dilate the skeleton to cover the torso width. 0.45x is safer to avoid background gap.
+                body_radius = int(max(s_width * 0.45, 25))
+                spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Aggressive Horizontal Clipping: Garment must stay within ~1.4x shoulder width
-                s_width = abs(shoulder_left[0] - shoulder_right[0])
+                # Spine-centric clipping
                 if s_width > 10:
-                    margin = s_width * 0.4 
-                    l_bound = min(shoulder_left[0], shoulder_right[0]) - margin
-                    r_bound = max(shoulder_left[0], shoulder_right[0]) + margin
-                    # Wipe anything outside these X bounds
+                    l_bound = mid_shoulder[0] - s_width * 0.70
+                    r_bound = mid_shoulder[0] + s_width * 0.70
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
-                # Apply Spatial Prior to physically sever any far-away background noise
                 physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
                 
-                # --- 2. Morphological Erosion to break any remaining thin bridges ---
-                # Reduced kernel to 7x7 to not erase thin strap/sleeves
-                kernel_erode = np.ones((7, 7), np.uint8)
+                # --- 2. Morphological Isolation ---
+                kernel_erode = np.ones((5, 5), np.uint8)
                 eroded_mask = cv2.erode(physically_severed_mask, kernel_erode, iterations=1)
-                
                 num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
-                print(f"   [MASK_GEN] Blob analysis: {num_labels} labels found after erosion.")
                 
                 if num_labels > 1:
-                    # Target: Torso Center
-                    t_x = neck[0] if neck[0] > 1 else (shoulder_right[0] + shoulder_left[0]) / 2
-                    t_y = neck[1] if neck[1] > 1 else (shoulder_right[1] + shoulder_left[1]) / 2
+                    t_x, t_y = neck[0], neck[1]
+                    if t_x <= 1: t_x, t_y = mid_shoulder[0], mid_shoulder[1]
                     
                     best_label = -1
                     min_dist = 999999
                     for i in range(1, num_labels):
                         dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
-                        # Area check: ignore tiny dust blobs
-                        if stats[i][cv2.CC_STAT_AREA] > 300 and dist < min_dist:
+                        if stats[i][cv2.CC_STAT_AREA] > 200 and dist < min_dist:
                             min_dist = dist
                             best_label = i
                     
                     if best_label != -1:
                         isolated_blob = (labels == best_label).astype(np.uint8)
-                        # Dilate back to restore original boundaries lost during erosion
                         isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
-                        # Final Garment Mask: Intersection of original parse, spatial prior, and main torso blob
                         parse_mask = np.logical_and(physically_severed_mask, isolated_blob).astype(np.float32)
-                        print(f"   [MASK_GEN] Kept blob #{best_label} (dist={min_dist:.1f}px, area={stats[best_label][cv2.CC_STAT_AREA]}px) using Spatial Prior.")
+                        print(f"   [MASK_GEN] Skeletal Prior kept blob #{best_label} (dist={min_dist:.1f}px).")
                     else:
-                        print(f"   [MASK_GEN] WARNING: No suitable torso blob found (best_label=-1). Falling back to severed mask.")
                         parse_mask = physically_severed_mask.astype(np.float32)
                 else:
-                    print(f"   [MASK_GEN] WARNING: No blobs survived erosion. Falling back to severed mask.")
                     parse_mask = physically_severed_mask.astype(np.float32)
 
+            # --- Arm Drawing & Integration ---
             ARM_LINE_WIDTH = int(arm_width / 512 * height)
 
             size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,
@@ -970,7 +958,7 @@ class WearCastHD:
                     'white', ARM_LINE_WIDTH, 'curve')
                 arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-            # Combine arm masks and update parse_mask
+            # Combine arm masks into final garment mask
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
                 np.ones((5, 5), np.uint16), iterations=4)
@@ -979,11 +967,11 @@ class WearCastHD:
             # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
             hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
             hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
-            parser_mask_fixed += hands_left + hands_right
-
+            parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_left)
+            parser_mask_fixed = np.logical_or(parser_mask_fixed, hands_right).astype(np.float32)
 
         # ------------------------------------------------------------------
-        # Merge head, dilate garment mask, add neck + arm regions
+        # Final Assembly: Head, Neck, and Inversion
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
         parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
@@ -993,20 +981,17 @@ class WearCastHD:
             neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
             neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
             parse_mask = np.logical_or(parse_mask, neck_mask)
-            arm_mask = cv2.dilate(
-                np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=4)
-            parse_mask += np.logical_or(parse_mask, arm_mask)
 
         # Invert: changeable pixels that are NOT part of the garment region
         parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
-
         parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
         inpaint_mask = 1 - parse_mask_total
+        
         img = np.where(inpaint_mask, 255, 0)
         dst = self.hole_fill(img.astype(np.uint8))
         dst = self.refine_mask(dst)
         inpaint_mask = dst / 255 * 1
+
 
         mask      = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)  # binary 0/255
         mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)  # visual overlay 0/127
