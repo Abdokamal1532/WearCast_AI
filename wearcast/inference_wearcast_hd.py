@@ -896,9 +896,19 @@ class WearCastHD:
                 spine_end    = (h_r + h_l) / 2
                 s_width      = abs(shoulder_left[0] - shoulder_right[0])
                 
+                # --- EXTENSION: Project the spine all the way to the bottom ---
+                # This ensures long shirts/dresses aren't cut off at the hip
+                bottom_y = model_parse.height
+                spine_dir = spine_end - mid_shoulder
+                if np.linalg.norm(spine_dir) > 5:
+                    spine_dir = spine_dir / np.linalg.norm(spine_dir)
+                    spine_proj = mid_shoulder + spine_dir * (bottom_y - mid_shoulder[1]) / (spine_dir[1] + 1e-6)
+                else:
+                    spine_proj = np.array([mid_shoulder[0], bottom_y])
+
                 # Draw Spine and Shoulder bones
                 cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=5)
-                cv2.line(spatial_prior, (int(mid_shoulder[0]), int(mid_shoulder[1])), (int(spine_end[0]), int(spine_end[1])), 1, thickness=5)
+                cv2.line(spatial_prior, (int(mid_shoulder[0]), int(mid_shoulder[1])), (int(spine_proj[0]), int(spine_proj[1])), 1, thickness=5)
                 cv2.line(spatial_prior, (int(shoulder_right[0]), int(shoulder_right[1])), (int(shoulder_left[0]), int(shoulder_left[1])), 1, thickness=5)
                 
                 # Draw arm bones to protect sleeves
@@ -911,16 +921,18 @@ class WearCastHD:
                 draw_bone(shoulder_left, elbow_left)
                 draw_bone(elbow_left, wrist_left)
                 
-                # Dilate the skeleton to cover the torso width. 0.45x is safer to avoid background gap.
-                body_radius = int(max(s_width * 0.45, 25))
+                # Dilate to cover torso. Increased slightly to 0.50x for looser fits
+                body_radius = int(max(s_width * 0.50, 30))
+
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Spine-centric clipping
+                # Spine-centric clipping (widened to 0.85x for looser shirt bottoms/drapes)
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.70
-                    r_bound = mid_shoulder[0] + s_width * 0.70
+                    l_bound = mid_shoulder[0] - s_width * 0.85
+                    r_bound = mid_shoulder[0] + s_width * 0.85
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+
 
                 physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
                 
