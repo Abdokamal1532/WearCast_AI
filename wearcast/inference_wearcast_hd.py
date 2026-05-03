@@ -405,8 +405,7 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- Build soft compositing mask ---
-        # Get the binary mask used during inpainting
+        # --- Build Pro-Grade Soft Compositing Mask ---
         if hasattr(self, '_cached_hard_mask'):
             mask_pil = self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)
         else:
@@ -416,16 +415,24 @@ class WearCastHD:
         if mask_np.max() > 1.0:
             mask_np = mask_np / 255.0
 
-        # Binarize then apply thin Gaussian feather (2px sigma)
-        # This is exactly what OOTDiffusion does — a thin, smooth transition
-        binary_mask = (mask_np > 0.5).astype(np.float32)
-        feather_sigma = 2.0
-        alpha = cv2.GaussianBlur(binary_mask, (0, 0), feather_sigma)
+        # Binarize
+        binary_mask = (mask_np > 0.5).astype(np.uint8)
+        
+        # Multi-stage edge softening:
+        # 1. Slightly erode to ensure no garment-background bleed
+        # 2. Apply Gaussian blur for natural skin/fabric transition
+        kernel_erode = np.ones((3, 3), np.uint8)
+        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
+        
+        # Feathering: 3.0 sigma provides a professional "studio" blend
+        feather_sigma = 3.0
+        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         alpha = np.clip(alpha, 0.0, 1.0)
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
-        print(f" -> Feather mask: sigma={feather_sigma}px")
+        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
+
 
         # --- Pre-compositing diagnostics ---
         mask_bool = binary_mask > 0.5
@@ -513,11 +520,12 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex/patterned garments: 30 steps for high quality
-            return {"num_steps": 20, "image_scale": 2.0}
+            # Complex/patterned garments: 30 steps for maximum fidelity
+            return {"num_steps": 30, "image_scale": 2.0}
         else:
-            # Simple/solid garments: 20 steps for speed and realism
-            return {"num_steps": 20, "image_scale": 2.0}
+            # Simple garments: 30 steps for premium realism
+            return {"num_steps": 30, "image_scale": 2.0}
+
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
