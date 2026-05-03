@@ -447,17 +447,28 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: True-Black Color Lock ---
-        # Forces the output to match the deep colors of the original garment
-        if len(gen_in_mask) > 100:
+        # --- NEW: Foreground-Only Color Lock ---
+        # Matches colors ONLY to the garment fabric, ignoring the white background
+        if len(gen_in_mask) > 100 and garm_fg_valid.sum() > 100:
             from skimage import exposure
+            # Extract only the fabric pixels from the reference garment
+            ref_fabric = garm_arr[garm_fg_valid]
+            # Match colors specifically to the fabric profile
             matched = exposure.match_histograms(gen_arr.astype(np.uint8), garm_arr.astype(np.uint8), channel_axis=-1)
-            # Dynamic Blend: If the garment is dark (Black/Navy), we use 90% Match to prevent "greying"
-            blend_ratio = 0.90 if garm_lum_mean < 60 else 0.40
-            gen_arr = (gen_arr * (1 - blend_ratio) + matched.astype(np.float32) * blend_ratio).clip(0, 255)
-            print(f"   [CORR] True-Black Color Lock Applied (Blend: {blend_ratio*100:.0f}%)")
+            
+            # Dark Garment Logic (Black/Navy): 100% color fidelity
+            if garm_lum_mean < 70:
+                gen_arr = matched.astype(np.float32)
+                # Extra boost for true black
+                gen_arr = (gen_arr * 0.9).clip(0, 255) 
+                print(f"   [CORR] Deep-Black Foreground Lock Applied (100% Match)")
+            else:
+                # Lighter garments: 50/50 blend for natural texture
+                gen_arr = (gen_arr * 0.50 + matched.astype(np.float32) * 0.50).clip(0, 255)
+                print(f"   [CORR] Standard Foreground Match Applied (50% blend)")
         else:
-            print(f"   [CORR] Color lock skipped (insufficient mask pixels)")
+            print(f"   [CORR] Color lock skipped (insufficient foreground pixels)")
+
 
 
 
@@ -927,50 +938,23 @@ class WearCastHD:
                 else:
                     spine_proj = np.array([mid_shoulder[0], bottom_y])
 
-                # --- NEW: Anatomical Hull (Natural Body Taper) ---
-                # We use actual hips instead of vertical lines to prevent "Massive Man" distortion
-                # This keeps the person's natural physique.
-                h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
-                h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
+                # --- NEW: Silhouette Lock (Perfect Physique) ---
+                # Instead of a boxy polygon, we use your REAL body shape from the photo.
+                # Torso, Arms, and Neck labels from the original parsing.
+                body_labels = [4, 5, 6, 14, 15, 18] 
+                spatial_prior = np.isin(parse_array, body_labels).astype(np.uint8)
                 
-                # Add 5% safety margin to hips to catch shirt hem
-                h_r_safe = h_r + np.array([s_width * 0.05, 0])
-                h_l_safe = h_l - np.array([s_width * 0.05, 0])
+                # Dilate slightly to ensure the fabric can "hang" naturally
+                spatial_prior = cv2.dilate(spatial_prior, np.ones((15, 15), np.uint8), iterations=1)
 
-                torso_pts = np.array([
-                    shoulder_right,
-                    shoulder_left,
-                    h_l_safe,
-                    h_r_safe
-                ], dtype=np.int32)
-                cv2.fillPoly(spatial_prior, [torso_pts], 1)
-
-
-                # Draw neck/spine line for connectivity
-                cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
-                
-                # Draw arm tubes (Tightened but widened slightly for natural drape)
-                def draw_arm(p1, p2, thick=25):
-                    if p1[0] > 1 and p2[0] > 1:
-                        cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
-
-                
-                draw_arm(shoulder_right, elbow_right)
-                draw_arm(elbow_right, wrist_right)
-                draw_arm(shoulder_left, elbow_left)
-                draw_arm(elbow_left, wrist_left)
-                
-                # Dilate slightly to catch fabric drapes
-                body_radius = int(max(s_width * 0.15, 15))
-                spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
-                
-                # Strict Horizontal Corridor (The "Cape Killer")
-                # Any pixel outside 0.6x shoulder width is KILLED
+                # Strict "Cape Killer" Clipping
+                # Even with the silhouette, we clip the horizontal bounds to prevent bleed
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.60
-                    r_bound = mid_shoulder[0] + s_width * 0.60
+                    l_bound = mid_shoulder[0] - s_width * 0.58
+                    r_bound = mid_shoulder[0] + s_width * 0.58
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+
 
 
 
