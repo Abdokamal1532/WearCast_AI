@@ -277,6 +277,12 @@ class WearCastHD:
         with torch.no_grad():
             from PIL import ImageEnhance
 
+            # --- NEW: Graphic Fidelity Boost ---
+            # We boost contrast slightly to ensure logos/text (like "LOVE") are super clear for the CLIP encoder
+            enhancer = ImageEnhance.Contrast(image_garm)
+            image_garm = enhancer.enhance(1.5)
+            print("   [CLIP-ENHANCE] Contrast boosted (1.5x) for logo fidelity.")
+
             # --- 2a. Adaptive Background Detection ---
             garm_np = np.array(image_garm.copy())
 
@@ -936,13 +942,13 @@ class WearCastHD:
             # --- 1. Define Category-Specific Silhouette Lock ---
             if category_norm == 'upper_body':
                 body_labels = [4, 5, 6, 14, 15] # Torso and arms
-                neck_erosion = 15
+                neck_erosion = 25 # Increased for lower collar
             elif category_norm == 'lower_body':
                 body_labels = [4, 5, 6, 12, 13] # Hips and legs
                 neck_erosion = 0
             else: # dresses
                 body_labels = [4, 5, 6, 7, 12, 13, 14, 15] # Full body
-                neck_erosion = 10
+                neck_erosion = 15
             
             # Build the "Allowed Body Zone"
             body_mask = np.isin(parse_array, body_labels).astype(np.uint8)
@@ -953,6 +959,15 @@ class WearCastHD:
                 neck_mask = cv2.erode(neck_mask, np.ones((neck_erosion, neck_erosion), np.uint8), iterations=1)
             
             spatial_prior = cv2.bitwise_or(body_mask, neck_mask)
+
+            # --- NEW: Shoulder Slope Prior ---
+            # We cut away a bit from the area ABOVE the shoulders to force a natural human slope
+            slope_h = int(s_width * 0.1)
+            # Right Shoulder Top
+            cv2.circle(spatial_prior, (int(shoulder_right[0]), int(shoulder_right[1] - slope_h)), slope_h, 0, -1)
+            # Left Shoulder Top
+            cv2.circle(spatial_prior, (int(shoulder_left[0]), int(shoulder_left[1] - slope_h)), slope_h, 0, -1)
+
             
             # --- 2. Add Category-Specific Skeletal "Bones" ---
             def draw_tube(p1, p2, thick=25):
