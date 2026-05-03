@@ -3,6 +3,8 @@ import time
 import json
 import urllib3
 import os
+import argparse
+import glob
 
 # Suppress insecure request warnings for testing
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -17,44 +19,72 @@ HEADERS = {
     "User-Agent": "WearCastTestClient/1.0"
 }
 
-def test_tryon():
-    print(f"\n--- Testing WearCast AI API ---")
-    print(f"Target: {BASE_URL}")
+def find_fallback_images():
+    """Search for Gemini-generated images if defaults are missing."""
+    patterns = [
+        "Gemini_Generated_Image_*.png",
+        "Gemini_Generated_Image_*.jpg",
+        "run/examples/model/*.png",
+        "run/examples/garment/*.jpg"
+    ]
+    found = []
+    for p in patterns:
+        found.extend(glob.glob(p))
+    return sorted(found)
+
+def test_tryon(person_path=None, garment_path=None):
+    print(f"\n--- WearCast AI Professional Test Suite ---")
+    print(f"Endpoint: {BASE_URL}")
+
+    # Resolve paths robustly
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    if not person_path:
+        # Default person: model_5.png
+        person_path = os.path.join(root, "run", "examples", "model", "model_5.png")
+    
+    if not garment_path:
+        # Default garment: 06123_00.jpg
+        garment_path = os.path.join(root, "run", "examples", "garment", "06123_00.jpg")
+
+    # Automatic Discovery Fallback
+    if not os.path.exists(person_path) or not os.path.exists(garment_path):
+        print("⚠️  Default images not found. Searching for Gemini alternatives...")
+        fallbacks = find_fallback_images()
+        if len(fallbacks) >= 2:
+            # Simple heuristic: largest is often the model, smallest is often garment
+            fallbacks.sort(key=os.path.getsize, reverse=True)
+            if not os.path.exists(person_path): person_path = fallbacks[0]
+            if not os.path.exists(garment_path): garment_path = fallbacks[1]
+            print(f"✨ Auto-discovered: person={os.path.basename(person_path)}, garment={os.path.basename(garment_path)}")
+
+    if not os.path.exists(person_path) or not os.path.exists(garment_path):
+        print(f"❌ Error: Could not locate input images.")
+        print(f"   Checked: {person_path}")
+        print(f"   Checked: {garment_path}")
+        return
+
+    print(f"👤 Person  : {os.path.abspath(person_path)}")
+    print(f"👕 Garment : {os.path.abspath(garment_path)}")
 
     # Create a session for better connection pooling
     session = requests.Session()
     session.verify = False
     session.trust_env = False  # Ignore system proxies
 
-    # 2. Start the Try-On Task
-    # ======================================================================
-    # 🚨 DO NOT SWAP THESE! 🚨
-    # PERSON  = The human photo (you)
-    # GARMENT = The clothing item (the shirt)
-    # ======================================================================
-    
-    # This is the human photo
-    person_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Gemini_Generated_Image_aabxrvaabxrvaabx.png')
-    
-    # This is the shirt photo
-    garment_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Gemini_Generated_Image_jqklycjqklycjqkl.png')
-    
-    if not os.path.exists(person_path):
-        # Fallback to current dir if root join fails
-        person_path = 'Gemini_Generated_Image_aabxrvaabxrvaabx.png'
-        garment_path = 'Gemini_Generated_Image_jqklycjqklycjqkl.png'
-
-    if not os.path.exists(person_path) or not os.path.exists(garment_path):
-        print(f"❌ Error: Images not found at {person_path} or {garment_path}")
-        print("Please ensure your photos are in the WearCast_AI folder.")
-        return
-
     try:
+        # Determine MIME types
+        p_ext = os.path.splitext(person_path)[1].lower()
+        g_ext = os.path.splitext(garment_path)[1].lower()
+        p_mime = "image/png" if p_ext == ".png" else "image/jpeg"
+        g_mime = "image/png" if g_ext == ".png" else "image/jpeg"
+
         files = {
-            'person': (os.path.basename(person_path), open(person_path, 'rb'), 'image/png'),
-            'garment': (os.path.basename(garment_path), open(garment_path, 'rb'), 'image/jpeg')
+            'person': (os.path.basename(person_path), open(person_path, 'rb'), p_mime),
+            'garment': (os.path.basename(garment_path), open(garment_path, 'rb'), g_mime)
         }
         
+        print(f"\n[1/4] Uploading to API...")
         response = session.post(
             f"{BASE_URL}/tryon", 
             files=files, 
@@ -71,20 +101,14 @@ def test_tryon():
             return
 
         data = response.json()
-        # Debug: print(f"DEBUG: Received data: {data}")
-        
         task_id = data.get('task_id')
-        estimate = data.get('estimated_time_seconds', data.get('estimate', 'unknown'))
+        estimate = data.get('estimated_time_seconds', 'unknown')
         
-        if not task_id:
-            print(f"❌ Error: No task_id in response: {data}")
-            return
-            
         print(f"✅ Task Created! ID: {task_id}")
         print(f"⏱️ Estimated Time: {estimate} seconds")
 
         # 3. Listen to the Professional Progress Stream
-        print(f"\n[2/3] Opening Professional Progress Stream...")
+        print(f"\n[2/4] Opening Progress Stream...")
         print("-" * 50)
         
         result_url = None
@@ -99,30 +123,25 @@ def test_tryon():
                             msg = event_data.get('message', '')
                             rem = event_data.get('remaining', 0)
                             
-                            if status == "initializing":
-                                print(f"🕒 [INITIALIZING] {msg} (Est: {rem}s)")
-                            elif status == "completed":
+                            if status == "completed":
                                 print(f"\n✨ [SUCCESS] Virtual Try-On Finished!")
                                 result_url = event_data.get('url')
                                 break
                             elif status == "failed":
                                 print(f"\n❌ [FAILED] Task failed: {event_data.get('error')}")
                                 return
-                            elif status == "finalizing":
-                                print(f"⏳ [FINALIZING] {msg}")
                             else:
-                                display_msg = msg if msg else f"Status: {status}"
-                                print(f"🚀 [PROCESSING] {display_msg} | Remaining: {rem}s")
+                                print(f"🚀 [{status.upper()}] {msg} | Remaining: {rem}s")
 
                         except json.JSONDecodeError:
-                            print(f"⚠️ Warning: Could not parse SSE data: {decoded_line}")
+                            pass
 
         if not result_url:
             print("❌ Error: Stream ended without a result URL.")
             return
 
         # 4. Download Result
-        print(f"\n[3/3] Downloading result...")
+        print(f"\n[3/4] Downloading final result...")
         img_response = session.get(f"{BASE_URL}{result_url}", headers=HEADERS)
         
         output_file = "tryon_result.png"
@@ -130,8 +149,8 @@ def test_tryon():
             f.write(img_response.content)
         print(f"🎉 Result saved to: {os.path.abspath(output_file)}")
 
-        # 4. Download Debug Pipeline Images
-        print(f"\n[4/4] Downloading Debug Pipeline Images...")
+        # 5. Download Debug Pipeline Images
+        print(f"\n[4/4] Syncing Debug Assets...")
         # Extract task_id from result_url (/result/TASK_ID)
         task_id = result_url.split("/")[-1]
         debug_dir = os.path.join(os.getcwd(), f"debug_{task_id}")
@@ -154,20 +173,21 @@ def test_tryon():
                     with open(local_path, 'wb') as f:
                         for chunk in d_res.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    print(f"  📥 Saved: {fname}")
+                    print(f"  📥 Cached: {fname}")
             except:
                 pass
         
-        print(f"\n✨ [ALL DONE] Check the folder: {debug_dir}")
+        print(f"\n✨ [ALL DONE] Analysis Complete. Inspect results in: {debug_dir}")
 
-    except requests.exceptions.SSLError as e:
-        print(f"💥 SSL Error: {e}")
-        print("Tip: This often happens with ngrok if the tunnel is unstable. Try restarting the Kaggle server.")
     except Exception as e:
         print(f"💥 Error: {e}")
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
-    test_tryon()
+    parser = argparse.ArgumentParser(description="WearCast AI API Professional Test Client")
+    parser.add_argument("--person", type=str, help="Path to person image")
+    parser.add_argument("--garment", type=str, help="Path to garment image")
+    args = parser.parse_args()
+    
+    test_tryon(args.person, args.garment)
+
 
