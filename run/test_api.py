@@ -30,13 +30,13 @@ def test_tryon():
     print("\n[1/3] Sending images to /tryon...")
     
     # Path to your specific images
-    person_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg')
-    garment_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'pp.jpg.jpeg')
+    person_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'pp.jpg.jpeg')
+    garment_path = os.path.join(os.path.dirname(os.path.dirname(__file__)),'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg' )
     
     if not os.path.exists(person_path):
         # Fallback to current dir if root join fails
-        person_path = 'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg'
-        garment_path = 'pp.jpg.jpeg'
+        person_path = 'pp.jpg.jpeg'
+        garment_path = 'WhatsApp Image 2026-05-03 at 12.18.33 PM.jpeg'
 
     if not os.path.exists(person_path) or not os.path.exists(garment_path):
         print(f"❌ Error: Images not found at {person_path} or {garment_path}")
