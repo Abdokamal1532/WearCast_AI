@@ -447,17 +447,18 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: VFX Grade Histogram Match ---
-        # Matches the entire color distribution (shadows, midtones, highlights)
+        # --- NEW: True-Black Color Lock ---
+        # Forces the output to match the deep colors of the original garment
         if len(gen_in_mask) > 100:
             from skimage import exposure
-            # Match generated shirt to studio reference shirt
             matched = exposure.match_histograms(gen_arr.astype(np.uint8), garm_arr.astype(np.uint8), channel_axis=-1)
-            # 60/40 blend ensures we keep AI details but use real-world lighting
-            gen_arr = (gen_arr * 0.60 + matched.astype(np.float32) * 0.40).clip(0, 255)
-            print(f"   [CORR] VFX Grade Histogram Match Applied (Soft 40% blend)")
+            # Dynamic Blend: If the garment is dark (Black/Navy), we use 90% Match to prevent "greying"
+            blend_ratio = 0.90 if garm_lum_mean < 60 else 0.40
+            gen_arr = (gen_arr * (1 - blend_ratio) + matched.astype(np.float32) * blend_ratio).clip(0, 255)
+            print(f"   [CORR] True-Black Color Lock Applied (Blend: {blend_ratio*100:.0f}%)")
         else:
-            print(f"   [CORR] Histogram match skipped (insufficient mask pixels)")
+            print(f"   [CORR] Color lock skipped (insufficient mask pixels)")
+
 
 
 
@@ -926,15 +927,24 @@ class WearCastHD:
                 else:
                     spine_proj = np.array([mid_shoulder[0], bottom_y])
 
-                # --- NEW: Anatomical Hull (Torso Polygon) ---
-                # Creates a solid block of "allowed" area between shoulders and hips
+                # --- NEW: Anatomical Hull (Natural Body Taper) ---
+                # We use actual hips instead of vertical lines to prevent "Massive Man" distortion
+                # This keeps the person's natural physique.
+                h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
+                h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
+                
+                # Add 5% safety margin to hips to catch shirt hem
+                h_r_safe = h_r + np.array([s_width * 0.05, 0])
+                h_l_safe = h_l - np.array([s_width * 0.05, 0])
+
                 torso_pts = np.array([
                     shoulder_right,
                     shoulder_left,
-                    [shoulder_left[0], model_parse.height],
-                    [shoulder_right[0], model_parse.height]
+                    h_l_safe,
+                    h_r_safe
                 ], dtype=np.int32)
                 cv2.fillPoly(spatial_prior, [torso_pts], 1)
+
 
                 # Draw neck/spine line for connectivity
                 cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
