@@ -133,18 +133,27 @@ class WearCastHD:
         )
         return inputs.input_ids
 
-    def __call__(self,
-                model_type='hd',
-                category='upperbody',
-                image_garm=None,
-                image_vton=None,
-                mask=None,
-                image_ori=None,
-                num_samples=1,
-                num_steps=20,
-                image_scale=1.0,
-                seed=-1,
+    def __call__(
+        self,
+        model_type='hd',
+        category='upperbody',
+        image_garm=None,
+        image_vton=None,
+        mask=None,
+        image_ori=None,
+        num_samples=1,
+        num_steps=20,
+        image_scale=1.0,
+        seed=-1,
+        callback=None,
+        callback_steps=1,
+        output_dir=None,
     ):
+        # Ensure output directory exists if provided
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"   [WearCast] Debug images will be saved to: {output_dir}")
+
         print("\n" + "=" * 70)
         print("[WearCastHD.__call__] Starting inference...")
         print(f"[WearCastHD.__call__] model_type ={model_type}")
@@ -235,20 +244,29 @@ class WearCastHD:
             print(f" -> Mask after resize: {mask.size}")
 
             # Save mask debug images
-            mask.save("debug_phase1_hard_mask.jpg")
-            print(f" -> [SAVED] Hard mask (255-binary) saved to: debug_phase1_hard_mask.jpg")
-            mask_gray.save("debug_phase1_soft_mask.jpg")
-            print(f" -> [SAVED] Soft mask (127-gray) saved to: debug_phase1_soft_mask.jpg")
+            def debug_save(img, name):
+                if output_dir:
+                    img.save(os.path.join(output_dir, name))
+                else:
+                    img.save(name)
+
+            debug_save(mask, "debug_phase1_hard_mask.jpg")
+            print(f" -> [SAVED] Hard mask (255-binary) saved")
+            debug_save(mask_gray, "debug_phase1_soft_mask.jpg")
+            print(f" -> [SAVED] Soft mask (127-gray) saved")
 
             print(" -> Preprocessing Stage: SUCCESS")
 
         # Auto-detect garment complexity and choose optimal params
         is_complex = self.detect_garment_complexity(image_garm)
         auto_params = self.get_optimal_params(category, is_complex)
-        final_steps = auto_params["num_steps"]    # use auto-detected optimal steps
-        final_scale = auto_params["image_scale"]   # use auto-detected optimal guidance
+        
+        # Respect UI parameters if they are valid (not -1 or similar)
+        final_steps = num_steps if num_steps > 0 else auto_params["num_steps"]
+        final_scale = image_scale if image_scale > 0 else auto_params["image_scale"]
+        
         print(f"\n[WearCast] Auto-detect: complex={is_complex} | auto_params={auto_params}")
-        print(f"[WearCast] Using params: steps={final_steps} (UI={num_steps}), guidance_scale={final_scale} (UI={image_scale})")
+        print(f"[WearCast] Using params: steps={final_steps} (Request={num_steps}), guidance_scale={final_scale} (Request={image_scale})")
 
         # =========================================================
         # PHASE 2 — CLIP Vision Encoding
@@ -275,14 +293,14 @@ class WearCastHD:
                 garm_np_proc = garm_np.copy()
                 garm_np_proc[bg_mask] = [170, 170, 170]
                 garm_proc = Image.fromarray(garm_np_proc)
-                garm_proc.save("debug_phase2_clip_bg_replaced.jpg")
+                debug_save(garm_proc, "debug_phase2_clip_bg_replaced.jpg")
                 print(f" -> [SAVED] CLIP input (BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
             else:
                 print(f" -> No significant white BG detected. Using original garment for CLIP.")
                 garm_proc = image_garm.copy()
 
             # Save the original garment for reference comparison
-            image_garm.save("debug_phase2_garment_original.jpg")
+            debug_save(image_garm, "debug_phase2_garment_original.jpg")
             print(f" -> [SAVED] Original garment saved to: debug_phase2_garment_original.jpg")
 
             # --- 2b. CLIP input preparation ---
@@ -290,7 +308,7 @@ class WearCastHD:
             # Heavy sharpness/contrast enhancement was removed because it
             # over-emphasises edges and textures, causing stiff/puffy artifacts.
             garm_enhanced = garm_proc
-            garm_enhanced.save("debug_phase2_clip_input.jpg")
+            debug_save(garm_enhanced, "debug_phase2_clip_input.jpg")
             print(f" -> [SAVED] CLIP input garment saved to: debug_phase2_clip_input.jpg")
 
             # --- 2c. CLIP Encoding ---
@@ -314,7 +332,7 @@ class WearCastHD:
             garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
             # Undo: [-1,1] -> [0,255]
             garm_rt_np = ((garm_roundtrip[0].float().cpu().clamp(-1, 1) + 1) / 2 * 255).byte().permute(1, 2, 0).numpy()
-            Image.fromarray(garm_rt_np).save("debug_phase2_vae_roundtrip.jpg")
+            debug_save(Image.fromarray(garm_rt_np), "debug_phase2_vae_roundtrip.jpg")
             # Compute PSNR between original and roundtrip
             garm_orig_resized = np.array(image_garm.resize((garm_rt_np.shape[1], garm_rt_np.shape[0]))).astype(np.float32)
             mse_val = np.mean((garm_orig_resized - garm_rt_np.astype(np.float32))**2)
@@ -329,7 +347,7 @@ class WearCastHD:
 
             # Save final mask diagnostic
             mask_diagnostic = (np.array(mask) * 255).astype(np.uint8)
-            Image.fromarray(mask_diagnostic).save("debug_final_unet_mask.jpg")
+            debug_save(Image.fromarray(mask_diagnostic), "debug_final_unet_mask.jpg")
             print(f" -> [SAVED] Final UNet mask saved to: debug_final_unet_mask.jpg")
 
             # Save masked person image (what the UNet receives as context)
@@ -337,7 +355,7 @@ class WearCastHD:
             vton_np = np.array(image_vton)
             masked_person_vis = vton_np.copy()
             masked_person_vis[mask_np_vis > 127] = [0, 0, 0]  # black out masked region
-            Image.fromarray(masked_person_vis).save("debug_phase3_masked_person.jpg")
+            debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
             if torch.cuda.is_available():
@@ -356,6 +374,8 @@ class WearCastHD:
                 image_guidance_scale=final_scale,
                 num_images_per_prompt=num_samples,
                 generator=generator,
+                callback=callback,
+                callback_steps=callback_steps,
             ).images
             t_unet_end = time.time()
 
@@ -376,7 +396,7 @@ class WearCastHD:
         # =====================================================================
         print(f"\n[WearCast] Phase 4/4: Final Post-processing (clean paste-back)...")
         raw_generated = images[0]
-        raw_generated.save("debug_phase4_raw_unet_output.jpg")
+        debug_save(raw_generated, "debug_phase4_raw_unet_output.jpg")
         print(f" -> [SAVED] Raw UNet output saved to: debug_phase4_raw_unet_output.jpg")
         print(f" -> UNet Generated Target Size: {raw_generated.size}")
 
@@ -404,7 +424,7 @@ class WearCastHD:
         alpha = np.clip(alpha, 0.0, 1.0)
 
         # Save feather mask for debugging
-        Image.fromarray((alpha * 255).astype(np.uint8)).save("debug_phase4_feather_mask.jpg")
+        debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
         print(f" -> Feather mask: sigma={feather_sigma}px")
 
         # --- Pre-compositing diagnostics ---
@@ -441,10 +461,10 @@ class WearCastHD:
         comparison.paste(image_garm.resize(raw_generated.size), (0, 0))
         comparison.paste(raw_generated, (raw_generated.size[0], 0))
         comparison.paste(final_image, (raw_generated.size[0] * 2, 0))
-        comparison.save("debug_phase4_comparison.jpg")
+        debug_save(comparison, "debug_phase4_comparison.jpg")
         print(f" -> [SAVED] 3-panel comparison: Garment | Raw UNet | Final")
 
-        final_image.save("debug_final_output.jpg")
+        debug_save(final_image, "debug_final_output.jpg")
         print(f" -> [SAVED] Final result saved to: debug_final_output.jpg")
 
         print("\n[WearCast] SUCCESS: Inference completed successfully!")
@@ -479,12 +499,11 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex/patterned garments require more steps for high accuracy (>98%)
-            # We use 40 steps and 2.5 scale for maximum detail retention
-            return {"num_steps": 40, "image_scale": 2.5}
+            # Complex/patterned garments: 30 steps for high quality
+            return {"num_steps": 20, "image_scale": 2.0}
         else:
-            # Simple/solid garments: increased steps (30) for better quality and realism
-            return {"num_steps": 30, "image_scale": 2.0}
+            # Simple/solid garments: 20 steps for speed and realism
+            return {"num_steps": 20, "image_scale": 2.0}
 
     def local_color_correction(self, generated, original_garment, mask_hard):
         """
@@ -831,12 +850,17 @@ class WearCastHD:
         arms_draw_right = ImageDraw.Draw(im_arms_right)
 
         if category_norm in ('upper_body', 'dresses'):
-            shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
-            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
-            elbow_right    = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
-            elbow_left     = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
-            wrist_right    = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
-            wrist_left     = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+            # IMPORTANT: Calculate scale based on the actual height of model_parse (source image)
+            # instead of hardcoding 512.0. This fixes the pose-offset bug.
+            source_height = model_parse.height
+            scale_factor = height / float(source_height)
+            
+            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+            elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
+            elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
+            wrist_right    = np.multiply(tuple(pose_data[4][:2]), scale_factor)
+            wrist_left     = np.multiply(tuple(pose_data[7][:2]), scale_factor)
             ARM_LINE_WIDTH = int(arm_width / 512 * height)
 
             size_left  = [shoulder_left[0]  - ARM_LINE_WIDTH // 2, shoulder_left[1]  - ARM_LINE_WIDTH // 2,

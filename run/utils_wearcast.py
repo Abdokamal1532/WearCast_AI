@@ -90,12 +90,17 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     im_arms_right = Image.new('L', (width, height))
     arms_draw_left = ImageDraw.Draw(im_arms_left)
     arms_draw_right = ImageDraw.Draw(im_arms_right)
-    shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
-    shoulder_left = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
-    elbow_right = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
-    elbow_left = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
-    wrist_right = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
-    wrist_left = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+    # IMPORTANT: Calculate scale based on the actual height of model_parse (source image)
+    # instead of hardcoding 512.0. This fixes the pose-offset bug.
+    source_height = model_parse.height
+    scale_factor = height / float(source_height)
+
+    shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+    shoulder_left = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+    elbow_right = np.multiply(tuple(pose_data[3][:2]), scale_factor)
+    elbow_left = np.multiply(tuple(pose_data[6][:2]), scale_factor)
+    wrist_right = np.multiply(tuple(pose_data[4][:2]), scale_factor)
+    wrist_left = np.multiply(tuple(pose_data[7][:2]), scale_factor)
     ARM_LINE_WIDTH = int(arm_width / 512 * height)
     size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
     size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
@@ -141,3 +146,34 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
 
     return mask, mask_gray
+
+def smart_resize(img: Image.Image, target_size=(768, 1024), fill_color=(255, 255, 255)):
+    """
+    Resizes image while maintaining aspect ratio, adding padding to reach target_size.
+    This prevents the 'stretched' look common in naive resizing.
+    """
+    img_w, img_h = img.size
+    target_w, target_h = target_size
+    
+    # Calculate aspect ratios
+    aspect = img_w / img_h
+    target_aspect = target_w / target_h
+    
+    if aspect > target_aspect:
+        # Image is wider than target: fit to width
+        new_w = target_w
+        new_h = int(target_w / aspect)
+    else:
+        # Image is taller than target: fit to height
+        new_h = target_h
+        new_w = int(target_h * aspect)
+        
+    img_resized = img.resize((new_w, new_h), Image.LANCZOS)
+    
+    # Create background and paste
+    new_img = Image.new("RGB", target_size, fill_color)
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    new_img.paste(img_resized, (paste_x, paste_y))
+    
+    return new_img
