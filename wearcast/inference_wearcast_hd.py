@@ -901,79 +901,90 @@ class WearCastHD:
         arms_draw_left  = ImageDraw.Draw(im_arms_left)
         arms_draw_right = ImageDraw.Draw(im_arms_right)
 
-        if category_norm in ('upper_body', 'dresses'):
-            # IMPORTANT: pose_data is generated from a 1024px height image.
-            # We scale it to the 512px height mask space.
-            scale_factor = model_parse.height / 1024.0
-            
-            shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
-            shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
-            elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
-            elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
-            wrist_right    = np.multiply(tuple(pose_data[4][:2]), scale_factor)
-            wrist_left     = np.multiply(tuple(pose_data[7][:2]), scale_factor)
-            neck           = np.multiply(tuple(pose_data[1][:2]), scale_factor)
-            hip_r          = np.multiply(tuple(pose_data[8][:2]), scale_factor)
-            hip_l          = np.multiply(tuple(pose_data[11][:2]), scale_factor)
+        # --- Extract Skeletal Keypoints ---
+        # We scale it to the 512px height mask space.
+        scale_factor = model_parse.height / 1024.0
+        
+        shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
+        shoulder_left  = np.multiply(tuple(pose_data[5][:2]), scale_factor)
+        elbow_right    = np.multiply(tuple(pose_data[3][:2]), scale_factor)
+        elbow_left     = np.multiply(tuple(pose_data[6][:2]), scale_factor)
+        wrist_right    = np.multiply(tuple(pose_data[4][:2]), scale_factor)
+        wrist_left     = np.multiply(tuple(pose_data[7][:2]), scale_factor)
+        neck           = np.multiply(tuple(pose_data[1][:2]), scale_factor)
+        
+        hip_r          = np.multiply(tuple(pose_data[8][:2]), scale_factor)
+        hip_l          = np.multiply(tuple(pose_data[11][:2]), scale_factor)
+        knee_r         = np.multiply(tuple(pose_data[9][:2]), scale_factor)
+        knee_l         = np.multiply(tuple(pose_data[12][:2]), scale_factor)
+        ankle_r        = np.multiply(tuple(pose_data[10][:2]), scale_factor)
+        ankle_l        = np.multiply(tuple(pose_data[13][:2]), scale_factor)
 
+        # ------------------------------------------------------------------
+        # Universal Silhouette Lock & Skeletal Cape Killer
+        # ------------------------------------------------------------------
+        if category_norm in ('upper_body', 'lower_body', 'dresses'):
+            parse_mask_uint8 = (parse_mask > 0).astype(np.uint8)
+            spatial_prior = np.zeros_like(parse_mask_uint8)
             
-            # ------------------------------------------------------------------
-            # Skeletal Prior & Torso-Centric Blob Filtering
-            # Physically severs background artifacts (capes) using OpenPose bones
-            # ------------------------------------------------------------------
+            mid_shoulder = (shoulder_right + shoulder_left) / 2
+            s_width      = abs(shoulder_left[0] - shoulder_right[0])
+            
+            # --- 1. Define Category-Specific Silhouette Lock ---
+            if category_norm == 'upper_body':
+                body_labels = [4, 5, 6, 14, 15] # Torso and arms
+                neck_erosion = 15
+            elif category_norm == 'lower_body':
+                body_labels = [4, 5, 6, 12, 13] # Hips and legs
+                neck_erosion = 0
+            else: # dresses
+                body_labels = [4, 5, 6, 7, 12, 13, 14, 15] # Full body
+                neck_erosion = 10
+            
+            # Build the "Allowed Body Zone"
+            body_mask = np.isin(parse_array, body_labels).astype(np.uint8)
+            
+            # Collar Protection (for upper body/dresses)
+            neck_mask = (parse_array == 18).astype(np.uint8)
+            if neck_erosion > 0:
+                neck_mask = cv2.erode(neck_mask, np.ones((neck_erosion, neck_erosion), np.uint8), iterations=1)
+            
+            spatial_prior = cv2.bitwise_or(body_mask, neck_mask)
+            
+            # --- 2. Add Category-Specific Skeletal "Bones" ---
+            def draw_tube(p1, p2, thick=25):
+                if p1[0] > 1 and p2[0] > 1:
+                    cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
+
             if category_norm in ('upper_body', 'dresses'):
-                parse_mask_uint8 = (parse_mask > 0).astype(np.uint8)
-                
-                # --- 1. Create Skeletal Prior (The "Body Tube") ---
-                spatial_prior = np.zeros_like(parse_mask_uint8)
-                
-                h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
-                h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
-                
-                mid_shoulder = (shoulder_right + shoulder_left) / 2
-                spine_end    = (h_r + h_l) / 2
-                s_width      = abs(shoulder_left[0] - shoulder_right[0])
-                
-                # --- EXTENSION: Project the spine all the way to the bottom ---
-                # This ensures long shirts/dresses aren't cut off at the hip
-                bottom_y = model_parse.height
-                spine_dir = spine_end - mid_shoulder
-                if np.linalg.norm(spine_dir) > 5:
-                    spine_dir = spine_dir / np.linalg.norm(spine_dir)
-                    spine_proj = mid_shoulder + spine_dir * (bottom_y - mid_shoulder[1]) / (spine_dir[1] + 1e-6)
-                else:
-                    spine_proj = np.array([mid_shoulder[0], bottom_y])
+                # Torso and Arms
+                draw_tube(shoulder_right, elbow_right)
+                draw_tube(elbow_right, wrist_right)
+                draw_tube(shoulder_left, elbow_left)
+                draw_tube(elbow_left, wrist_left)
+                draw_tube(neck, mid_shoulder, thick=10)
+            
+            if category_norm in ('lower_body', 'dresses'):
+                # Legs
+                draw_tube(hip_r, knee_r, thick=35)
+                draw_tube(knee_r, ankle_r, thick=30)
+                draw_tube(hip_l, knee_l, thick=35)
+                draw_tube(knee_l, ankle_l, thick=30)
 
-                # --- NEW: Silhouette Lock with Collar Protection ---
-                # Torso and arms
-                torso_labels = [4, 5, 6, 14, 15]
-                torso_mask = np.isin(parse_array, torso_labels).astype(np.uint8)
-                
-                # Neck label (18) with "Collar Protection" (Strong Erosion)
-                # This prevents the shirt from climbing too high on your neck
-                neck_mask = (parse_array == 18).astype(np.uint8)
-                neck_mask = cv2.erode(neck_mask, np.ones((15, 15), np.uint8), iterations=1)
-                
-                # Combine into the final Silhouette
-                spatial_prior = cv2.bitwise_or(torso_mask, neck_mask)
-                
-                # Dilate slightly for natural hang
-                spatial_prior = cv2.dilate(spatial_prior, np.ones((10, 10), np.uint8), iterations=1)
+            # Dilate to catch natural drapes
+            body_radius = int(max(s_width * 0.15, 10))
+            spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
 
+            # --- 3. Strict "Cape Killer" Horizontal Clipping ---
+            if s_width > 10:
+                l_bound = mid_shoulder[0] - s_width * 0.62
+                r_bound = mid_shoulder[0] + s_width * 0.62
+                spatial_prior[:, :max(0, int(l_bound))] = 0
+                spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
-                # Strict "Cape Killer" Clipping
-                # Even with the silhouette, we clip the horizontal bounds to prevent bleed
-                if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.58
-                    r_bound = mid_shoulder[0] + s_width * 0.58
-                    spatial_prior[:, :max(0, int(l_bound))] = 0
-                    spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+            # Apply the silhouette lock
+            physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
 
-
-
-
-
-                physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
                 
                 # --- 2. Morphological Isolation ---
                 kernel_erode = np.ones((5, 5), np.uint8)
