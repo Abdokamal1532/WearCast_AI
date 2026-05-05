@@ -291,12 +291,33 @@ class WearCastHD:
             print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% BG pixels (selected threshold>={bg_thresh})")
 
             if bg_coverage > 0.05:
-                print(f" -> White product background detected ({100*bg_coverage:.1f}%), replacing with neutral gray for CLIP...")
                 garm_np_proc = garm_np.copy()
-                garm_np_proc[bg_mask] = [170, 170, 170]
+                # --- Adaptive BG Color ---
+                # For a dark garment (e.g. black shirt), using a medium-grey BG (170,170,170)
+                # biases the CLIP embedding toward grey → UNet generates grey, not black.
+                # FIX: Detect garment foreground luminance and choose a complementary BG:
+                #   - Dark foreground  (<80 lum) → dark BG [30,30,30]  (preserves black)
+                #   - Medium foreground (80-160)  → neutral BG [128,128,128]
+                #   - Light foreground  (>160 lum) → medium-grey BG [170,170,170]
+                fg_pixels = garm_np[~bg_mask]
+                if len(fg_pixels) > 100:
+                    fg_lum = (fg_pixels[:,0]*0.299 + fg_pixels[:,1]*0.587 + fg_pixels[:,2]*0.114).mean()
+                else:
+                    fg_lum = 128.0
+                if fg_lum < 80:
+                    bg_color = [30, 30, 30]
+                    bg_label = "dark (garment is dark/black)"
+                elif fg_lum < 160:
+                    bg_color = [128, 128, 128]
+                    bg_label = "neutral-grey (garment is medium tone)"
+                else:
+                    bg_color = [170, 170, 170]
+                    bg_label = "light-grey (garment is light/white)"
+                print(f" -> Garment FG luminance: {fg_lum:.1f} → using BG color={bg_color} [{bg_label}]")
+                garm_np_proc[bg_mask] = bg_color
                 garm_proc = Image.fromarray(garm_np_proc)
                 debug_save(garm_proc, "debug_phase2_clip_bg_replaced.jpg")
-                print(f" -> [SAVED] CLIP input (BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
+                print(f" -> [SAVED] CLIP input (adaptive BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
             else:
                 print(f" -> No significant white BG detected. Using original garment for CLIP.")
                 garm_proc = image_garm.copy()
@@ -448,15 +469,21 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: Professional Luminance Match ---
-        # Balances the UNet lighting to match the original garment reference.
-        # FIX: Raised cap from ±20 → ±50 with a 0.6 multiplier so that large gaps
-        # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
-        # residual that produces the grey "cape" artifact around the waist.
+        # --- Luminance Match: Dark-Garment-Aware ---
+        # For dark garments (reference lum < 80, e.g. black shirt) the UNet tends to
+        # generate medium-grey output because diffusion priors are biased toward average
+        # scene brightness. We apply a more aggressive correction in that case:
+        #   - Dark garment  (ref < 80)  : factor=0.85, cap=70 → strong darken
+        #   - Normal garment (ref >= 80) : factor=0.6,  cap=50 → balanced shift
         if abs(lum_gap) > 3.0:
-            shift = np.clip(lum_gap * 0.6, -50, 50)
+            if garm_lum_mean < 80 and lum_gap < 0:
+                # Dark garment: push harder toward black
+                shift = np.clip(lum_gap * 0.85, -70, 0)
+                print(f"   [CORR] Dark-garment mode (ref={garm_lum_mean:.1f}<80): shift={shift:+.1f}")
+            else:
+                shift = np.clip(lum_gap * 0.6, -50, 50)
+                print(f"   [CORR] Standard luminance shift: {shift:+.1f}")
             gen_arr = np.clip(gen_arr + shift, 0, 255)
-            print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
         else:
             print(f"   [CORR] Luminance match already within tolerance (gap={lum_gap:.1f})")
 
