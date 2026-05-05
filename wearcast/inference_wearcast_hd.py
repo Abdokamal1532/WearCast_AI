@@ -826,8 +826,7 @@ class WearCastHD:
 
         # --- Model-type arm width (matches OOTDiffusion exactly) ---
         if model_type == 'hd':
-            # Surgical Arm Masking: 30px is enough for target_w=384
-            arm_width = 30
+            arm_width = 60  # Original OOTDiffusion value — 30 was too thin, losing arm coverage
         elif model_type == 'dc':
             arm_width = 45
         else:
@@ -1071,7 +1070,7 @@ class WearCastHD:
 
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=1)
+                np.ones((5, 5), np.uint16), iterations=3)  # 3 iterations for proper sleeve area coverage
             parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
             # Always add raw arm segmentation — catches bare-arm regions the drawn
             # arm lines may not fully cover (especially for sleeveless → sleeved transfers)
@@ -1082,15 +1081,12 @@ class WearCastHD:
             # ------------------------------------------------------------------
             # FINAL LOCK: Apply Silhouette Lock and Cape Killer to the WHOLE mask
             # ------------------------------------------------------------------
-            # Any pixel outside the 5px silhouette buffer is KILLED
+            # Silhouette Lock: remove any mask pixel that falls outside the person body
+            # (5px dilated silhouette). This kills background bleed without cutting arm coverage.
             parse_mask = np.logical_and(parse_mask, silhouette_lock).astype(np.float32)
-
-            # Re-apply Cape Killer corridor to the final combined mask
-            if s_width > 10:
-                l_bound = mid_shoulder[0] - s_width * 0.52
-                r_bound = mid_shoulder[0] + s_width * 0.52
-                parse_mask[:, :max(0, int(l_bound))] = 0
-                parse_mask[:, min(parse_mask.shape[1], int(r_bound)):] = 0
+            # NOTE: We do NOT re-apply the 0.52× corridor here. The spatial_prior already
+            # uses 0.65× + 15px padding. A second 0.52× pass was causing mask to drop
+            # from ~29% → ~12%, stripping all arm pixels and killing sleeve coverage.
 
             # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
             hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
