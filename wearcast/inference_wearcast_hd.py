@@ -426,8 +426,9 @@ class WearCastHD:
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
         
-        # Feathering: 3.0 sigma provides a professional "studio" blend
-        feather_sigma = 3.0
+        # Feathering: 5.0 sigma gives a softer, more natural fabric-to-skin transition
+        # (was 3.0 — too sharp at shirt collar and sleeve edges)
+        feather_sigma = 5.0
         alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -448,9 +449,12 @@ class WearCastHD:
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
         # --- NEW: Professional Luminance Match ---
-        # Balances the UNet lighting to match the original garment reference
+        # Balances the UNet lighting to match the original garment reference.
+        # FIX: Raised cap from ±20 → ±50 with a 0.6 multiplier so that large gaps
+        # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
+        # residual that produces the grey "cape" artifact around the waist.
         if abs(lum_gap) > 3.0:
-            shift = np.clip(lum_gap * 0.5, -20, 20)
+            shift = np.clip(lum_gap * 0.6, -50, 50)
             gen_arr = np.clip(gen_arr + shift, 0, 255)
             print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
         else:
@@ -960,11 +964,12 @@ class WearCastHD:
                 body_radius = int(max(s_width * 0.05, 8))
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Strict Horizontal Corridor (The "Cape Killer" - TIGHTENED: 0.6 -> 0.52)
-                # Any pixel outside 0.52x shoulder width is KILLED
+                # Horizontal Corridor — keeps only pixels within body width.
+                # FIX: Widened from 0.52× → 0.65× and added ±15px padding so that
+                # shirt sides and sleeve transitions are not clipped at straight edges.
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.52
-                    r_bound = mid_shoulder[0] + s_width * 0.52
+                    l_bound = mid_shoulder[0] - s_width * 0.65 - 15
+                    r_bound = mid_shoulder[0] + s_width * 0.65 + 15
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
@@ -1028,10 +1033,24 @@ class WearCastHD:
 
             # Combine arm masks into final garment mask
             # TIGHTENED: Reduced dilation (4 -> 1) to prevent background bloat
+
+            # Combine arm masks into final garment mask.
+            # FIX: Also unconditionally union the raw arm segmentation labels (arms_left,
+            # arms_right) into the parse mask for upper_body try-on. This is critical when
+            # the model wears a sleeveless garment but the target has sleeves: the parser
+            # correctly labels bare arms as LeftArm/RightArm, but the old code only used
+            # those labels as a fallback when wrist keypoints were missing (0,0). Now we
+            # always include the full arm parse region so the UNet can synthesise sleeves.
+
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
                 np.ones((5, 5), np.uint16), iterations=1)
             parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
+            # Always add raw arm segmentation — catches bare-arm regions the drawn
+            # arm lines may not fully cover (especially for sleeveless → sleeved transfers)
+            parse_mask = np.logical_or(parse_mask, arms_left).astype(np.float32)
+            parse_mask = np.logical_or(parse_mask, arms_right).astype(np.float32)
+            print(f"   [MASK_GEN] Arm-parse pixels added to mask (sleeveless→sleeved support).")
 
             # ------------------------------------------------------------------
             # FINAL LOCK: Apply Silhouette Lock and Cape Killer to the WHOLE mask
@@ -1057,7 +1076,10 @@ class WearCastHD:
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
         # TIGHTENED: Minimum dilation (1 iteration) for seamless edges only
-        parse_mask = cv2.dilate(parse_mask, np.ones((3, 3), np.uint16), iterations=1)
+        # parse_mask = cv2.dilate(parse_mask, np.ones((3, 3), np.uint16), iterations=1)
+        # FIX: Increased from 2 → 3 iterations (15px effective radius) to better cover
+        # arm edges and shirt-hem transitions without over-masking the face/neck.
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=3)
 
         if category_norm in ('upper_body', 'dresses'):
             neck_mask = (parse_array == 18).astype(np.float32)
