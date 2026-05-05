@@ -440,22 +440,32 @@ class WearCastHD:
 
         # Binarize
         binary_mask = (mask_np > 0.5).astype(np.uint8)
-        
-        # Multi-stage edge softening:
-        # 1. Slightly erode to ensure no garment-background bleed
-        # 2. Apply Gaussian blur for natural skin/fabric transition
-        kernel_erode = np.ones((3, 3), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
-        
-        # Feathering: 5.0 sigma gives a softer, more natural fabric-to-skin transition
-        # (was 3.0 — too sharp at shirt collar and sleeve edges)
+
+        # --- Interior-Fill Compositing (eliminates background ghosting) ---
+        # Problem: GaussianBlur applied to the whole mask lowers center-pixel alpha
+        # to ~0.6-0.8, so the background bleeds through the shirt interior (ghosting).
+        # Fix: compute two layers —
+        #   1. A "hard interior" eroded deeply → guaranteed alpha = 1.0 at center
+        #   2. A "soft boundary" from a shallow erode + blur → smooth fabric edge
+        # Then np.maximum() keeps interior at 1.0 while boundary gets smooth transition.
+
+        # Soft boundary: 1-iteration erode + 5px Gaussian (same as before)
+        kernel_edge = np.ones((3, 3), np.uint8)
+        edge_mask = cv2.erode(binary_mask, kernel_edge, iterations=1)
         feather_sigma = 5.0
-        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        alpha_soft = cv2.GaussianBlur(edge_mask.astype(np.float32), (0, 0), feather_sigma)
+
+        # Hard interior: deeply erode so only the clear center survives at alpha=1.0
+        kernel_interior = np.ones((7, 7), np.uint8)
+        interior_mask = cv2.erode(binary_mask, kernel_interior, iterations=3).astype(np.float32)
+
+        # Merge: boundary feathering everywhere, interior locked at 1.0
+        alpha = np.maximum(alpha_soft, interior_mask)
         alpha = np.clip(alpha, 0.0, 1.0)
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
-        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
+        print(f" -> Compositing: interior=hard(1.0) + boundary=feather(sigma={feather_sigma}px)")
 
 
         # --- Pre-compositing diagnostics ---
