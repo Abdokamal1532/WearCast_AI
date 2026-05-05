@@ -504,8 +504,10 @@ class WearCastHD:
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
         
-        # Ensure RGB mode and matching sizes
-        gen_final = np.array(raw_generated.convert('RGB')).astype(np.float32)
+        # CRITICAL FIX: use the luminance-corrected gen_arr, NOT raw_generated.
+        # Previously this line re-read raw_generated, silently discarding the entire
+        # luminance shift (e.g. -44.9 for dark garments) that was applied to gen_arr above.
+        gen_final = np.clip(gen_arr, 0, 255)   # already corrected + clipped above
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
         
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
