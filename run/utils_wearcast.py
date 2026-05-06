@@ -80,19 +80,20 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     scale_factor = height / 512.0
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
     
-    # OpenPose: 2=RShoulder, 5=LShoulder
+    # OpenPose: 2=RShoulder, 5=LShoulder, 3=RElbow, 6=LElbow
     s_r, s_l = pt(2), pt(5)   # Shoulders
+    e_r, e_l = pt(3), pt(6)   # Elbows
     
     # ============================================================
-    # T-SHIRT ONLY OPTIMIZATION: CONVEX HULL (Shoulders Only)
+    # SLEEVE-SUPPORT OPTIMIZATION: CONVEX HULL (Shoulders + Elbows)
     # ============================================================
     hull_pts = []
     valid = lambda p: p[0] > 1 and p[1] > 1
     
-    # Smaller lateral padding for T-shirts (15px instead of 60)
-    ARM_PAD = int(15 / 512 * height) 
+    # Moderate lateral padding for T-shirt sleeves (25px)
+    ARM_PAD = int(25 / 512 * height) 
     
-    for p in [s_r, s_l]:
+    for p in [s_r, s_l, e_r, e_l]:
         if valid(p):
             hull_pts.append([p[0] + ARM_PAD, p[1]])
             hull_pts.append([p[0] - ARM_PAD, p[1]])
@@ -123,8 +124,15 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     # FINAL PROTECTION: Remove head AND forearm area
     inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(head_only)).astype(np.float32)
     
-    # Stricter arm protection for short sleeves
-    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(arms_labels * 0.9)).astype(np.float32)
+    # Forearm Protection: Only protect arms BELOW the elbow level to allow sleeves
+    forearm_protection = np.zeros_like(arms_labels)
+    for e_pt in [e_r, e_l]:
+        if valid(e_pt):
+            elbow_y = int(e_pt[1])
+            forearm_protection[elbow_y + 20:, :] = 1
+    
+    arms_to_protect = np.logical_and(arms_labels, forearm_protection)
+    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(arms_to_protect * 0.95)).astype(np.float32)
     
     # Smooth with small kernel
     inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8), iterations=1)
