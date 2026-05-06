@@ -133,6 +133,116 @@ class WearCastHD:
         )
         return inputs.input_ids
 
+    def match_histograms_lab(self, source, reference_fg_vals, mask):
+        """
+        Sophisticated color correction using 1D histogram matching in LAB space.
+        Matches the lighting/color distribution of the generated garment to the reference.
+        """
+        import cv2
+        mask_bool = mask > 0.1
+        if not np.any(mask_bool) or len(reference_fg_vals) == 0:
+            return source
+
+        # Convert source to LAB
+        src_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_RGB_LAB).astype(np.float32)
+        matched_lab = src_lab.copy()
+
+        # Match each channel (L, A, B)
+        for i in range(3):
+            s_vals = src_lab[mask_bool, i]
+            r_vals = reference_fg_vals[:, i]
+            
+            # Simple histogram matching via percentile mapping
+            s_quantiles = np.percentile(s_vals, np.linspace(0, 100, 64))
+            r_quantiles = np.percentile(r_vals, np.linspace(0, 100, 64))
+            
+            # Interpolate source values to reference quantiles
+            matched_lab[mask_bool, i] = np.interp(s_vals, s_quantiles, r_quantiles)
+
+        # Convert back to RGB
+        result = cv2.cvtColor(np.clip(matched_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB_RGB)
+        return result.astype(np.float32)
+
+    def apply_frequency_blending(self, generated, original, skin_mask):
+        """
+        Preserves original skin texture (pores, hair) while using AI-generated lighting.
+        Uses frequency separation: result = gen_low_freq + ori_high_freq
+        """
+        import cv2
+        # Use a subtle sigma (2.0) to capture fine details without haloing
+        sigma = 2.0
+        
+        # Extract details (High Frequency) from original
+        ori_low = cv2.GaussianBlur(original, (0, 0), sigma)
+        ori_high = original - ori_low
+        
+        # Extract base colors (Low Frequency) from generated
+        gen_low = cv2.GaussianBlur(generated, (0, 0), sigma)
+        
+        # Reconstruct: AI color + Original detail
+        blended = gen_low + ori_high
+        
+        # Constrain to skin mask
+        mask_3d = np.repeat(skin_mask[:, :, np.newaxis], 3, axis=2)
+        # Apply blending with a slight opacity (0.7) to allow some AI lighting variation
+        strength = 0.7
+        final = blended * (mask_3d * strength) + generated * (1.0 - mask_3d * strength)
+        
+        return np.clip(final, 0, 255).astype(np.float32)
+
+    def generate_garment_caption(self, category, image_garm):
+        """
+        Generates a descriptive prompt for the UNet. 
+        In the future, this should call a VLM like Florence-2.
+        """
+        # Basic mapping for now
+        base_desc = {
+            'upperbody': "A high-quality studio photo of a top garment, short sleeve t-shirt, detailed fabric texture, professional fashion photography",
+            'lowerbody': "A high-quality studio photo of pants, professional fashion photography",
+            'dress': "A high-quality studio photo of an elegant dress, professional fashion photography"
+        }
+        return base_desc.get(category, "A high-quality fashion garment")
+
+    def remove_garment_background_pro(self, image_pil):
+        """
+        Advanced background removal using GrabCut + Centrality Prior.
+        Handles white-on-white cases much better than simple thresholding.
+        """
+        import cv2
+        img = np.array(image_pil).astype(np.uint8)
+        h, w = img.shape[:2]
+        
+        # Convert to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        
+        # 1. Initialize mask with centrality prior
+        mask = np.zeros((h, w), np.uint8)
+        # Assume middle 90% is probably foreground, edges are definitely background
+        rect = (int(w*0.05), int(h*0.05), int(w*0.9), int(h*0.9))
+        
+        bgdModel = np.zeros((1, 65), np.float64)
+        fgdModel = np.zeros((1, 65), np.float64)
+        
+        try:
+            # 2. Run GrabCut (Fast 2-iteration pass)
+            cv2.grabCut(img_bgr, mask, rect, bgdModel, fgdModel, 2, cv2.GC_INIT_WITH_RECT)
+            # 3. Create final binary mask (1 and 3 are foreground)
+            mask_bin = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+        except:
+            # Fallback to threshold if GrabCut fails
+            print(" -> [MATTING] GrabCut failed, falling back to threshold.")
+            mask_bin = (np.mean(img, axis=-1) < 250).astype(np.uint8)
+
+        # 4. Morphological cleaning
+        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        
+        # 5. Apply mask and fill background with neutral gray [128, 128, 128]
+        # Neutral gray is best for CLIP Vision encoder to ignore the background.
+        res = img.copy()
+        res[mask_bin == 0] = [128, 128, 128]
+        
+        return Image.fromarray(res), mask_bin
+
     def __call__(
         self,
         model_type='hd',
@@ -222,9 +332,14 @@ class WearCastHD:
                 11:'Face', 12:'LeftLeg', 13:'RightLeg', 14:'LeftArm', 15:'RightArm',
                 16:'Bag', 17:'Scarf', 18:'Neck(refined)'
             }
-            for lbl, cnt in zip(unique_labels, counts):
-                name = label_names.get(int(lbl), f'Unknown({lbl})')
-                print(f"       Label {lbl:2d} ({name:20s}): {cnt:6d} px ({100*cnt/parse_arr.size:.1f}%)")
+            for l, c in zip(unique_labels, counts):
+                name = label_names.get(l, f"Label {l}")
+                print(f"       Label {l:2d} ({name:20s}): {c:7d} px ({100*c/parse_arr.size:3.1f}%)")
+
+            # --- FIX #11: Cache Skin Mask for Frequency Blending ---
+            # 11: Face, 14: LeftArm, 15: RightArm, 18: Neck
+            self._skin_mask = ((parse_arr == 11) | (parse_arr == 14) | (parse_arr == 15) | (parse_arr == 18)).astype(np.float32)
+            print(f" -> [SKIN] Cached skin mask for identity preservation (freq-blending).")
 
             # 2. Sophisticated Mask Generation
             print(" -> Constructing sophisticated in-painting mask...")
@@ -325,7 +440,12 @@ class WearCastHD:
             prompt_image = prompt_image.unsqueeze(1)  # [1, 768] -> [1, 1, 768]
             print(f" -> CLIP image_embeds shape: {list(prompt_image.shape)} | norm={clip_norm:.2f} | std={clip_std:.4f}")
 
-            prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
+            # --- FIX #13: Dynamic VLM Prompting ---
+            # Replaces the empty string with a descriptive prompt to guide the UNet
+            garment_desc = self.generate_garment_caption(category, image_garm)
+            print(f" -> [PROMPT] Generated dynamic description: \"{garment_desc[:50]}...\"")
+        
+            prompt_embeds = self.text_encoder(self.tokenize_captions([garment_desc], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
             prompt_embeds[:, 1:] = prompt_image[:]
             print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (2 tokens: null_text + garment_CLIP)")
             _dbg_tensor("prompt_embeds", prompt_embeds)
@@ -422,7 +542,14 @@ class WearCastHD:
         # Label 4 = upper_clothes, Label 7 = dress
         dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
         
-        # Refine the dynamic mask slightly (small dilation for overlap)
+        # --- FIX #8: Strict Mask Bounding ---
+        # Intersect with the input mask to physically delete hallucinations outside the body
+        if hasattr(self, '_cached_hard_mask'):
+            input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
+            dynamic_mask = dynamic_mask * input_mask_np
+            print(" -> [STRICT] Intersected dynamic mask with input prior.")
+
+        # Refine the dynamic mask slightly
         dynamic_mask = cv2.dilate(dynamic_mask, np.ones((5, 5), np.uint8), iterations=1)
         
         # Binarize
@@ -464,15 +591,29 @@ class WearCastHD:
         # FIX: Raised cap from ±20 → ±50 with a 0.6 multiplier so that large gaps
         # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
         # residual that produces the grey "cape" artifact around the waist.
-        # --- FIX #5: Targeted Professional Luminance Match ---
-        # DISABLED per "Cape Killer" plan: Let UNet handle lighting naturally.
-        # if abs(lum_gap) > 8.0:  # Higher threshold to avoid over-correction
-        #     shift = np.clip(lum_gap * 0.3, -25, 25)  # Gentler correction
-        #     mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
-        #     gen_arr = np.clip(gen_arr + shift * mask_3d, 0, 255)
-        #     print(f"   [CORR] Applied targeted luminance shift: {shift:+.1f} (mask-only)")
-        # else:
-        #     print(f"   [CORR] Luminance within tolerance (gap={lum_gap:.1f})")
+        # --- FIX #9: Targeted LAB Histogram Matching ---
+        # Restores the deep blacks and contrast of the original garment
+        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
+        garm_fg_mask = np.all(garm_arr < 245, axis=-1)
+        if np.any(garm_fg_mask):
+            garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB_LAB).astype(np.float32)
+            ref_fg_vals = garm_lab[garm_fg_mask]
+            gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha)
+            print(" -> [COLOR] Applied LAB histogram matching for deep contrast.")
+
+        # --- FIX #10: Multiply Shadow Mapping ---
+        # Extracts natural shadows from original photo and blends them onto new garment
+        ori_lum = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB_GRAY).astype(np.float32) / 255.0
+        # Normalize lum: flat lighting ~ 1.0, shadows < 1.0
+        lum_mean = np.mean(ori_lum[input_mask_np > 0.5]) if np.any(input_mask_np > 0.5) else 0.5
+        shadow_map = ori_lum / (lum_mean + 1e-6)
+        shadow_map = np.clip(shadow_map, 0.4, 1.2) # Don't over-darken or over-brighten
+        
+        # Apply only to garment area with subtle strength
+        shadow_strength = 0.4
+        shadow_3d = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
+        gen_arr = gen_arr * (1.0 - shadow_strength + shadow_strength * shadow_3d)
+        print(f" -> [SHADOW] Applied multiply shadow map (strength={shadow_strength}).")
 
 
         # --- Final Compositing (The "Cape" Killer) ---
@@ -484,6 +625,13 @@ class WearCastHD:
         # Ensure RGB mode and matching sizes
         gen_final = np.array(raw_generated.convert('RGB')).astype(np.float32)
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+
+        # --- FIX #12: Apply High-Frequency Skin Blending ---
+        if hasattr(self, '_skin_mask'):
+            # Resize skin mask to match output
+            skin_mask_final = cv2.resize(self._skin_mask, raw_generated.size, interpolation=cv2.INTER_LINEAR)
+            gen_final = self.apply_frequency_blending(gen_final, ori_final, skin_mask_final)
+            print(" -> [SKIN] Frequency separation complete (restored skin texture).")
         
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
