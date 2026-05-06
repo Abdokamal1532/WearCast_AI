@@ -250,6 +250,7 @@ class WearCastHD:
         # 4: upper_clothes, 7: dress, 17: scarf
         target_area = (parse_array == 4).astype(np.float32) + \
                       (parse_array == 7).astype(np.float32) + \
+                      (parse_array == 11).astype(np.float32) + \
                       (parse_array == 17).astype(np.float32)
 
         # Labels to PROTECT (Face, Hair, and Arms as much as possible)
@@ -331,11 +332,21 @@ class WearCastHD:
         filled = self.hole_fill(np.where(inpaint_mask, 255, 0).astype(np.uint8))
         dst = self.refine_mask(filled)
         
-        # Soft feathered mask for smooth skin blending
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (11, 11), 3) 
+        # Smoothing & Refinement
+        # We use a slight dilation to ensure the old garment is fully covered
+        kernel_dilate = np.ones((7, 7), np.uint8)
+        mask_hard = cv2.dilate(dst.astype(np.uint8), kernel_dilate, iterations=1)
+        
+        # Open operation to remove small noise
+        kernel_open = np.ones((5, 5), np.uint8)
+        mask_hard = cv2.morphologyEx(mask_hard, cv2.MORPH_OPEN, kernel_open)
+        
+        # Feather the edges slightly (5x5 instead of 11x11) 
+        # This keeps the center of the mask SOLID (1.0) to prevent ghosting
+        mask_soft = cv2.GaussianBlur(mask_hard.astype(np.float32), (5, 5), 0)
         inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
         percentage = 100 * np.sum(dst > 0) / (width * height)
         print(f" -> Optimized Mask: {percentage:.1f}% coverage. Restricted to torso/shoulders.")
         
-        return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
+        return Image.fromarray(mask_hard), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
