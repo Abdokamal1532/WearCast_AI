@@ -149,8 +149,8 @@ class WearCastHD:
                 mask_hard.save(os.path.join(output_dir, "debug_phase1_hard_mask.jpg"))
                 mask_soft.save(os.path.join(output_dir, "debug_phase1_soft_mask.jpg"))
             
-            mask = mask.resize((768, 1024), Image.NEAREST)
-            print(" -> Preprocessing Stage: SUCCESS")
+            mask_res = mask.resize((768, 1024), Image.NEAREST)
+            print(f" -> Preprocessing Stage: SUCCESS (Final Mask Size: {mask_res.size})")
 
         print(f"[WearCast] Phase 2/4: Encoding Inputs (VAE & CLIP Vision)...")
         with torch.no_grad():
@@ -180,7 +180,7 @@ class WearCastHD:
             images = self.pipe(prompt_embeds=prompt_embeds,
                         image_garm=image_garm,
                         image_vton=image_vton, 
-                        mask=mask,
+                        mask=mask_res,
                         image_ori=image_ori,
                         num_inference_steps=num_steps,
                         image_guidance_scale=image_scale,

@@ -133,8 +133,15 @@ def test_tryon(person_path=None, garment_path=None):
                             else:
                                 print(f"🚀 [{status.upper()}] {msg} | Remaining: {rem}s")
 
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as je:
+                            print(f"⚠️ [DEBUG] Failed to decode SSE line: {decoded_line} | Error: {je}")
                             pass
+                    elif decoded_line.startswith(":"):
+                        # This is a comment/ping, just ignore or print in debug
+                        # print(f"  (ping: {decoded_line[1:].strip()})")
+                        pass
+                    else:
+                        print(f"❓ [DEBUG] Unknown line type: {decoded_line}")
 
         if not result_url:
             print("❌ Error: Stream ended without a result URL.")
@@ -180,7 +187,9 @@ def test_tryon(person_path=None, garment_path=None):
         print(f"\n✨ [ALL DONE] Analysis Complete. Inspect results in: {debug_dir}")
 
     except Exception as e:
-        print(f"💥 Error: {e}")
+        print(f"\n💥 [CRITICAL ERROR] {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WearCast AI API Professional Test Client")
