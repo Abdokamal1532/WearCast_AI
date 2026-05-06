@@ -53,99 +53,108 @@ def refine_mask(mask):
 
     return refine_mask
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384,height=512):
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
     im_parse = model_parse.resize((width, height), Image.NEAREST)
     parse_array = np.array(im_parse)
 
-    arm_width = 60
-
-    parse_head = (parse_array == 1).astype(np.float32) + \
-                 (parse_array == 3).astype(np.float32) + \
-                 (parse_array == 11).astype(np.float32)
-
-    parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
-                        (parse_array == label_map["right_shoe"]).astype(np.float32) + \
-                        (parse_array == label_map["hat"]).astype(np.float32) + \
-                        (parse_array == label_map["sunglasses"]).astype(np.float32) + \
-                        (parse_array == label_map["bag"]).astype(np.float32)
-
-    parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
-
-    arms_left = (parse_array == 14).astype(np.float32)
-    arms_right = (parse_array == 15).astype(np.float32)
-    arms = arms_left + arms_right
-
-    parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
-    parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + \
-                                    (parse_array == label_map["pants"]).astype(np.float32)
-    parser_mask_fixed += parser_mask_fixed_lower_cloth
-    parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
-
-    # Load pose points
-    pose_data = keypoint["pose_keypoints_2d"]
-    pose_data = np.array(pose_data)
-    pose_data = pose_data.reshape((-1, 2))
-
-    im_arms_left = Image.new('L', (width, height))
-    im_arms_right = Image.new('L', (width, height))
-    arms_draw_left = ImageDraw.Draw(im_arms_left)
-    arms_draw_right = ImageDraw.Draw(im_arms_right)
-    # IMPORTANT: Calculate scale based on the actual height of model_parse (source image)
-    # instead of hardcoding 512.0. This fixes the pose-offset bug.
-    source_height = model_parse.height
-    scale_factor = height / float(source_height)
-
-    shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
-    shoulder_left = np.multiply(tuple(pose_data[5][:2]), scale_factor)
-    elbow_right = np.multiply(tuple(pose_data[3][:2]), scale_factor)
-    elbow_left = np.multiply(tuple(pose_data[6][:2]), scale_factor)
-    wrist_right = np.multiply(tuple(pose_data[4][:2]), scale_factor)
-    wrist_left = np.multiply(tuple(pose_data[7][:2]), scale_factor)
-    ARM_LINE_WIDTH = int(arm_width / 512 * height)
-    size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
-    size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
-                  shoulder_right[1] + ARM_LINE_WIDTH // 2]
+    # 2. High-Accuracy Pose-Guided Mask Generation (Optimized for "T-shirt Only")
+    print(" -> Constructing High-Precision Mask (Target: Tshirt Only)...")
     
+    # Labels to TARGET for generation (core clothes)
+    # 4: upper_clothes, 7: dress, 17: scarf
+    target_area = (parse_array == 4).astype(np.float32) + \
+                  (parse_array == 7).astype(np.float32) + \
+                  (parse_array == 17).astype(np.float32)
 
-    if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
-        im_arms_right = arms_right
-    else:
-        wrist_right = extend_arm_mask(wrist_right, elbow_right, 1.2)
-        arms_draw_right.line(np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-        arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+    # Labels to PROTECT (Face, Hair, and Arms as much as possible)
+    head_only = (parse_array == 1).astype(np.float32) + \
+                (parse_array == 3).astype(np.float32) + \
+                (parse_array == 11).astype(np.float32)
+    
+    # Arm labels to protect
+    arms_labels = (parse_array == 14).astype(np.float32) + (parse_array == 15).astype(np.float32)
+    
+    # Pose keypoints
+    pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
+    # Correct scale factor calculation
+    scale_factor = height / 512.0
+    pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
+    
+    # OpenPose: 2=RShoulder, 5=LShoulder
+    s_r, s_l = pt(2), pt(5)   # Shoulders
+    
+    # ============================================================
+    # T-SHIRT ONLY OPTIMIZATION: CONVEX HULL (Shoulders Only)
+    # ============================================================
+    hull_pts = []
+    valid = lambda p: p[0] > 1 and p[1] > 1
+    
+    # Smaller lateral padding for T-shirts (15px instead of 60)
+    ARM_PAD = int(15 / 512 * height) 
+    
+    for p in [s_r, s_l]:
+        if valid(p):
+            hull_pts.append([p[0] + ARM_PAD, p[1]])
+            hull_pts.append([p[0] - ARM_PAD, p[1]])
+    
+    inpaint_mask = target_area.copy()
+    torso_pixels = np.column_stack(np.where(target_area > 0))
+    
+    if len(torso_pixels) > 5 and len(hull_pts) >= 3:
+        torso_xy = torso_pixels[:, [1, 0]]
+        if len(torso_xy) > 600:
+            idx = np.random.choice(len(torso_xy), 600, replace=False)
+            torso_xy = torso_xy[idx]
+        
+        all_pts = np.vstack([torso_xy, np.array(hull_pts)]).astype(np.float32)
+        hull = cv2.convexHull(all_pts)
+        hull_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
+        
+        inpaint_mask = np.logical_or(inpaint_mask, hull_mask / 255.0).astype(np.float32)
+    elif len(torso_pixels) > 5:
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
 
-    if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
-        im_arms_left = arms_left
-    else:
-        wrist_left = extend_arm_mask(wrist_left, elbow_left, 1.2)
-        arms_draw_left.line(np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-        arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+    # Neck region: Conservative (1px dilation)
+    neck_area = (parse_array == 18).astype(np.float32)
+    neck_tight = cv2.dilate(neck_area, np.ones((1, 1), np.uint8), iterations=1)
+    inpaint_mask = np.logical_or(inpaint_mask, neck_tight).astype(np.float32)
 
-    hands_left = np.logical_and(np.logical_not(im_arms_left), arms_left)
-    hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
-    parser_mask_fixed += hands_left + hands_right
+    # FINAL PROTECTION: Remove head AND forearm area
+    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(head_only)).astype(np.float32)
+    
+    # Stricter arm protection for short sleeves
+    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(arms_labels * 0.9)).astype(np.float32)
+    
+    # Smooth with small kernel
+    inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8), iterations=1)
 
-    parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-    parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
-    neck_mask = (parse_array == 18).astype(np.float32)
-    neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
-    neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
-    parse_mask = np.logical_or(parse_mask, neck_mask)
-    arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
-    parse_mask += np.logical_or(parse_mask, arm_mask)
+    # Hole fill + largest-contour refinement
+    def hole_fill_local(img):
+        img = np.pad(img[1:-1, 1:-1], pad_width=1, mode='constant', constant_values=0)
+        img_copy = img.copy()
+        mask_fill = np.zeros((img.shape[0] + 2, img.shape[1] + 2), dtype=np.uint8)
+        cv2.floodFill(img, mask_fill, (0, 0), 255)
+        img_inverse = cv2.bitwise_not(img)
+        dst_fill = cv2.bitwise_or(img_copy, img_inverse)
+        return dst_fill
 
-    parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
+    def refine_mask_local(mask_ref):
+        cnts, _ = cv2.findContours(mask_ref.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1)
+        areas = [abs(cv2.contourArea(c, True)) for c in cnts]
+        refined_mask = np.zeros_like(mask_ref).astype(np.uint8)
+        if len(areas) != 0:
+            idx_max = areas.index(max(areas))
+            cv2.drawContours(refined_mask, cnts, idx_max, color=255, thickness=-1)
+        return refined_mask
 
-    parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
-    inpaint_mask = 1 - parse_mask_total
-    img = np.where(inpaint_mask, 255, 0)
-    dst = hole_fill(img.astype(np.uint8))
-    dst = refine_mask(dst)
-    inpaint_mask = dst / 255 * 1
-    mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
-    mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
+    filled = hole_fill_local(np.where(inpaint_mask, 255, 0).astype(np.uint8))
+    dst = refine_mask_local(filled)
+    
+    mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (11, 11), 3) 
+    inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
-    return mask, mask_gray
+    return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
 
 def smart_resize(img: Image.Image, target_size=(768, 1024), fill_color=(255, 255, 255)):
     """

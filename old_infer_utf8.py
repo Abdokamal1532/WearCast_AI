@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import sys
 import os
 import torch
@@ -66,11 +66,11 @@ class WearCastHD:
         self.auto_processor = AutoProcessor.from_pretrained(VIT_PATH)
         self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH).to(self.gpu_id)
         
-        # Load scheduler explicitly
+        # Load scheduler explicitly to avoid from_config auto-load lists
         from diffusers import DDPMScheduler
         scheduler = DDPMScheduler.from_pretrained(MODEL_PATH, subfolder="scheduler")
 
-        # 5. Initialize Pipeline
+        # 5. Initialize Pipeline DIRECTLY (Bypass broken loaders)
         print("Assembling WearCast Pipeline...")
         self.pipe = WearCastPipeline(
             vae=vae,
@@ -84,7 +84,7 @@ class WearCastHD:
             requires_safety_checker=False,
         ).to(self.gpu_id)
 
-        # Use UniPC for inference
+        # Ensure we use UniPC for inference as per original OOTD
         from diffusers import UniPCMultistepScheduler
         self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
 
@@ -105,7 +105,6 @@ class WearCastHD:
                 num_steps=20,
                 image_scale=1.0,
                 seed=-1,
-                **kwargs # For callback/callback_steps
     ):
         if seed == -1:
             random.seed(time.time())
@@ -147,27 +146,40 @@ class WearCastHD:
 
         print(f"[WearCast] Phase 2/4: Encoding Inputs (VAE & CLIP Vision)...")
         with torch.no_grad():
+            # -------------------------------------------------------
+            # GARMENT PREPROCESSING: Remove white product background
+            # so CLIP can CLEARLY distinguish white garment fabric
+            # from the white product-shot background.
+            #
+            # Without this: white-shirt-on-white-bg ΓåÆ CLIP encodes
+            # ambiguous features ΓåÆ model generates GRAY instead of WHITE.
+            # With this: pure white bg ΓåÆ replaced with mid-gray (160) ΓåÆ
+            # CLIP sees white fabric as a distinct signal.
+            # -------------------------------------------------------
             from PIL import ImageEnhance
             garm_np = np.array(image_garm.copy())
-            # Detect near-white background
+            # Detect near-white background: all channels >= 240
             bg_mask = np.all(garm_np >= 240, axis=-1)
-            if bg_mask.mean() > 0.05:
+            if bg_mask.mean() > 0.05:  # Only if > 5% of image is white bg
                 print(f" -> White product background detected ({100*bg_mask.mean():.1f}% coverage), replacing with mid-gray for CLIP...")
                 garm_np_proc = garm_np.copy()
-                garm_np_proc[bg_mask] = [160, 160, 160]
+                garm_np_proc[bg_mask] = [160, 160, 160]  # Neutral gray
                 garm_proc = Image.fromarray(garm_np_proc)
             else:
                 garm_proc = image_garm.copy()
-            
+            # Sharpness + Contrast boost for richer texture features
             garm_enhanced = ImageEnhance.Sharpness(garm_proc).enhance(1.8)
             garm_enhanced = ImageEnhance.Contrast(garm_enhanced).enhance(1.3)
+            print(f" -> Garment CLIP features extracted with enhanced preprocessing.")
 
+            # Explicitly cast to half (float16) for T4 GPU compatibility
             prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
             prompt_image = self.image_encoder(prompt_image.data['pixel_values'].to(dtype=torch.float16)).image_embeds
             prompt_image = prompt_image.unsqueeze(1)
             
             prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
             prompt_embeds[:, 1:] = prompt_image[:]
+            print(f" -> CLIP Embedding shape: {prompt_embeds.shape}")
 
             print(f"[WearCast] Phase 3/4: Starting Denoising Diffusion (U-Net)...")
             images = self.pipe(prompt_embeds=prompt_embeds,
@@ -179,12 +191,15 @@ class WearCastHD:
                         image_guidance_scale=image_scale,
                         num_images_per_prompt=num_samples,
                         generator=generator,
-                        **kwargs
             ).images
             print(f"[WearCast] Phase 4/4: Final Post-processing...")
             print("[WearCast] SUCCESS: Inference completed successfully!")
 
         return images
+
+    def extend_arm_mask(self, wrist, elbow, scale):
+        wrist = elbow + scale * (wrist - elbow)
+        return wrist
 
     def hole_fill(self, img):
         img = np.pad(img[1:-1, 1:-1], pad_width=1, mode='constant', constant_values=0)
@@ -212,86 +227,96 @@ class WearCastHD:
         im_parse = model_parse.resize((width, height), Image.NEAREST)
         parse_array = np.array(im_parse)
 
-        # 2. High-Accuracy Pose-Guided Mask Generation (Optimized for "T-shirt Only")
-        print(" -> Constructing High-Precision Mask (Target: Tshirt Only)...")
+        # 2. High-Accuracy Pose-Guided Mask Generation
+        print(" -> Constructing High-Accuracy Mask (Convex Hull + Pose-Guided)...")
         
         # Labels to TARGET for generation (core clothes)
-        # 4: upper_clothes, 7: dress, 17: scarf
+        # 4: upper_clothes, 7: dress, 17: scarf, 14: left_arm, 15: right_arm (include arms for sleeves)
         target_area = (parse_array == 4).astype(np.float32) + \
                       (parse_array == 7).astype(np.float32) + \
                       (parse_array == 17).astype(np.float32)
 
-        # Labels to PROTECT (Face, Hair, and Arms as much as possible)
+        # Labels to PROTECT (Face, Hair only ΓÇö NOT neck, NOT arms)
         head_only = (parse_array == 1).astype(np.float32) + \
                     (parse_array == 2).astype(np.float32) + \
                     (parse_array == 11).astype(np.float32)
         
-        # Arm labels to protect
-        arms_labels = (parse_array == 14).astype(np.float32) + (parse_array == 15).astype(np.float32)
-        
         # Pose keypoints
         pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
         pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), height / 512.0)
-        
-        # OpenPose: 2=RShoulder, 5=LShoulder (Elbows intentionally omitted to avoid over-masking)
+        # OpenPose: 2=RShoulder, 5=LShoulder, 3=RElbow, 6=LElbow, 4=RWrist, 7=LWrist
         s_r, s_l = pt(2), pt(5)   # Shoulders
+        e_r, e_l = pt(3), pt(6)   # Elbows
         
         # ============================================================
-        # T-SHIRT ONLY OPTIMIZATION: CONVEX HULL (Shoulders Only)
+        # ROOT-CAUSE FIX: CONVEX HULL GARMENT MASK
+        # Drawing disconnected sleeve LINES creates "cold shoulder" holes.
+        # Instead, we collect all boundary points (torso pixels + pose
+        # keypoints) and wrap them in ONE solid convex polygon.
+        # This guarantees anatomical continuity - no disconnected regions.
         # ============================================================
-        hull_pts = []
+        
+        # Seed points from semantic parsing
+        torso_pixels = np.column_stack(np.where(target_area > 0))  # (row, col)
+        
+        # Keypoint boundary points (x=col, y=row) with lateral padding
+        ARM_PAD = int(38 / 512 * height)
         valid = lambda p: p[0] > 1 and p[1] > 1
         
-        # Smaller lateral padding for T-shirts (15px instead of 38)
-        ARM_PAD = int(15 / 512 * height) 
-        
-        for p in [s_r, s_l]:
+        hull_pts = []
+        for p in [s_r, s_l, e_r, e_l]:
             if valid(p):
+                # p is (x, y) where x=col, y=row
                 hull_pts.append([p[0] + ARM_PAD, p[1]])
                 hull_pts.append([p[0] - ARM_PAD, p[1]])
         
+        # Build the garment mask
         inpaint_mask = target_area.copy()
-        torso_pixels = np.column_stack(np.where(target_area > 0))
         
         if len(torso_pixels) > 5 and len(hull_pts) >= 3:
+            # torso_pixels: (row, col) -> convert to (col, row) = (x, y)
             torso_xy = torso_pixels[:, [1, 0]]
+            
+            # Subsample for speed
             if len(torso_xy) > 600:
                 idx = np.random.choice(len(torso_xy), 600, replace=False)
                 torso_xy = torso_xy[idx]
             
             all_pts = np.vstack([torso_xy, np.array(hull_pts)]).astype(np.float32)
+            
+            # Convex hull wraps everything into one solid region
             hull = cv2.convexHull(all_pts)
             hull_mask = np.zeros((height, width), dtype=np.uint8)
             cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
             
+            # Union: parsing labels + convex hull
             inpaint_mask = np.logical_or(inpaint_mask, hull_mask / 255.0).astype(np.float32)
         elif len(torso_pixels) > 5:
-            # Fallback: moderate dilation
-            inpaint_mask = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
+            # Fallback: just dilate the torso heavily if pose is missing
+            inpaint_mask = cv2.dilate(inpaint_mask, np.ones((31, 31), np.uint8), iterations=2)
 
-        # Neck region: Extremely conservative (1px dilation)
+        # Add neck region - MINIMAL expansion (just 3px) to avoid choker artifact
+        # We only want to barely expose the collar area, NOT create a visible neck band
         neck_area = (parse_array == 18).astype(np.float32)
-        neck_tight = cv2.dilate(neck_area, np.ones((1, 1), np.uint8), iterations=1)
-        inpaint_mask = np.logical_or(inpaint_mask, neck_tight).astype(np.float32)
+        neck_expanded = cv2.dilate(neck_area, np.ones((3, 3), np.uint8), iterations=1)
+        inpaint_mask = np.logical_or(inpaint_mask, neck_expanded).astype(np.float32)
 
-        # FINAL PROTECTION: Remove head AND forearm area
+        # FINAL GUARD: protect only face/hair ΓÇö allow arms and neck
         inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(head_only)).astype(np.float32)
         
-        # Stricter arm protection for short sleeves
-        inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(arms_labels * 0.9)).astype(np.float32)
-        
-        # Smooth with small kernel
-        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8), iterations=1)
+        # Light dilation to smooth jagged edges from the convex hull
+        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((11, 11), np.uint8), iterations=1)
 
         # Hole fill + largest-contour refinement
         filled = self.hole_fill(np.where(inpaint_mask, 255, 0).astype(np.uint8))
         dst = self.refine_mask(filled)
         
-        # Soft feathered mask for smooth skin blending
-        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (11, 11), 3) 
+        # Soft feathered mask for smooth final blending at skin edges
+        mask_soft = cv2.GaussianBlur(dst.astype(np.float32), (21, 21), 7)
         inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
+        # Diagnostic
         percentage = 100 * np.sum(dst > 0) / (width * height)
-        print(f" -> Optimized Mask: {percentage:.1f}% coverage. Restricted to torso/shoulders.")
+        print(f" -> Convex Hull Mask: {percentage:.1f}% coverage. Solid connected region, no holes.")
         
         return Image.fromarray(dst), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
