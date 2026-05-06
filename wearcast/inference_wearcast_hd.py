@@ -144,7 +144,7 @@ class WearCastHD:
             return source
 
         # Convert source to LAB
-        src_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_RGB_LAB).astype(np.float32)
+        src_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         matched_lab = src_lab.copy()
 
         # Match each channel (L, A, B)
@@ -160,7 +160,7 @@ class WearCastHD:
             matched_lab[mask_bool, i] = np.interp(s_vals, s_quantiles, r_quantiles)
 
         # Convert back to RGB
-        result = cv2.cvtColor(np.clip(matched_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB_RGB)
+        result = cv2.cvtColor(np.clip(matched_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
         return result.astype(np.float32)
 
     def apply_frequency_blending(self, generated, original, skin_mask):
@@ -596,7 +596,7 @@ class WearCastHD:
         garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
         garm_fg_mask = np.all(garm_arr < 245, axis=-1)
         if np.any(garm_fg_mask):
-            garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB_LAB).astype(np.float32)
+            garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
             ref_fg_vals = garm_lab[garm_fg_mask]
             gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha)
             print(" -> [COLOR] Applied LAB histogram matching for deep contrast.")
