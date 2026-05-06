@@ -153,9 +153,9 @@ class WearCastHD:
 
     def apply_logo_warping(self, image_garm, person_keypoints, generated_image, target_mask):
         """
-        [PRODUCTION MASTER] Global TPS Geometric Warping
-        Detects ANY logos/text ANYWHERE on the shirt automatically,
-        and gracefully warps the entire pattern onto the body.
+        [ULTIMATE PRODUCTION] UNet-Guided Feature Transfer
+        Automatically detects features (logos/patterns) and uses the UNet's
+        generated output to guide their perfect placement and warping.
         """
         import cv2
         from PIL import Image
@@ -169,112 +169,98 @@ class WearCastHD:
         if len(mask_np.shape) == 3:
             mask_np = mask_np[:, :, 0]
             
-        if mask_np.max() > 2.0:
-            mask_np = mask_np.astype(np.float32) / 255.0
-        else:
-            mask_np = mask_np.astype(np.float32)
+        mask_np = mask_np.astype(np.float32) 
         
         h_gen, w_gen = gen_np.shape[:2]
         h_garm, w_garm = garm_np.shape[:2]
 
-        # ---------------------------------------------------------
-        # 1. GLOBAL LOGO EXTRACTION (No more hardcoded cropping)
-        # ---------------------------------------------------------
-        # Convert garment to float32 for safe math
+        # 1. SMART LOGO EXTRACTION (Source)
         garm_f32 = garm_np.astype(np.float32)
-        
-        # Determine background (assuming white studio background > 240)
         bg_mask = np.all(garm_f32 >= 240, axis=-1)
         fg_pixels = garm_f32[~bg_mask]
         
         if len(fg_pixels) < 100:
-             print(" -> [LOGO_WARP] Garment is completely white or empty. Skipping.")
              return generated_image
              
-        # Find the dominant "fabric" color of the whole shirt
         base_color = np.median(fg_pixels, axis=0)
-        
-        # Calculate color difference for the ENTIRE shirt
         color_diff = np.linalg.norm(garm_f32 - base_color, axis=-1)
-        
-        # Zero out the background so we don't warp studio whitespace
         color_diff[bg_mask] = 0
         
-        # Threshold: Anything > 20 difference from fabric color is a "Pattern/Logo/Text"
-        raw_logo_mask = (color_diff > 20).astype(np.uint8) * 255
+        # Adaptive thresholding
+        std_diff = np.std(color_diff[color_diff > 0])
+        thresh = max(15, std_diff * 0.7) 
         
-        # Protect thin lines and blur for a smooth alpha blend
-        logo_mask_dilated = cv2.dilate(raw_logo_mask, np.ones((3, 3), np.uint8), iterations=1)
-        logo_alpha_full = cv2.GaussianBlur(logo_mask_dilated, (3, 3), 0).astype(np.float32) / 255.0
-
-        # Check if we actually found any logos
-        if np.sum(logo_alpha_full) < 50:
-            print(" -> [LOGO_WARP] No distinct logos found globally. Skipping.")
+        raw_logo_mask = (color_diff > thresh).astype(np.uint8) * 255
+        
+        y_indices, x_indices = np.where(raw_logo_mask > 0)
+        if len(y_indices) < 50:
+            print(f" -> [LOGO_WARP] No distinct features found at threshold {thresh:.1f}. Skipping.")
             return generated_image
 
-        # ---------------------------------------------------------
-        # 2. GLOBAL WARPING (Mapping the whole shirt bounding box)
-        # ---------------------------------------------------------
-        # Find the bounding box of the actual shirt in the source image
-        y_indices, x_indices = np.where(~bg_mask)
-        if len(y_indices) == 0:
+        # 2. FEATURE TRACKING (Target Discovery via UNet Output)
+        gen_f32 = gen_np.astype(np.float32)
+        gen_fg_mask = mask_np > 0.5
+        
+        if not np.any(gen_fg_mask):
             return generated_image
             
-        src_min_y, src_max_y = np.min(y_indices), np.max(y_indices)
-        src_min_x, src_max_x = np.min(x_indices), np.max(x_indices)
+        gen_base_color = np.median(gen_f32[gen_fg_mask], axis=0)
+        gen_color_diff = np.linalg.norm(gen_f32 - gen_base_color, axis=-1)
+        gen_color_diff[~gen_fg_mask] = 0
         
-        # We warp the ENTIRE bounding box of the shirt, keeping proportions intact
-        src_pts = np.float32([
-            [src_min_x, src_min_y], [src_max_x, src_min_y],
-            [src_max_x, src_max_y], [src_min_x, src_max_y]
-        ])
-
-        # Define Target Landmarks on Person (from OpenPose)
-        kp = person_keypoints
-        if isinstance(kp, dict) and "pose_keypoints_2d" in kp:
-            kp = kp["pose_keypoints_2d"]
-            
-        scale_w = w_gen / 384.0
-        scale_h = h_gen / 512.0
+        # Look for where the UNet placed the pattern
+        gen_logo_mask = (gen_color_diff > (thresh * 0.6)).astype(np.uint8) * 255
+        gy, gx = np.where(gen_logo_mask > 0)
         
-        neck = [kp[1][0] * scale_w, kp[1][1] * scale_h]
-        r_sho = [kp[2][0] * scale_w, kp[2][1] * scale_h]
-        l_sho = [kp[5][0] * scale_w, kp[5][1] * scale_h]
-
-        if any(p[0] <= 1 for p in [neck, r_sho, l_sho]):
-            print(" -> [LOGO_WARP] Landmarks missing, skipping geometric transfer.")
-            return generated_image
-
-        # Find the bounding box of the target shirt mask on the person
-        ty_indices, tx_indices = np.where(mask_np > 0.5)
-        if len(ty_indices) == 0:
-            return generated_image
+        # 3. COORDINATE MAPPING
+        src_y_all, src_x_all = np.where(~bg_mask)
+        src_bbox = [np.min(src_x_all), np.min(src_y_all), np.max(src_x_all), np.max(src_y_all)]
+        logo_bbox = [np.min(x_indices), np.min(y_indices), np.max(x_indices), np.max(y_indices)]
+        
+        tgt_y_all, tgt_x_all = np.where(gen_fg_mask)
+        tgt_bbox = [np.min(tgt_x_all), np.min(tgt_y_all), np.max(tgt_x_all), np.max(tgt_y_all)]
+        
+        # Dynamic Alignment: Use UNet's placement if robust, else fallback to global
+        if len(gy) > 200:
+            print(" -> [LOGO_WARP] AI-Guided placement detected. Aligning graphics to UNet features.")
+            tx_min, tx_max = np.min(gx), np.max(gx)
+            ty_min, ty_max = np.min(gy), np.max(gy)
             
-        tgt_min_y, tgt_max_y = np.min(ty_indices), np.max(ty_indices)
-        tgt_min_x, tgt_max_x = np.min(tx_indices), np.max(tx_indices)
+            # Add small padding to prevent edge cropping
+            pw, ph = (tx_max - tx_min) * 0.05, (ty_max - ty_min) * 0.05
+            dst_pts = np.float32([
+                [tx_min - pw, ty_min - ph], [tx_max + pw, ty_min - ph],
+                [tx_max + pw, ty_max + ph], [tx_min - pw, ty_max + ph]
+            ])
+            src_pts = np.float32([
+                [logo_bbox[0], logo_bbox[1]], [logo_bbox[2], logo_bbox[1]],
+                [logo_bbox[2], logo_bbox[3]], [logo_bbox[0], logo_bbox[3]]
+            ])
+        else:
+            print(" -> [LOGO_WARP] Using global anatomical mapping.")
+            src_pts = np.float32([
+                [src_bbox[0], src_bbox[1]], [src_bbox[2], src_bbox[1]],
+                [src_bbox[2], src_bbox[3]], [src_bbox[0], src_bbox[3]]
+            ])
+            dst_pts = np.float32([
+                [tgt_bbox[0], tgt_bbox[1]], [tgt_bbox[2], tgt_bbox[1]],
+                [tgt_bbox[2], tgt_bbox[3]], [tgt_bbox[0], tgt_bbox[3]]
+            ])
 
-        # Map the source shirt corners to the target shirt corners
-        # This stretches the entire graphic exactly over the generated shirt
-        dst_pts = np.float32([
-            [tgt_min_x, tgt_min_y], [tgt_max_x, tgt_min_y],
-            [tgt_max_x, tgt_max_y], [tgt_min_x, tgt_max_y]
-        ])
-
-        # Apply Perspective Warp globally
+        # 4. WARP & BLEND
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         warped_garm = cv2.warpPerspective(garm_np, M, (w_gen, h_gen), flags=cv2.INTER_LANCZOS4)
-        warped_alpha = cv2.warpPerspective(logo_alpha_full, M, (w_gen, h_gen), flags=cv2.INTER_LANCZOS4)
         
-        # Constrain alpha to the person's exact shirt mask
+        logo_alpha_src = cv2.dilate(raw_logo_mask, np.ones((3, 3), np.uint8), iterations=1)
+        logo_alpha_src = cv2.GaussianBlur(logo_alpha_src, (3, 3), 0).astype(np.float32) / 255.0
+        warped_alpha = cv2.warpPerspective(logo_alpha_src, M, (w_gen, h_gen), flags=cv2.INTER_LANCZOS4)
+        
         warped_alpha = warped_alpha * mask_np
-        logo_alpha_3d = np.stack([warped_alpha]*3, axis=-1)
+        alpha_3d = np.stack([warped_alpha]*3, axis=-1)
         
-        # ---------------------------------------------------------
-        # 3. FINAL BLEND
-        # ---------------------------------------------------------
-        result = gen_np * (1.0 - logo_alpha_3d) + warped_garm * logo_alpha_3d
+        result = gen_np * (1.0 - alpha_3d) + warped_garm * alpha_3d
 
-        print(f" -> [LOGO_WARP] Global transfer successful. Pattern coverage: {np.mean(warped_alpha)*100:.2f}%")
+        print(f" -> [LOGO_WARP] Transfer successful. Pattern coverage: {np.mean(warped_alpha)*100:.2f}%")
         return Image.fromarray(result.astype(np.uint8))
 
     def match_histograms_lab(self, source, reference_fg_vals, mask, strength=1.0):
@@ -791,7 +777,9 @@ class WearCastHD:
         # --- FIX #16: Smart Adaptive Color Matching ---
         # Detects if the garment is light or complex and adjusts LAB matching strength
         garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        garm_fg_mask = np.all(garm_arr < 245, axis=-1)
+        # FIX: Raise threshold to 254 to include white shirt pixels in the foreground
+        garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
+        
         if np.any(garm_fg_mask):
             garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
             ref_fg_vals = garm_lab[garm_fg_mask]
@@ -801,13 +789,14 @@ class WearCastHD:
             # Variance in AB channels helps detect colorful graphics
             std_ab = np.std(ref_fg_vals[:, 1:]) 
             
+            # Adaptive Strength
             strength = 1.0
-            if avg_l > 200: 
-                strength = 0.0 # Skip for pure white (prevents "dusty" gray)
-                print(f" -> [COLOR] Bright garment detected (L={avg_l:.1f}). Skipping LAB matching.")
-            elif avg_l > 160 or std_ab > 15.0:
-                strength = 0.4 # Reduce for light/colorful garments
-                print(f" -> [COLOR] Light/Graphic garment detected. Reducing LAB matching strength to {strength}.")
+            if avg_l > 220: 
+                strength = 0.7 # High strength for white shirts to fix UNet grayness
+                print(f" -> [COLOR] Ultra-bright garment detected (L={avg_l:.1f}). Force-matching to restore white.")
+            elif avg_l > 180 or std_ab > 15.0:
+                strength = 0.5 # Moderate for light shirts
+                print(f" -> [COLOR] Light/Graphic garment detected (L={avg_l:.1f}). Balanced matching.")
             
             if strength > 0:
                 gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha, strength=strength)
