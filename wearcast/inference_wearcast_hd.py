@@ -603,7 +603,7 @@ class WearCastHD:
 
         # --- FIX #10: Multiply Shadow Mapping ---
         # Extracts natural shadows from original photo and blends them onto new garment
-        ori_lum = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB_GRAY).astype(np.float32) / 255.0
+        ori_lum = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
         # Normalize lum: flat lighting ~ 1.0, shadows < 1.0
         lum_mean = np.mean(ori_lum[input_mask_np > 0.5]) if np.any(input_mask_np > 0.5) else 0.5
         shadow_map = ori_lum / (lum_mean + 1e-6)
