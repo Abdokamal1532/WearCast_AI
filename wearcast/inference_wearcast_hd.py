@@ -411,36 +411,37 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- Build Pro-Grade Soft Compositing Mask ---
-        if hasattr(self, '_cached_hard_mask'):
-            mask_pil = self._cached_hard_mask.resize(raw_generated.size, Image.BILINEAR)
-        else:
-            mask_pil = mask.resize(raw_generated.size, Image.BILINEAR)
-
-        mask_np = np.array(mask_pil).astype(np.float32)
-        if mask_np.max() > 1.0:
-            mask_np = mask_np / 255.0
-
+        # --- FIX #1: Dynamic Output Masking (The Cape Killer) ---
+        # Instead of using the input mask (which has a huge background "box"),
+        # we re-parse the generated image to find the ACTUAL shirt pixels.
+        print(" -> Running Dynamic Re-Parsing for clean mask...")
+        t_reparse = time.time()
+        parse_new_pil, _ = self.parsing_model(raw_generated)
+        parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
+        
+        # Label 4 = upper_clothes, Label 7 = dress
+        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+        
+        # Refine the dynamic mask slightly (small dilation for overlap)
+        dynamic_mask = cv2.dilate(dynamic_mask, np.ones((5, 5), np.uint8), iterations=1)
+        
         # Binarize
-        # Binarize
-        binary_mask = (mask_np > 0.5).astype(np.uint8)
+        binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
         # FIX #4: Tighten and stabilize the blend alpha
         # 1. Erode mask inward to guarantee no garment bleeds outside body
-        kernel_erode = np.ones((5, 5), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=2) # 2x for tighter fit
+        kernel_erode = np.ones((3, 3), np.uint8)
+        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
         
-        # 2. Use a HARD center + soft edge mask (not fully Gaussian)
-        # This keeps the CENTER of the garment at full 1.0 alpha (no ghost)
-        # while only softening the EDGES for natural skin/fabric transition
-        feather_sigma = 3.0  # Smaller sigma = sharper, more realistic edge
+        # 2. Use a HARD center + soft edge mask
+        feather_sigma = 3.0
         blurred = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         
         # 3. Force center pixels to be fully opaque (1.0)
-        # Any pixel that is inside the mask AND away from edges should be 1.0
-        core_mask = cv2.erode(eroded_mask, np.ones((15, 15), np.uint8), iterations=2)
+        core_mask = cv2.erode(eroded_mask, np.ones((11, 11), np.uint8), iterations=1)
         alpha = np.where(core_mask > 0, 1.0, blurred)
         alpha = np.clip(alpha, 0.0, 1.0)
+        print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
@@ -464,14 +465,14 @@ class WearCastHD:
         # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
         # residual that produces the grey "cape" artifact around the waist.
         # --- FIX #5: Targeted Professional Luminance Match ---
-        # Apply shift ONLY to masked region to prevent background artifacts
-        if abs(lum_gap) > 8.0:  # Higher threshold to avoid over-correction
-            shift = np.clip(lum_gap * 0.3, -25, 25)  # Gentler correction
-            mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
-            gen_arr = np.clip(gen_arr + shift * mask_3d, 0, 255)
-            print(f"   [CORR] Applied targeted luminance shift: {shift:+.1f} (mask-only)")
-        else:
-            print(f"   [CORR] Luminance within tolerance (gap={lum_gap:.1f})")
+        # DISABLED per "Cape Killer" plan: Let UNet handle lighting naturally.
+        # if abs(lum_gap) > 8.0:  # Higher threshold to avoid over-correction
+        #     shift = np.clip(lum_gap * 0.3, -25, 25)  # Gentler correction
+        #     mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
+        #     gen_arr = np.clip(gen_arr + shift * mask_3d, 0, 255)
+        #     print(f"   [CORR] Applied targeted luminance shift: {shift:+.1f} (mask-only)")
+        # else:
+        #     print(f"   [CORR] Luminance within tolerance (gap={lum_gap:.1f})")
 
 
         # --- Final Compositing (The "Cape" Killer) ---
@@ -921,94 +922,96 @@ class WearCastHD:
                 # --- 1. Create Skeletal Prior (The "Body Tube") ---
                 spatial_prior = np.zeros_like(parse_mask_uint8)
                 
-                h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
-                h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
-                
-                mid_shoulder = (shoulder_right + shoulder_left) / 2
-                spine_end    = (h_r + h_l) / 2
-                s_width      = abs(shoulder_left[0] - shoulder_right[0])
-                
-                # --- EXTENSION: Project the spine all the way to the bottom ---
-                # This ensures long shirts/dresses aren't cut off at the hip
-                bottom_y = model_parse.height
-                spine_dir = spine_end - mid_shoulder
-                if np.linalg.norm(spine_dir) > 5:
-                    spine_dir = spine_dir / np.linalg.norm(spine_dir)
-                    spine_proj = mid_shoulder + spine_dir * (bottom_y - mid_shoulder[1]) / (spine_dir[1] + 1e-6)
+                # Robustness: Check if shoulders are valid before building prior
+                if shoulder_right[0] <= 1 or shoulder_left[0] <= 1:
+                    print("   [MASK_GEN] WARNING: Shoulders not detected, skipping skeletal prior.")
                 else:
-                    spine_proj = np.array([mid_shoulder[0], bottom_y])
-
-                # --- IMPROVED: Anatomical Hull (Tapered Torso) ---
-                # Creates a tapered block that follows shoulders and hips to preserve physique
-                h_r_pts = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
-                h_l_pts = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
-                
-                torso_pts = np.array([
-                    shoulder_right,
-                    shoulder_left,
-                    h_l_pts,
-                    [h_l_pts[0], model_parse.height],
-                    [h_r_pts[0], model_parse.height],
-                    h_r_pts
-                ], dtype=np.int32)
-                cv2.fillPoly(spatial_prior, [torso_pts], 1)
-
-                # Draw neck/spine line for connectivity
-                cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
-                
-                # Draw arm tubes (Tightened)
-                def draw_arm(p1, p2, thick=15):
-                    if p1[0] > 1 and p2[0] > 1:
-                        cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
-                
-                draw_arm(shoulder_right, elbow_right)
-                draw_arm(elbow_right, wrist_right)
-                draw_arm(shoulder_left, elbow_left)
-                draw_arm(elbow_left, wrist_left)
-                
-                # Dilate slightly to catch fabric drapes (TIGHTENED: 0.15 -> 0.05)
-                body_radius = int(max(s_width * 0.05, 8))
-                spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
-                
-                # Horizontal Corridor — keeps only pixels within body width.
-                # FIX #3: Tightened from 0.65x -> 0.55x to prevent background bleed
-                if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.55 - 8
-                    r_bound = mid_shoulder[0] + s_width * 0.55 + 8
-                    spatial_prior[:, :max(0, int(l_bound))] = 0
-                    spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
-
-
-
-
-                physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
-                
-                # --- 2. Morphological Isolation ---
-                kernel_erode = np.ones((5, 5), np.uint8)
-                eroded_mask = cv2.erode(physically_severed_mask, kernel_erode, iterations=1)
-                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
-                
-                if num_labels > 1:
-                    t_x, t_y = neck[0], neck[1]
-                    if t_x <= 1: t_x, t_y = mid_shoulder[0], mid_shoulder[1]
+                    h_r = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
+                    h_l = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
                     
-                    best_label = -1
-                    min_dist = 999999
-                    for i in range(1, num_labels):
-                        dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
-                        if stats[i][cv2.CC_STAT_AREA] > 200 and dist < min_dist:
-                            min_dist = dist
-                            best_label = i
+                    mid_shoulder = (shoulder_right + shoulder_left) / 2
+                    spine_end    = (h_r + h_l) / 2
+                    s_width      = abs(shoulder_left[0] - shoulder_right[0])
                     
-                    if best_label != -1:
-                        isolated_blob = (labels == best_label).astype(np.uint8)
-                        isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
-                        parse_mask = np.logical_and(physically_severed_mask, isolated_blob).astype(np.float32)
-                        print(f"   [MASK_GEN] Skeletal Prior kept blob #{best_label} (dist={min_dist:.1f}px).")
+                    # --- EXTENSION: Project the spine all the way to the bottom ---
+                    # This ensures long shirts/dresses aren't cut off at the hip
+                    bottom_y = model_parse.height
+                    spine_dir = spine_end - mid_shoulder
+                    if np.linalg.norm(spine_dir) > 5:
+                        spine_dir = spine_dir / np.linalg.norm(spine_dir)
+                        spine_proj = mid_shoulder + spine_dir * (bottom_y - mid_shoulder[1]) / (spine_dir[1] + 1e-6)
+                    else:
+                        spine_proj = np.array([mid_shoulder[0], bottom_y])
+
+                    # --- IMPROVED: Anatomical Hull (Tapered Torso) ---
+                    # Creates a tapered block that follows shoulders and hips to preserve physique
+                    h_r_pts = hip_r if hip_r[0] > 1 else np.array([shoulder_right[0], model_parse.height])
+                    h_l_pts = hip_l if hip_l[0] > 1 else np.array([shoulder_left[0], model_parse.height])
+                    
+                    torso_pts = np.array([
+                        shoulder_right,
+                        shoulder_left,
+                        h_l_pts,
+                        [h_l_pts[0], model_parse.height],
+                        [h_r_pts[0], model_parse.height],
+                        h_r_pts
+                    ], dtype=np.int32)
+                    cv2.fillPoly(spatial_prior, [torso_pts], 1)
+
+                    # Draw neck/spine line for connectivity
+                    if neck[0] > 1:
+                        cv2.line(spatial_prior, (int(neck[0]), int(neck[1])), (int(mid_shoulder[0]), int(mid_shoulder[1])), 1, thickness=10)
+                    
+                    # Draw arm tubes (Tightened)
+                    def draw_arm(p1, p2, thick=15):
+                        if p1[0] > 1 and p2[0] > 1:
+                            cv2.line(spatial_prior, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), 1, thickness=thick)
+                    
+                    draw_arm(shoulder_right, elbow_right)
+                    draw_arm(elbow_right, wrist_right)
+                    draw_arm(shoulder_left, elbow_left)
+                    draw_arm(elbow_left, wrist_left)
+                    
+                    # Dilate slightly to catch fabric drapes (TIGHTENED: 0.15 -> 0.05)
+                    body_radius = int(max(s_width * 0.05, 8))
+                    spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
+                    
+                    # Horizontal Corridor — keeps only pixels within body width.
+                    # FIX #3: Tightened from 0.65x -> 0.55x to prevent background bleed
+                    if s_width > 10:
+                        l_bound = mid_shoulder[0] - s_width * 0.55 - 8
+                        r_bound = mid_shoulder[0] + s_width * 0.55 + 8
+                        spatial_prior[:, :max(0, int(l_bound))] = 0
+                        spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
+
+                    physically_severed_mask = np.logical_and(parse_mask_uint8, spatial_prior).astype(np.uint8)
+                    
+                    # --- 2. Morphological Isolation ---
+                    kernel_erode = np.ones((5, 5), np.uint8)
+                    eroded_mask = cv2.erode(physically_severed_mask, kernel_erode, iterations=1)
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eroded_mask)
+                    
+                    if num_labels > 1:
+                        t_x, t_y = neck[0], neck[1]
+                        if t_x <= 1: t_x, t_y = mid_shoulder[0], mid_shoulder[1]
+                        
+                        best_label = -1
+                        min_dist = 999999
+                        for i in range(1, num_labels):
+                            dist = np.sqrt((centroids[i][0] - t_x)**2 + (centroids[i][1] - t_y)**2)
+                            if stats[i][cv2.CC_STAT_AREA] > 200 and dist < min_dist:
+                                min_dist = dist
+                                best_label = i
+                        
+                        if best_label != -1:
+                            isolated_blob = (labels == best_label).astype(np.uint8)
+                            isolated_blob = cv2.dilate(isolated_blob, kernel_erode, iterations=1)
+                            parse_mask = np.logical_and(physically_severed_mask, isolated_blob).astype(np.float32)
+                            print(f"   [MASK_GEN] Skeletal Prior kept blob #{best_label} (dist={min_dist:.1f}px).")
+                        else:
+                            parse_mask = physically_severed_mask.astype(np.float32)
                     else:
                         parse_mask = physically_severed_mask.astype(np.float32)
-                else:
-                    parse_mask = physically_severed_mask.astype(np.float32)
 
             # --- Arm Drawing & Integration ---
             ARM_LINE_WIDTH = int(arm_width / 512 * height)
@@ -1063,9 +1066,8 @@ class WearCastHD:
         # Final Assembly: Head, Neck, and Inversion
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-        # FIX: Increased from 2 → 3 iterations (15px effective radius) to better cover
-        # arm edges and shirt-hem transitions without over-masking the face/neck.
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=3)
+        # FIX: Reduced from 3 -> 2 iterations to prevent over-masking
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=2)
 
         if category_norm in ('upper_body', 'dresses'):
             # FIX #6: Use pose keypoints as fallback for neck mask if Label 18 is missing
