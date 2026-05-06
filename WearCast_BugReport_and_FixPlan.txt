@@ -1,0 +1,384 @@
+================================================================================
+       WEARCAST PIPELINE - FULL DIAGNOSTIC REPORT & FIX PLAN
+       Generated: May 2026
+================================================================================
+
+OVERVIEW OF OBSERVED SYMPTOMS (from debug images)
+--------------------------------------------------
+1. debug_final_output.jpg      → Ghost / transparent hoodie floating over original shirt.
+                                  The new garment is semi-transparent and misaligned.
+2. debug_phase1_hard_mask.jpg  → Mask shape is correct but extends beyond the body
+                                  silhouette (visible "wings" on both sides).
+3. debug_phase1_soft_mask.jpg  → Same oversized shape as hard mask.
+4. debug_phase3_masked_person  → Massive black blob covers the person from neck to
+                                  waist AND bleeds into the background on both sides.
+5. debug_phase4_comparison.jpg → Left (garment): correct black dental t-shirt.
+                                  Centre (original): person wearing a different shirt.
+                                  Right (result): ghostly semi-transparent garment,
+                                  nothing like the target garment.
+
+ROOT CAUSES — 6 BUGS FOUND
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #1  [CRITICAL — NameError Crash]
+FILE:   wearcast/inference_wearcast_hd.py
+LINES:  307–310
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  The wrist keypoint variables `w_r` and `w_l` are used on lines 307-310 inside
+  `get_mask_location()` to erase the forearm region from the mask. However,
+  these variables are NEVER DEFINED in this file.
+
+  In inference_wearcast_hd.py only shoulders and elbows are extracted:
+      s_r, s_l = pt(2), pt(5)   # Shoulders
+      e_r, e_l = pt(3), pt(6)   # Elbows
+      # w_r, w_l  <-- MISSING! Never defined!
+
+  In utils_wearcast.py (the reference/working version) there is a 3rd line:
+      w_r, w_l = pt(4), pt(7)   # Wrists  <-- PRESENT HERE
+
+  The forearm-protection block that calls these variables:
+      if valid(e_l) and valid(w_l):         # <-- w_l is undefined!
+          cv2.line(inpaint_mask, ...)
+      if valid(e_r) and valid(w_r):         # <-- w_r is undefined!
+          cv2.line(inpaint_mask, ...)
+
+IMPACT:
+  When the forearm-protection block executes, Python throws a NameError and
+  either crashes the mask generation or (if caught) skips it silently.
+  Result: the mask extends all the way from the shoulders down past the elbows
+  to the wrists, creating the huge black blob seen in debug_phase3.
+
+FIX:
+  In inference_wearcast_hd.py, add the wrist line immediately after elbows:
+
+  BEFORE (line ~271):
+      s_r, s_l = pt(2), pt(5)
+      e_r, e_l = pt(3), pt(6)
+
+  AFTER:
+      s_r, s_l = pt(2), pt(5)
+      e_r, e_l = pt(3), pt(6)
+      w_r, w_l = pt(4), pt(7)   # <-- ADD THIS LINE
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #2  [CRITICAL — Ghost / Transparency Artifact]
+FILE:   wearcast/inference_wearcast_hd.py
+LINE:   138
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  After mask generation, the code assigns:
+      mask_hard, mask_soft = self.get_mask_location(...)
+      mask = mask_soft       # <-- LINE 138: WRONG MASK IS USED
+
+  The SOFT mask is a blurred gradient image (pixel values 0–255 representing
+  a smooth fade from "replace" to "keep"). When passed directly to the
+  diffusion pipeline, it causes the model to BLEND the generated garment with
+  the original image using partial weights — creating the semi-transparent
+  ghost effect clearly visible in debug_final_output.jpg.
+
+  The diffusion pipeline expects a BINARY/HARD mask where:
+      255 = pixels to be fully inpainted (replaced)
+        0 = pixels to be fully preserved
+
+  The soft mask blurs this boundary so the centre of the shirt region is
+  only ~80% replaced instead of 100%, producing the see-through effect.
+
+IMPACT:
+  This is the PRIMARY cause of the ghost garment artifact in the final output.
+
+FIX:
+  Change line 138 to use the hard mask:
+
+  BEFORE:
+      mask = mask_soft
+
+  AFTER:
+      mask = mask_hard
+
+  The soft mask can still optionally be used for final compositing blending,
+  but the pipeline's inpainting process MUST receive the hard binary mask.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #3  [HIGH — Mask Bleeds Into Background]
+FILE:   wearcast/inference_wearcast_hd.py  (also utils_wearcast.py)
+LINES:  279–302
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  The `add_arm_mask` (or `add_arm_mask_local`) function creates a convex
+  polygon between the shoulder and elbow keypoints with a flat `ARM_PAD`
+  padding on each side. This polygon is drawn directly onto the mask with NO
+  check against the body silhouette.
+
+  For a person with arms slightly away from the body (e.g. relaxed standing
+  pose), the polygon extends into the background area, masking pixels that
+  are pure background. This is visible in debug_phase1 as the wide "wings"
+  extending horizontally beyond the body outline.
+
+  The human-parsing model produces a segmentation map that already contains
+  the exact body boundary. The arm mask should be constrained (AND-ed) with
+  the body region, not drawn blindly.
+
+IMPACT:
+  Background pixels are masked and inpainted, causing the generated garment
+  to "spill" outside the body outline and creating unnatural edges.
+
+FIX:
+  After building the full inpaint_mask, apply a body-region constraint:
+
+      # Define what counts as "body" (person pixels, not background)
+      body_mask = ((parse_array > 0) & (parse_array != 16)).astype(np.uint8) * 255
+      # Slightly dilate body to allow for minor segmentation errors
+      body_mask = cv2.dilate(body_mask, np.ones((9, 9), np.uint8), iterations=1)
+      # Constrain: only mask pixels that are INSIDE the body silhouette
+      inpaint_mask = cv2.bitwise_and(inpaint_mask, body_mask)
+
+  Insert this block AFTER all the arm mask additions and forearm protection,
+  BEFORE the hole_fill step.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #4  [MEDIUM — Label 11 Contradiction]
+FILE:   wearcast/inference_wearcast_hd.py  (also utils_wearcast.py)
+LINES:  251–259
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  According to `label_map` in utils_wearcast.py:
+      label 11 = "head"
+
+  However, in get_mask_location() (both files), label 11 appears in BOTH:
+  (a) target_area — pixels to REPLACE with new garment:
+          target_area = (parse_array == 4) + (parse_array == 7) +
+                        (parse_array == 11) + ...   # <-- HEAD IS A TARGET!
+
+  (b) head_only — pixels to PROTECT from masking:
+          head_only = (parse_array == 1) + (parse_array == 2) +
+                      (parse_array == 11)             # <-- HEAD IS ALSO PROTECTED!
+
+  These two sets cancel each other out unpredictably depending on order of
+  operations. The head/face should NEVER be in the target_area.
+
+  Note: The comment says label 11 is "scarf/accessory" but the label_map says
+  "head". The actual SCHP parsing model uses label 13 for "Face". This suggests
+  the label numbering is inconsistent between the model and the code comments.
+
+IMPACT:
+  Portions of the face/head may be included in the inpainting region,
+  causing the model to try to "paint over" the face, leading to artifacts
+  around the neck and lower face area.
+
+FIX:
+  Remove label 11 from target_area. The target for upper-body replacement
+  should only be clothing labels:
+
+  BEFORE:
+      target_area = (parse_array == 4).astype(np.float32) + \
+                    (parse_array == 7).astype(np.float32) + \
+                    (parse_array == 11).astype(np.float32) + \
+                    (parse_array == 17).astype(np.float32)
+
+  AFTER:
+      target_area = (parse_array == 4).astype(np.float32) + \
+                    (parse_array == 7).astype(np.float32) + \
+                    (parse_array == 17).astype(np.float32)
+                    # Label 11 (head) removed — never mask the head
+
+  Also verify the correct SCHP label numbers for your parsing model version.
+  Common SCHP-20 label assignments are:
+      0=Background, 1=Hat, 2=Hair, 4=Upper-clothes, 5=Skirt,
+      6=Pants, 7=Dress, 11=Left-shoe, 12=Right-shoe, 13=Face,
+      14=Left-leg, 15=Right-leg, 16=Left-arm, 17=Right-arm, 18=Bag
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #5  [MEDIUM — Non-existent Neck Label]
+FILE:   wearcast/inference_wearcast_hd.py  (also utils_wearcast.py)
+LINE:   ~313
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  Both files contain:
+      neck_area = (parse_array == 18).astype(np.float32)
+
+  But the label_map in utils_wearcast.py only defines labels 0–17. There is
+  no label 18. In the SCHP-20 model, label 18 is "Bag" not "Neck". The
+  actual neck/skin area is usually not a separate label — it falls under the
+  background or face labels depending on the model version.
+
+  This means `neck_area` is always all-zeros (no pixels match label 18),
+  so the neck region is never added to the mask. For shirts with a collar,
+  this means the collar area at the neck may not be properly covered by the
+  mask, leaving the original shirt's collar visible beneath the new garment.
+
+IMPACT:
+  Minor: collar area of original garment may bleed through on the final result.
+
+FIX:
+  Verify what label your specific parsing model assigns to the neck/skin area.
+  A safe approximation is to draw a small polygon between the two shoulder
+  keypoints and up to the chin keypoint using OpenPose data:
+
+      # Use pose keypoints to define neck region instead of parse label
+      # OpenPose: 1=Neck, 0=Nose, 17=Left-Ear, 18=Right-Ear
+      if valid(pt(1)):  # Neck keypoint
+          neck_pt = pt(1)
+          neck_box_y_top = int(neck_pt[1]) - int(ARM_PAD * 0.5)
+          neck_box_y_bot = int(neck_pt[1]) + int(ARM_PAD * 1.0)
+          neck_box_x_left = int(neck_pt[0]) - ARM_PAD
+          neck_box_x_right = int(neck_pt[0]) + ARM_PAD
+          cv2.rectangle(inpaint_mask,
+                        (neck_box_x_left, neck_box_y_top),
+                        (neck_box_x_right, neck_box_y_bot), 255, -1)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BUG #6  [LOW — Exposed ngrok Auth Token in Source Code]
+FILE:   api_wearcast.py
+LINE:   113
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESCRIPTION:
+  The ngrok authentication token is hardcoded as a plaintext string:
+      NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
+
+  Anyone with access to this source file (e.g. a shared Kaggle notebook,
+  public GitHub repo, or screenshot) can use this token to hijack your
+  ngrok account and expose their own tunnels under your identity.
+
+IMPACT:
+  Security risk — your ngrok account can be abused and your API quota stolen.
+
+FIX:
+  Immediately regenerate your ngrok token at dashboard.ngrok.com.
+  Then load the token from an environment variable instead:
+
+  BEFORE:
+      NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
+
+  AFTER:
+      import os
+      NGROK_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "")
+      if not NGROK_TOKEN:
+          raise RuntimeError("NGROK_AUTH_TOKEN environment variable not set!")
+
+  In Kaggle: go to Add-ons → Secrets, add key NGROK_AUTH_TOKEN with your
+  new token value, then access it with:
+      from kaggle_secrets import UserSecretsClient
+      NGROK_TOKEN = UserSecretsClient().get_secret("NGROK_AUTH_TOKEN")
+
+
+================================================================================
+PRIORITY-ORDERED FIX PLAN
+================================================================================
+
+PHASE 1 — CRITICAL FIXES (Do These First, They Cause The Core Failure)
+------------------------------------------------------------------------
+
+STEP 1: Add missing wrist variables in inference_wearcast_hd.py
+  File:  wearcast/inference_wearcast_hd.py
+  Find:  s_r, s_l = pt(2), pt(5)
+         e_r, e_l = pt(3), pt(6)
+  Add:   w_r, w_l = pt(4), pt(7)   # Add this immediately after elbows
+
+STEP 2: Fix the mask type passed to the pipeline in inference_wearcast_hd.py
+  File:  wearcast/inference_wearcast_hd.py
+  Find:  mask = mask_soft
+  Change to: mask = mask_hard
+
+  Then resize hard mask to pipeline input size:
+  Find:  mask_res = mask.resize((768, 1024), Image.NEAREST)
+  Keep this line as-is (NEAREST is correct for binary mask).
+
+PHASE 2 — HIGH PRIORITY (Fix Mask Quality)
+-------------------------------------------
+
+STEP 3: Add body-silhouette constraint to inpaint_mask
+  File:  wearcast/inference_wearcast_hd.py
+  After line 303 (after arm masks are OR-ed in), add:
+
+      # Constrain mask to body silhouette (prevent background bleed)
+      body_mask = ((parse_array > 0) & (parse_array != 16)).astype(np.uint8) * 255
+      body_mask_dilated = cv2.dilate(body_mask, np.ones((9, 9), np.uint8), iterations=1)
+      inpaint_mask = cv2.bitwise_and(inpaint_mask, body_mask_dilated)
+
+  Apply the SAME fix to utils_wearcast.py (same logic, same location).
+
+STEP 4: Remove label 11 from target_area
+  File:  Both inference_wearcast_hd.py and utils_wearcast.py
+  Remove (parse_array == 11) from the target_area computation.
+
+PHASE 3 — MEDIUM PRIORITY (Polish)
+------------------------------------
+
+STEP 5: Fix the neck label (label 18 does not exist)
+  File:  Both inference_wearcast_hd.py and utils_wearcast.py
+  Replace the `neck_area = (parse_array == 18)` block with a
+  pose-keypoint-based neck rectangle as described in Bug #5 above.
+
+STEP 6: Verify your parsing model's label numbering
+  Print out: np.unique(parse_array) after parsing an image to confirm
+  which label numbers are actually being output by your parsing model.
+  Cross-check against the SCHP model documentation.
+
+PHASE 4 — SECURITY
+-------------------
+
+STEP 7: Revoke and replace the exposed ngrok token
+  Go to dashboard.ngrok.com → Your Authtoken → Regenerate.
+  Move the token to an environment variable / Kaggle Secret.
+  Never commit tokens to source control.
+
+
+================================================================================
+QUICK SANITY TEST AFTER APPLYING FIXES
+================================================================================
+
+After applying Phase 1 and Phase 2 fixes, run a test and verify the following
+by examining the debug output images:
+
+1. debug_phase1_hard_mask.jpg
+   EXPECTED: Mask covers only the torso/shirt area, does NOT extend past the
+   body silhouette into the background.
+
+2. debug_phase3_masked_person.jpg
+   EXPECTED: The person image shows a clean black hole where the shirt was.
+   Arms/hands, face, background should all be fully visible (not black).
+   The black region should NOT be wider than the person's shoulders.
+
+3. debug_final_output.jpg
+   EXPECTED: A clearly visible, opaque black t-shirt on the person.
+   No ghosting, no see-through effect, no transparency.
+   The face, arms, and background should be unaffected.
+
+If step 3 still shows ghosting after all fixes, check that the WearCastPipeline
+internally does NOT apply its own soft-blending using the mask. If it does,
+ensure it is receiving `Image.fromarray(mask_hard)` (mode "L", values 0 or 255).
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+ #  | Severity | File                        | Issue
+----|----------|-----------------------------|----------------------------------
+ 1  | CRITICAL | inference_wearcast_hd.py    | w_r / w_l undefined → NameError
+ 2  | CRITICAL | inference_wearcast_hd.py    | mask_soft used instead of mask_hard
+ 3  | HIGH     | Both inference + utils      | Mask bleeds outside body silhouette
+ 4  | MEDIUM   | Both inference + utils      | Label 11 (head) in target_area
+ 5  | MEDIUM   | Both inference + utils      | Label 18 (neck) does not exist
+ 6  | LOW      | api_wearcast.py             | Hardcoded ngrok auth token (security)
+
+Root cause of ghost artifact in final output: BUG #2 (mask_soft)
+Root cause of oversized black blob:           BUG #1 + BUG #3
+Root cause of wrong garment rendering:        BUG #1 + BUG #2 combined
+
+================================================================================
+END OF REPORT
+================================================================================

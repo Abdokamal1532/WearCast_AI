@@ -109,8 +109,11 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Ngrok Setup
-# EXACT token from user: 37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a
-NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
+# Load Ngrok token from environment variable for security
+NGROK_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "")
+if not NGROK_TOKEN:
+    print("[ERROR] NGROK_AUTH_TOKEN environment variable not set! Ngrok will fail.")
+    # We don't raise RuntimeError here to allow the FastAPI server to still start locally
 PORT = 8000
 
 def start_ngrok():
@@ -144,8 +147,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
     
-    # Use fixed 20 steps as requested by user (previously was dynamic 15-20)
-    total_steps = 20
+    # Use 30 steps for professional high-fidelity output
+    total_steps = 30
     
     tasks[task_id]["total_steps"] = total_steps
     tasks[task_id]["current_step"] = 0

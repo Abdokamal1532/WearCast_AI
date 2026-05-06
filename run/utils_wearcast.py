@@ -61,10 +61,9 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     print(" -> Constructing High-Precision Mask (Target: Tshirt Only)...")
     
     # Labels to TARGET for generation (core clothes)
-    # 4: upper_clothes, 7: dress, 11: scarf/accessory, 17: neckline
+    # 4: upper_clothes, 7: dress, 17: scarf/accessory
     target_area = (parse_array == 4).astype(np.float32) + \
                   (parse_array == 7).astype(np.float32) + \
-                  (parse_array == 11).astype(np.float32) + \
                   (parse_array == 17).astype(np.float32)
 
     # Labels to PROTECT (Face, Hair, and Arms as much as possible)
@@ -82,63 +81,70 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
     
     # OpenPose: 2=RShoulder, 5=LShoulder, 3=RElbow, 6=LElbow
+    # OpenPose: 2=RShoulder, 5=LShoulder, 3=RElbow, 6=LElbow, 4=RWrist, 7=LWrist
     s_r, s_l = pt(2), pt(5)   # Shoulders
     e_r, e_l = pt(3), pt(6)   # Elbows
+    w_r, w_l = pt(4), pt(7)   # Wrists
     
     # ============================================================
     # SLEEVE-SUPPORT OPTIMIZATION: CONVEX HULL (Shoulders + Elbows)
     # ============================================================
-    hull_pts = []
     valid = lambda p: p[0] > 1 and p[1] > 1
     
     # Moderate lateral padding for T-shirt sleeves (35px for better coverage)
     ARM_PAD = int(35 / 512 * height) 
     
-    # Add more points around shoulders to ensure full deltoid coverage
-    for p in [s_r, s_l, e_r, e_l]:
-        if valid(p):
-            hull_pts.append([p[0] + ARM_PAD, p[1]])
-            hull_pts.append([p[0] - ARM_PAD, p[1]])
-            hull_pts.append([p[0], p[1] - ARM_PAD // 2]) # Top of shoulder
+    # 3. Create Arm Masks separately (to avoid filling the gap between arm and torso)
+    inpaint_mask = (target_area > 0).astype(np.uint8) * 255
     
-    inpaint_mask = target_area.copy()
-    torso_pixels = np.column_stack(np.where(target_area > 0))
-    
-    if len(torso_pixels) > 5 and len(hull_pts) >= 3:
-        torso_xy = torso_pixels[:, [1, 0]]
-        if len(torso_xy) > 600:
-            idx = np.random.choice(len(torso_xy), 600, replace=False)
-            torso_xy = torso_xy[idx]
-        
-        all_pts = np.vstack([torso_xy, np.array(hull_pts)]).astype(np.float32)
-        hull = cv2.convexHull(all_pts)
-        hull_mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.fillConvexPoly(hull_mask, hull.astype(np.int32), 255)
-        
-        inpaint_mask = np.logical_or(inpaint_mask, hull_mask / 255.0).astype(np.float32)
-    elif len(torso_pixels) > 5:
-        inpaint_mask = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
+    def add_arm_mask_local(shoulder, elbow, side_pad):
+        if valid(shoulder) and valid(elbow):
+            # Create a local hull for this arm only
+            arm_pts = []
+            # Shoulder points (deltoid)
+            arm_pts.append([shoulder[0] - side_pad, shoulder[1]])
+            arm_pts.append([shoulder[0] + side_pad, shoulder[1]])
+            arm_pts.append([shoulder[0], shoulder[1] - side_pad // 2])
+            # Elbow points
+            arm_pts.append([elbow[0] - side_pad, elbow[1]])
+            arm_pts.append([elbow[0] + side_pad, elbow[1]])
+            
+            arm_mask = np.zeros_like(inpaint_mask)
+            cv2.fillConvexPoly(arm_mask, np.array(arm_pts, dtype=np.int32), 255)
+            return arm_mask
+        return None
 
-    # Neck region: Conservative (1px dilation)
-    neck_area = (parse_array == 18).astype(np.float32)
-    neck_tight = cv2.dilate(neck_area, np.ones((1, 1), np.uint8), iterations=1)
-    inpaint_mask = np.logical_or(inpaint_mask, neck_tight).astype(np.float32)
+    # Add Left and Right arm masks independently
+    l_arm = add_arm_mask_local(s_l, e_l, ARM_PAD)
+    r_arm = add_arm_mask_local(s_r, e_r, ARM_PAD)
+    
+    if l_arm is not None: inpaint_mask = cv2.bitwise_or(inpaint_mask, l_arm)
+    if r_arm is not None: inpaint_mask = cv2.bitwise_or(inpaint_mask, r_arm)
+    
+    # Constrain mask to body silhouette (prevent background bleed)
+    body_mask = ((parse_array > 0) & (parse_array != 16)).astype(np.uint8) * 255
+    body_mask_dilated = cv2.dilate(body_mask, np.ones((9, 9), np.uint8), iterations=1)
+    inpaint_mask = cv2.bitwise_and(inpaint_mask, body_mask_dilated)
+    
+    # 4. Forearm Protection (Exclude area below elbows)
+    # Erase everything below the elbow to protect the skin
+    if valid(e_l) and valid(w_l):
+        cv2.line(inpaint_mask, (int(e_l[0]), int(e_l[1])), (int(w_l[0]), int(w_l[1])), 0, thickness=int(ARM_PAD * 2.5))
+    if valid(e_r) and valid(w_r):
+        cv2.line(inpaint_mask, (int(e_r[0]), int(e_r[1])), (int(w_r[0]), int(w_r[1])), 0, thickness=int(ARM_PAD * 2.5))
 
-    # FINAL PROTECTION: Remove head AND forearm area
-    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(head_only)).astype(np.float32)
+    # Neck region: Use pose keypoints instead of non-existent parse label 18
+    if valid(pt(1)):  # Neck keypoint
+        neck_pt = pt(1)
+        neck_box_y_top = int(neck_pt[1]) - int(ARM_PAD * 0.5)
+        neck_box_y_bot = int(neck_pt[1]) + int(ARM_PAD * 1.0)
+        neck_box_x_left = int(neck_pt[0]) - ARM_PAD
+        neck_box_x_right = int(neck_pt[0]) + ARM_PAD
+        cv2.rectangle(inpaint_mask,
+                      (neck_box_x_left, neck_box_y_top),
+                      (neck_box_x_right, neck_box_y_bot), 255, -1)
     
-    # Forearm Protection: Only protect arms BELOW the elbow level to allow sleeves
-    forearm_protection = np.zeros_like(arms_labels)
-    for e_pt in [e_r, e_l]:
-        if valid(e_pt):
-            elbow_y = int(e_pt[1])
-            forearm_protection[elbow_y + 20:, :] = 1
-    
-    arms_to_protect = np.logical_and(arms_labels, forearm_protection)
-    inpaint_mask = np.logical_and(inpaint_mask, np.logical_not(arms_to_protect * 0.95)).astype(np.float32)
-    
-    # Smooth with small kernel
-    inpaint_mask = cv2.dilate(inpaint_mask, np.ones((5, 5), np.uint8), iterations=1)
+    # 5. Hole Filling and Refinement
 
     # Hole fill + largest-contour refinement
     def hole_fill_local(img):
