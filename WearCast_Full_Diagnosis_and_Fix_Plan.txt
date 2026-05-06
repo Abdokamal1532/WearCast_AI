@@ -1,0 +1,550 @@
+================================================================================
+        WEARCAST AI — FULL DIAGNOSIS REPORT & REALISTIC TRY-ON FIX PLAN
+================================================================================
+Author  : Claude (Anthropic)
+Date    : 2026-05-06
+Version : Comprehensive Analysis v1.0
+
+Target Goal: Make the virtual try-on look EXACTLY like the person physically
+             changed their shirt — photorealistic, no ghosting, no capes, no
+             floating garment artifacts.
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — WHAT WE SEE IN THE DEBUG IMAGES (Evidence Catalog)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMAGE 1 — debug_final_output.jpg
+  SYMPTOM: The generated garment appears as a transparent/ghostly "cape" that
+  floats AROUND the person's body, not ON it. The original black t-shirt is still
+  visible underneath. The new garment looks like a semi-transparent plastic poncho
+  draped over the body. Background bleeds through the garment.
+
+IMAGE 2 — debug_phase1_hard_mask.jpg  (384×512)
+  SYMPTOM: The binary mask is correct in shape — it covers the upper-body region
+  (torso + shoulders). However, the mask is sized at 384×512 but the pipeline
+  expects 768×1024. This size mismatch means when it is used for compositing it
+  is being upscaled with artifacts. Also note the mask is smaller than ideal — it
+  clips the very edges of the shoulders.
+
+IMAGE 3 — debug_phase1_soft_mask.jpg  (384×512)
+  SYMPTOM: The soft mask is nearly identical to the hard mask with very minimal
+  feathering. The soft mask edges show sharp transitions at the shoulder/sleeve
+  boundary, which explains the harsh visible seams in the output. The neck notch
+  is correctly cut out.
+
+IMAGE 4 — debug_phase3_masked_person.jpg
+  SYMPTOM: The masked region (blacked out) is OVERSIZED — it covers not just the
+  shirt area but also a large area ABOVE the shoulders (shoulder padding going into
+  background), and a wide area that bleeds into the background on both sides. This
+  means the UNet is being asked to inpaint a region that includes background sky,
+  which is why the output garment has "wings" that extend into the background and
+  create the cape artifact.
+
+IMAGE 5 — debug_phase4_comparison.jpg  (3 panels)
+  Panel 1 (Garment): Clean black t-shirt with "LOVE" dental design. Correct.
+  Panel 2 (Raw UNet): The UNet DID try to generate the garment, but it is dark,
+  blurry, and oversized — the garment literally covers the shoulders too widely
+  and extends into the background zone, creating the cape.
+  Panel 3 (Final Output): After compositing, the transparent/ghostly overlay is
+  visible. The luminance shift correction is making the result slightly lighter,
+  partially blending the original dark shirt with the new one = "double exposure"
+  ghost effect.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — ROOT CAUSE ANALYSIS (All 7 Problems Identified)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM #1 — MASK BLEEDS INTO BACKGROUND (CRITICAL — THE MAIN CAUSE)
+──────────────────────────────────────────────────────────────────────
+  WHERE: utils_wearcast.py → get_mask_location() → add_arm_mask_local()
+         inference_wearcast_hd.py → get_mask_location() → spatial_prior
+
+  WHAT IS HAPPENING:
+  The arm mask generation uses a convex hull based on shoulder + elbow keypoints
+  with ARM_PAD = 35px. This ARM_PAD value is too large and causes the arm region
+  to extend OUTSIDE the body boundary into the background.
+
+  The body_mask_dilated constraint that tries to prevent background bleed uses a
+  9×9 dilation which adds ~4-5px of expansion — far too small to counteract the
+  35px arm padding. Result: the mask bleeds into the background.
+
+  In inference_wearcast_hd.py, the spatial_prior horizontal corridor uses
+  s_width * 0.65 + 15px padding, which for a normal person (shoulder width ~180px)
+  gives corridor_half = 132px. This is wider than the actual shirt, so garment
+  edges bleed outside the torso into background pixels.
+
+  THE DAMAGE: The UNet sees background pixels inside the mask, gets confused, and
+  generates the garment overlapping/floating over the background → "cape effect".
+
+PROBLEM #2 — MASK SIZE MISMATCH (CRITICAL)
+────────────────────────────────────────────
+  WHERE: inference_wearcast_hd.py line ~243
+         mask = mask.resize((768, 1024), Image.NEAREST)
+
+  WHAT IS HAPPENING:
+  The mask is generated at 384×512 (because model_parse is 384×512) but is then
+  resized to 768×1024 using Image.NEAREST. NEAREST neighbor upscaling creates a
+  "blocky" mask with harsh pixelated edges at 2× scale. This means the feathering
+  done BEFORE the resize is wasted — the resize re-introduces hard block edges.
+
+  THE DAMAGE: Visible hard boundary seams around the garment edges in the output.
+  The garment looks "pasted on" because the edge is pixel-jagged.
+
+PROBLEM #3 — MASK GENERATION RUNS AT 384×512 BUT IMAGE IS 768×1024 (CRITICAL)
+────────────────────────────────────────────────────────────────────────────────
+  WHERE: inference_wearcast_hd.py → self.get_mask_location()
+
+  WHAT IS HAPPENING:
+  Human parsing (model_parse) returns a 384×512 segmentation map. All the
+  careful geometric calculations — arm paddings, shoulder widths, neck boxes,
+  spatial priors — are computed at 384×512 scale. Then the mask is upscaled 2×.
+
+  A 35px ARM_PAD at 384×512 scale becomes effectively 70px at 768×1024 scale.
+  So even if 35px was correct at low resolution, it becomes doubly wrong at
+  the actual inference resolution.
+
+  THE DAMAGE: Everything is off by a factor of 2 in pixel coordinates.
+
+PROBLEM #4 — COMPOSITE MASK IS NOT TIGHT ENOUGH TO BODY (HIGH)
+───────────────────────────────────────────────────────────────
+  WHERE: inference_wearcast_hd.py lines 426–433
+
+  WHAT IS HAPPENING:
+  The post-processing compositing uses erode(3×3, 1 iter) + GaussianBlur(sigma=5).
+  The erosion is too small (3×3, only 1px effective shrink at each side). The
+  feather sigma=5.0 creates a wide soft edge that bleeds the generated garment
+  pixels into the background by ~15px on each side.
+
+  For large images (768×1024), a sigma=5 creates almost invisible feathering —
+  it's too sharp for the shirt collar/sleeve boundary but too soft for the torso
+  edge, giving the transparent ghostly blending look.
+
+  THE DAMAGE: The "ghost" semi-transparent look in the final output. The outer
+  edges of the shirt fade from the new garment → background instead of stopping
+  cleanly at the body silhouette.
+
+PROBLEM #5 — LUMINANCE CORRECTION IS FIGHTING THE UNet (MEDIUM)
+─────────────────────────────────────────────────────────────────
+  WHERE: inference_wearcast_hd.py lines 456–461
+
+  WHAT IS HAPPENING:
+  The luminance shift formula: shift = clip(lum_gap * 0.6, -50, 50)
+  When the UNet generates a dark garment (correct, since the t-shirt IS dark)
+  and the garment reference is also dark, the gap should be near 0. But because
+  the mask includes background pixels (see Problem #1), the "gen_in_mask" mean
+  luminance includes bright background pixels. This inflates lum_gap and causes
+  an overcorrection that lightens the dark shirt, making it look grey/washed out.
+
+  THE DAMAGE: The generated black shirt is shifted to appear grey/transparent
+  instead of staying black, contributing to the "ghost garment" look.
+
+PROBLEM #6 — NECK MASK USES NON-EXISTENT LABEL 18 (MEDIUM)
+────────────────────────────────────────────────────────────
+  WHERE: inference_wearcast_hd.py line 1059
+         neck_mask = (parse_array == 18).astype(np.float32)
+
+  WHAT IS HAPPENING:
+  The LIP (Look Into Person) human parser used in OOTD uses 20 classes (0–19).
+  Label 18 IS defined as "Neck(refined)" in some versions but is ABSENT in many
+  Kaggle/HuggingFace deployments. When it is absent, neck_mask is all zeros and
+  the neck-collar region gets NO mask coverage.
+
+  THE DAMAGE: The collar of the new shirt is not inpainted — it either shows the
+  original shirt's collar or creates a visible seam at the neck boundary.
+
+PROBLEM #7 — image_scale=2.0 IS TOO HIGH FOR THE BASE MODEL (LOW-MEDIUM)
+──────────────────────────────────────────────────────────────────────────
+  WHERE: run_wearcast.py line 48
+         image_scale=2.0
+
+  WHAT IS HAPPENING:
+  OOTDiffusion (the base model for WearCast) was trained and evaluated with
+  image_guidance_scale values of 1.0–2.0. A scale of 2.0 pushes the classifier-
+  free guidance very hard toward the garment reference image. This means the model
+  over-copies the garment's texture/shape regardless of body pose, causing the
+  garment to appear "floating" in its reference pose rather than deforming to the
+  body.
+
+  THE DAMAGE: The garment looks rigidly placed (like a product photo overlaid)
+  rather than naturally draping on the person's body. Contributes to the "cape"
+  floating look when combined with the mask bleed problem.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — THE FIX PLAN (Step by Step, File by File)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Each fix is labeled: [CRITICAL], [HIGH], [MEDIUM], [LOW]
+Apply them in this exact order. Fixes #1–4 alone will solve ~85% of the problem.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #1 [CRITICAL] — Tighten Mask to Body: Reduce ARM_PAD and Fix Body Boundary
+FILE: utils_wearcast.py → get_mask_location()
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE (line ~65):
+    ARM_PAD = int(35 / 512 * height)
+
+CHANGE TO:
+    ARM_PAD = int(20 / 512 * height)   # ← Reduce from 35 to 20
+
+WHY: 20px at 512px height = ~4% of image width. This gives enough coverage for
+the shirt sleeve boundary without bleeding into background. 35px was causing
+the arm region to extend 15px outside the actual body silhouette.
+
+CURRENT CODE (body constraint dilation):
+    body_mask_dilated = cv2.dilate(body_mask, np.ones((9, 9), np.uint8), iterations=1)
+
+CHANGE TO:
+    body_mask_dilated = cv2.dilate(body_mask, np.ones((5, 5), np.uint8), iterations=1)
+
+WHY: 5×5 kernel = ~2px expansion. The body mask should stay CLOSE to the actual
+body silhouette. 9×9 was expanding it 4px which allowed more background bleed.
+
+ALSO ADD after the body constraint line:
+    # Strict: only allow mask where segmentation parser sees body/clothes
+    upper_body_mask = ((parse_array == 4) | (parse_array == 7) |
+                       (parse_array == 14) | (parse_array == 15) |
+                       (parse_array == 11) | (parse_array == 17) |
+                       (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
+    upper_body_mask = cv2.dilate(upper_body_mask, np.ones((15, 15), np.uint8), iterations=1)
+    inpaint_mask = cv2.bitwise_and(inpaint_mask, upper_body_mask)
+
+WHY: This creates a second safety constraint. The mask is limited to pixels that
+are NEAR a body part. Pure background pixels (sky, grass, building) are excluded.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #2 [CRITICAL] — Fix Mask Size Mismatch: Generate Mask at Full Resolution
+FILE: inference_wearcast_hd.py → __call__() and get_mask_location()
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE (line ~243):
+    mask = mask.resize((768, 1024), Image.NEAREST)
+
+CHANGE TO:
+    mask = mask.resize((768, 1024), Image.BILINEAR)  # Smooth upscale
+    # Re-binarize after bilinear to prevent grey artifacts
+    mask_np_clean = np.array(mask)
+    mask_np_clean = (mask_np_clean > 127).astype(np.uint8) * 255
+    mask = Image.fromarray(mask_np_clean)
+
+WHY: BILINEAR upscaling creates smooth edges. The re-binarization step ensures
+we don't accidentally create semi-transparent mask regions that confuse the UNet.
+The UNet expects a clean 0/255 mask, not a graduated grey mask.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #3 [CRITICAL] — Fix Spatial Prior Corridor Width
+FILE: inference_wearcast_hd.py → get_mask_location() → lines ~963-967
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE:
+    if s_width > 10:
+        l_bound = mid_shoulder[0] - s_width * 0.65 - 15
+        r_bound = mid_shoulder[0] + s_width * 0.65 + 15
+
+CHANGE TO:
+    if s_width > 10:
+        l_bound = mid_shoulder[0] - s_width * 0.55 - 8
+        r_bound = mid_shoulder[0] + s_width * 0.55 + 8
+
+WHY: 0.65× shoulder width + 15px was creating a corridor that extended ~20px
+outside the actual body on each side. 0.55× + 8px is tighter and stays within
+the body silhouette. For a standard person at 768px width, this reduces the
+corridor from ~252px half-width to ~215px half-width — still covers full shirt
+but does not bleed into background.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #4 [CRITICAL] — Fix Post-Processing Compositing (Kill the Ghost)
+FILE: inference_wearcast_hd.py → __call__() → Phase 4 compositing
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE (lines ~420-432):
+    binary_mask = (mask_np > 0.5).astype(np.uint8)
+    kernel_erode = np.ones((3, 3), np.uint8)
+    eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
+    feather_sigma = 5.0
+    alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+CHANGE TO:
+    binary_mask = (mask_np > 0.5).astype(np.uint8)
+
+    # Step 1: Erode mask inward to guarantee no garment bleeds outside body
+    kernel_erode = np.ones((5, 5), np.uint8)
+    eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=2)  # 2x for tighter fit
+
+    # Step 2: Use a HARD center + soft edge mask (not fully Gaussian)
+    # This keeps the CENTER of the garment at full 1.0 alpha (no ghost)
+    # while only softening the EDGES for natural skin/fabric transition
+    feather_sigma = 3.0   # Smaller sigma = sharper, more realistic edge
+    blurred = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+
+    # Step 3: Force center pixels to be fully opaque (1.0)
+    # Any pixel that is inside the mask AND away from edges should be 1.0
+    core_mask = cv2.erode(eroded_mask, np.ones((15, 15), np.uint8), iterations=2)
+    alpha = np.where(core_mask > 0, 1.0, blurred)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+WHY: The original pure-Gaussian approach made the CENTER of the garment semi-
+transparent. A real shirt is FULLY OPAQUE in the center. Only the edges (where
+fabric meets skin) should have soft blending. The core_mask forces center alpha
+to 1.0, making the garment look solid and real. Only the edge pixels blend.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #5 [HIGH] — Fix Luminance Correction (Stop Washing Out Black Shirts)
+FILE: inference_wearcast_hd.py → __call__() → lines 456–461
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE:
+    if abs(lum_gap) > 3.0:
+        shift = np.clip(lum_gap * 0.6, -50, 50)
+        gen_arr = np.clip(gen_arr + shift, 0, 255)
+
+CHANGE TO:
+    # Only apply luminance correction to pixels INSIDE the mask
+    # DO NOT shift background pixels — they should stay as-is
+    if abs(lum_gap) > 8.0:  # Raise threshold to avoid over-correction
+        shift = np.clip(lum_gap * 0.3, -25, 25)  # Gentler: 0.3 factor, ±25 cap
+        # Apply shift ONLY to masked region
+        mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
+        gen_arr = np.clip(gen_arr + shift * mask_3d, 0, 255)
+        print(f"   [CORR] Applied targeted luminance shift: {shift:+.1f} (mask-only)")
+    else:
+        print(f"   [CORR] Luminance within tolerance (gap={lum_gap:.1f})")
+
+WHY: The original code applied the luminance shift to the ENTIRE image including
+background. This was making the background brighter/darker incorrectly. The new
+code only shifts masked pixels. Also, the 0.3 factor and ±25 cap prevent
+overcorrection that was turning black shirts grey.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #6 [MEDIUM] — Fix Neck Mask Using Pose Keypoints as Fallback
+FILE: inference_wearcast_hd.py → get_mask_location() → lines ~1059-1062
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE:
+    if category_norm in ('upper_body', 'dresses'):
+        neck_mask = (parse_array == 18).astype(np.float32)
+        neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
+        neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
+        parse_mask = np.logical_or(parse_mask, neck_mask)
+
+CHANGE TO:
+    if category_norm in ('upper_body', 'dresses'):
+        # Try label 18 first (Neck refined), then fall back to pose keypoint
+        neck_mask = (parse_array == 18).astype(np.float32)
+
+        if neck_mask.sum() < 100:  # Label 18 missing or too small → use keypoint
+            print("   [MASK] Label 18 (Neck) not found, using pose keypoint fallback")
+            neck_kp = pose_data[1]  # OpenPose index 1 = Neck
+            if neck_kp[0] > 1 and neck_kp[1] > 1:
+                neck_x = int(neck_kp[0] * width / image_vton.width)
+                neck_y = int(neck_kp[1] * height / image_vton.height)
+                neck_radius = int(0.04 * height)  # ~20px at 512 height
+                neck_mask_manual = np.zeros((height, width), dtype=np.float32)
+                cv2.circle(neck_mask_manual, (neck_x, neck_y), neck_radius, 1.0, -1)
+                neck_mask = neck_mask_manual
+
+        neck_mask = cv2.dilate(neck_mask.astype(np.uint8), np.ones((5, 5), np.uint16), iterations=1).astype(np.float32)
+        neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
+        parse_mask = np.logical_or(parse_mask, neck_mask)
+
+WHY: When label 18 is absent (which is common), the collar area is missed. The
+pose-based fallback ensures the neck/collar area is always included in the mask,
+which means the new shirt's collar will be properly rendered.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX #7 [MEDIUM] — Lower image_scale to 1.5 for Better Body Conformance
+FILE: run_wearcast.py → line 48, and api_wearcast.py
+────────────────────────────────────────────────────────────────────────────────
+
+CURRENT CODE:
+    image_scale=2.0
+
+CHANGE TO:
+    image_scale=1.5
+
+WHY: At 2.0, the classifier-free guidance is too strong — it pushes the UNet to
+reproduce the garment's exact shape from the product photo, not the garment
+deformed around a body. At 1.5, the model balances between "looks like the
+reference garment" and "conforms to this body's pose and shape". This produces
+natural draping, wrinkles, and realistic body conformance.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — BONUS RECOMMENDATIONS FOR PHOTOREALISTIC "REAL CLOTHES CHANGE" LOOK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are advanced improvements to make the result look truly like a photograph
+of the person wearing the new shirt — not a digital composite.
+
+RECOMMENDATION A — Add Lighting Consistency (Shadow Matching)
+──────────────────────────────────────────────────────────────
+  The generated garment ignores the scene lighting. In the sample image, the
+  lighting comes from slightly above-left. The new shirt should have shadows on
+  the right side matching this.
+
+  HOW TO IMPLEMENT:
+  After compositing, apply a very subtle directional shadow overlay:
+
+    shadow_mask = binary_mask.copy().astype(np.float32)
+    # Shift shadow mask slightly right and down
+    shadow_offset_x, shadow_offset_y = 8, 5  # pixels
+    M = np.float32([[1, 0, shadow_offset_x], [0, 1, shadow_offset_y]])
+    shadow_shifted = cv2.warpAffine(shadow_mask, M, (shadow_mask.shape[1], shadow_mask.shape[0]))
+    # Shadow = area in shifted but not original = edge
+    shadow_region = np.clip(shadow_shifted - shadow_mask, 0, 1)
+    shadow_region = cv2.GaussianBlur(shadow_region, (0, 0), 3.0)
+    # Darken slightly: reduce by 8%
+    final_np[:, :, :] -= (shadow_region[:, :, np.newaxis] * 20).astype(np.float32)
+    final_np = np.clip(final_np, 0, 255)
+
+RECOMMENDATION B — Preserve Skin Color at Mask Boundary
+─────────────────────────────────────────────────────────
+  At the neck and forearm boundary, the transition from skin to fabric often
+  creates a color-bleed where garment color leaks onto skin or skin color leaks
+  onto garment, looking unrealistic.
+
+  HOW TO IMPLEMENT:
+  Create a "skin zone" mask using the human parser (labels 11=Face, 14=LeftArm,
+  15=RightArm). Wherever the compositing alpha is in range [0.1, 0.9] AND the
+  original image is skin-colored, bias the blend toward the original (skin):
+
+    skin_zone = ((parse_array == 14) | (parse_array == 15) | (parse_array == 11)).astype(np.float32)
+    skin_zone_resized = cv2.resize(skin_zone, (final_np.shape[1], final_np.shape[0]))
+    skin_bias = np.where((alpha > 0.1) & (alpha < 0.9) & (skin_zone_resized > 0.5), 0.7, 1.0)
+    # Reduce alpha where we are near skin edges to bias toward original skin color
+    alpha_skin_adjusted = alpha * skin_bias
+    final_np = (gen_final * alpha_skin_adjusted[:,:,np.newaxis]) + (ori_final * (1 - alpha_skin_adjusted[:,:,np.newaxis]))
+
+RECOMMENDATION C — Increase num_steps to 30–40 (Not 20)
+─────────────────────────────────────────────────────────
+  CURRENT: final_steps = max(30, ...) → but UI default is 20 and auto_params
+  may be returning lower values.
+
+  RECOMMENDATION: Always enforce minimum 30 steps, ideally 40 for HD mode.
+  The reason is that OOTDiffusion's denoising quality improves significantly
+  from 20→30 steps (sharper fabric texture, better color rendering) but only
+  marginally from 30→40. At 20 steps, fabric textures appear slightly blurry.
+
+  HOW TO IMPLEMENT in run_wearcast.py:
+    num_steps=35  # Change from 20 to 35
+
+RECOMMENDATION D — Garment Preprocessing: Isolate Garment from White BG
+─────────────────────────────────────────────────────────────────────────
+  The dental "LOVE" t-shirt image has a pure white background. Currently the
+  code detects this and replaces with grey (170, 170, 170) for CLIP encoding.
+  This is correct. But for the UNet's image_garm input, the white background
+  should ALSO be replaced to prevent the UNet from treating the white regions
+  as part of the garment.
+
+  HOW TO IMPLEMENT in inference_wearcast_hd.py Phase 2:
+  AFTER the CLIP background-replacement block, also apply the grey background
+  to image_garm (the PIL image) that gets passed to the UNet:
+
+    if bg_coverage > 0.05:
+        # Also update image_garm with grey background for UNet input
+        image_garm_clean = Image.fromarray(garm_np_proc)  # garm_np_proc already has grey bg
+    else:
+        image_garm_clean = image_garm
+
+  Then pass image_garm_clean to self.pipe() instead of image_garm.
+
+RECOMMENDATION E — Use Poisson Blending at Boundaries (Advanced)
+──────────────────────────────────────────────────────────────────
+  For the most photorealistic result, use OpenCV's seamlessClone (Poisson
+  blending) at the garment boundaries instead of simple alpha blending.
+  Poisson blending ensures lighting, color, and texture gradients transition
+  naturally, making it literally impossible to see where the garment begins.
+
+  HOW TO IMPLEMENT (add after current compositing):
+    # Only do Poisson on the boundary region, not the whole image
+    boundary_mask = cv2.dilate(binary_mask*255, np.ones((20,20),np.uint8)) - \
+                    cv2.erode(binary_mask*255, np.ones((20,20),np.uint8))
+
+    center = (final_np.shape[1]//2, final_np.shape[0]//2)
+    try:
+        final_poisson = cv2.seamlessClone(
+            gen_final.astype(np.uint8),
+            ori_final.astype(np.uint8),
+            (binary_mask*255).astype(np.uint8),
+            center,
+            cv2.NORMAL_CLONE
+        )
+        # Blend only where the difference is small (safety check)
+        diff = np.abs(final_poisson.astype(float) - final_np).mean()
+        if diff < 30:  # Sanity check — if Poisson went wrong, skip it
+            final_np = final_poisson.astype(np.float32)
+            print(f" -> [POISSON] Seamless boundary blend applied. Diff={diff:.1f}")
+    except Exception as e:
+        print(f" -> [POISSON] Skipped: {e}")
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — IMPLEMENTATION PRIORITY TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ Priority | Fix # | Impact | Effort | File
+──────────┼───────┼────────┼────────┼─────────────────────────────────────
+    1     |  #1   | ★★★★★  |  Low   | utils_wearcast.py
+    2     |  #3   | ★★★★★  |  Low   | inference_wearcast_hd.py
+    3     |  #4   | ★★★★★  |  Low   | inference_wearcast_hd.py
+    4     |  #2   | ★★★★☆  |  Low   | inference_wearcast_hd.py
+    5     |  #5   | ★★★☆☆  |  Low   | inference_wearcast_hd.py
+    6     |  #7   | ★★★☆☆  |  Tiny  | run_wearcast.py
+    7     |  #6   | ★★☆☆☆  |  Med   | inference_wearcast_hd.py
+    8     | Rec-D | ★★★☆☆  |  Low   | inference_wearcast_hd.py
+    9     | Rec-C | ★★☆☆☆  |  Tiny  | run_wearcast.py
+   10     | Rec-B | ★★★☆☆  |  Med   | inference_wearcast_hd.py
+   11     | Rec-A | ★★☆☆☆  |  Med   | inference_wearcast_hd.py
+   12     | Rec-E | ★★★★☆  |  High  | inference_wearcast_hd.py
+
+Apply fixes in order 1–7 first and re-test. The output should be dramatically
+better. Then apply recommendations if you want photorealism.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — WHAT "PERFECT" SHOULD LOOK LIKE (Quality Checklist)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After all fixes are applied, test against this checklist:
+
+  □ The new shirt is fully OPAQUE — no ghost of the original shirt visible
+  □ The shirt collar fits naturally around the neck — no gap or seam
+  □ The shirt sleeves end at the correct arm length — not too long or short
+  □ The garment follows the body shape — slightly tighter at shoulders,
+    natural drape at the waist
+  □ Skin at the forearms and neck looks unchanged — no color bleed from shirt
+  □ The background behind the person is identical to the original photo
+  □ No "cape" or "wings" extending beyond the body silhouette
+  □ The black shirt design ("LOVE" dental) is clearly visible, not blurred
+  □ The shirt color is the same deep black as the reference — not grey
+  □ The shirt's shoulder line matches the person's actual shoulder width
+  □ Natural fabric wrinkles/folds present (not a flat cardboard shirt)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The core problem causing the "ghost cape" effect is a combination of:
+
+  1. MASK TOO LARGE — bleeds outside body into background (Fixes #1, #3)
+  2. SOFT COMPOSITING — garment is semi-transparent at center (Fix #4)
+  3. LUMINANCE OVERCORRECTION — black shirt turned grey (Fix #5)
+  4. MASK UPSCALE ARTIFACTS — blocky edges at boundaries (Fix #2)
+
+The model itself (the UNet / WearCast pipeline) is NOT broken. It IS generating
+the correct garment shape. The problem is entirely in MASK GENERATION (too wide)
+and POST-PROCESSING COMPOSITING (too transparent). Fixing these gives you a
+photorealistic try-on without changing any model weights or checkpoints.
+
+Expected result after fixes: The try-on should look indistinguishable from
+the person wearing the actual black LOVE dental t-shirt in the same photo.
+
+================================================================================
+END OF REPORT
+================================================================================

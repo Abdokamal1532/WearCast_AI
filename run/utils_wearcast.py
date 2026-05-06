@@ -91,8 +91,8 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     # ============================================================
     valid = lambda p: p[0] > 1 and p[1] > 1
     
-    # Moderate lateral padding for T-shirt sleeves (35px for better coverage)
-    ARM_PAD = int(35 / 512 * height) 
+    # Moderate lateral padding for T-shirt sleeves (20px for better coverage)
+    ARM_PAD = int(20 / 512 * height) 
     
     # 3. Create Arm Masks separately (to avoid filling the gap between arm and torso)
     inpaint_mask = (target_area > 0).astype(np.uint8) * 255
@@ -123,8 +123,16 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     
     # Constrain mask to body silhouette (prevent background bleed)
     body_mask = ((parse_array > 0) & (parse_array != 16)).astype(np.uint8) * 255
-    body_mask_dilated = cv2.dilate(body_mask, np.ones((9, 9), np.uint8), iterations=1)
+    body_mask_dilated = cv2.dilate(body_mask, np.ones((5, 5), np.uint8), iterations=1)
     inpaint_mask = cv2.bitwise_and(inpaint_mask, body_mask_dilated)
+    
+    # Strict: only allow mask where segmentation parser sees body/clothes
+    upper_body_mask = ((parse_array == 4) | (parse_array == 7) |
+                       (parse_array == 14) | (parse_array == 15) |
+                       (parse_array == 11) | (parse_array == 17) |
+                       (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
+    upper_body_mask = cv2.dilate(upper_body_mask, np.ones((15, 15), np.uint8), iterations=1)
+    inpaint_mask = cv2.bitwise_and(inpaint_mask, upper_body_mask)
     
     # 4. Forearm Protection (Exclude area below elbows)
     # Erase everything below the elbow to protect the skin

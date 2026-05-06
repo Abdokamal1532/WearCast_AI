@@ -195,8 +195,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WearCast AI API Professional Test Client")
     parser.add_argument("--person", type=str, help="Path to person image")
     parser.add_argument("--garment", type=str, help="Path to garment image")
+    parser.add_argument("--url", type=str, help="API Base URL (e.g., https://xyz.ngrok-free.dev)")
     args = parser.parse_args()
     
+    if args.url:
+        BASE_URL = args.url
+        # Ensure no trailing slash
+        if BASE_URL.endswith("/"):
+            BASE_URL = BASE_URL[:-1]
+            
     test_tryon(args.person, args.garment)
 
 

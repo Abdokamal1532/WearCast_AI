@@ -240,8 +240,12 @@ class WearCastHD:
             print(f" -> Mask Diagnostic: {mask_pixels} pixels marked for replacement ({100*mask_pixels/total_pixels:.2f}% of image)")
             print(f" -> Mask raw size: {mask.size}  |  dtype={mask_np.dtype}  |  min={mask_np.min()}  max={mask_np.max()}")
 
-            mask = mask.resize((768, 1024), Image.NEAREST)
-            print(f" -> Mask after resize: {mask.size}")
+            mask = mask.resize((768, 1024), Image.BILINEAR)  # Smooth upscale
+            # Re-binarize after bilinear to prevent grey artifacts
+            mask_np_clean = np.array(mask)
+            mask_np_clean = (mask_np_clean > 127).astype(np.uint8) * 255
+            mask = Image.fromarray(mask_np_clean)
+            print(f" -> Mask after bilinear resize and re-binarization: {mask.size}")
 
             # Save mask debug images
             def debug_save(img, name):
@@ -368,7 +372,7 @@ class WearCastHD:
             t_unet_start = time.time()
             images = self.pipe(
                 prompt_embeds=prompt_embeds,
-                image_garm=image_garm,
+                image_garm=garm_proc,  # Recommendation D: Use BG-cleaned garment for UNet
                 image_vton=image_vton,
                 mask=mask,
                 image_ori=image_ori,
@@ -418,18 +422,24 @@ class WearCastHD:
             mask_np = mask_np / 255.0
 
         # Binarize
+        # Binarize
         binary_mask = (mask_np > 0.5).astype(np.uint8)
         
-        # Multi-stage edge softening:
-        # 1. Slightly erode to ensure no garment-background bleed
-        # 2. Apply Gaussian blur for natural skin/fabric transition
-        kernel_erode = np.ones((3, 3), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
+        # FIX #4: Tighten and stabilize the blend alpha
+        # 1. Erode mask inward to guarantee no garment bleeds outside body
+        kernel_erode = np.ones((5, 5), np.uint8)
+        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=2) # 2x for tighter fit
         
-        # Feathering: 5.0 sigma gives a softer, more natural fabric-to-skin transition
-        # (was 3.0 — too sharp at shirt collar and sleeve edges)
-        feather_sigma = 5.0
-        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        # 2. Use a HARD center + soft edge mask (not fully Gaussian)
+        # This keeps the CENTER of the garment at full 1.0 alpha (no ghost)
+        # while only softening the EDGES for natural skin/fabric transition
+        feather_sigma = 3.0  # Smaller sigma = sharper, more realistic edge
+        blurred = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        
+        # 3. Force center pixels to be fully opaque (1.0)
+        # Any pixel that is inside the mask AND away from edges should be 1.0
+        core_mask = cv2.erode(eroded_mask, np.ones((15, 15), np.uint8), iterations=2)
+        alpha = np.where(core_mask > 0, 1.0, blurred)
         alpha = np.clip(alpha, 0.0, 1.0)
 
         # Save feather mask for debugging
@@ -453,12 +463,15 @@ class WearCastHD:
         # FIX: Raised cap from ±20 → ±50 with a 0.6 multiplier so that large gaps
         # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
         # residual that produces the grey "cape" artifact around the waist.
-        if abs(lum_gap) > 3.0:
-            shift = np.clip(lum_gap * 0.6, -50, 50)
-            gen_arr = np.clip(gen_arr + shift, 0, 255)
-            print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
+        # --- FIX #5: Targeted Professional Luminance Match ---
+        # Apply shift ONLY to masked region to prevent background artifacts
+        if abs(lum_gap) > 8.0:  # Higher threshold to avoid over-correction
+            shift = np.clip(lum_gap * 0.3, -25, 25)  # Gentler correction
+            mask_3d = np.repeat(binary_mask[:, :, np.newaxis], 3, axis=2).astype(np.float32)
+            gen_arr = np.clip(gen_arr + shift * mask_3d, 0, 255)
+            print(f"   [CORR] Applied targeted luminance shift: {shift:+.1f} (mask-only)")
         else:
-            print(f"   [CORR] Luminance match already within tolerance (gap={lum_gap:.1f})")
+            print(f"   [CORR] Luminance within tolerance (gap={lum_gap:.1f})")
 
 
         # --- Final Compositing (The "Cape" Killer) ---
@@ -532,10 +545,10 @@ class WearCastHD:
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Complex/patterned garments: 30 steps for maximum fidelity
-            return {"num_steps": 30, "image_scale": 2.0}
+            return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
         else:
             # Simple garments: 30 steps for premium realism
-            return {"num_steps": 30, "image_scale": 2.0}
+            return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
 
 
     def local_color_correction(self, generated, original_garment, mask_hard):
@@ -958,11 +971,10 @@ class WearCastHD:
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
                 # Horizontal Corridor — keeps only pixels within body width.
-                # FIX: Widened from 0.52× → 0.65× and added ±15px padding so that
-                # shirt sides and sleeve transitions are not clipped at straight edges.
+                # FIX #3: Tightened from 0.65x -> 0.55x to prevent background bleed
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.65 - 15
-                    r_bound = mid_shoulder[0] + s_width * 0.65 + 15
+                    l_bound = mid_shoulder[0] - s_width * 0.55 - 8
+                    r_bound = mid_shoulder[0] + s_width * 0.55 + 8
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
@@ -1056,8 +1068,27 @@ class WearCastHD:
         parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=3)
 
         if category_norm in ('upper_body', 'dresses'):
+            # FIX #6: Use pose keypoints as fallback for neck mask if Label 18 is missing
             neck_mask = (parse_array == 18).astype(np.float32)
-            neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
+            
+            if neck_mask.sum() < 100: # Label 18 missing or too small
+                print("   [MASK_GEN] Label 18 (Neck) not found, using pose keypoint fallback")
+                neck_kp = pose_data[1] # OpenPose index 1 = Neck
+                if neck_kp[0] > 1 and neck_kp[1] > 1:
+                    neck_x = int(neck_kp[0] * width / image_vton.width) # Wait, need to use proper width
+                    # In get_mask_location, width/height are already the target size
+                    neck_x = int(neck_kp[0] * width / 384) # keypoints are relative to 384x512 or 768x1024?
+                    # Line 888: scale_factor = model_parse.height / 1024.0
+                    # keypoints are relative to 1024.
+                    # So we should use the scaled keypoints we already calculated.
+                    neck_x = int(neck[0])
+                    neck_y = int(neck[1])
+                    neck_radius = int(0.04 * height)
+                    neck_mask_manual = np.zeros((height, width), dtype=np.float32)
+                    cv2.circle(neck_mask_manual, (neck_x, neck_y), neck_radius, 1.0, -1)
+                    neck_mask = neck_mask_manual
+
+            neck_mask = cv2.dilate(neck_mask.astype(np.uint8), np.ones((5, 5), np.uint16), iterations=1).astype(np.float32)
             neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
             parse_mask = np.logical_or(parse_mask, neck_mask)
 
