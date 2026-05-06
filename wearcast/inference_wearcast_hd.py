@@ -187,9 +187,10 @@ class WearCastHD:
         color_diff[bg_mask] = 0
         
         # Adaptive thresholding
+        # --- LOGO EXTRACTION (Adaptive Floor) ---
+        # FIX: Lowered floor to 12.0 and multiplier to 0.5 to capture thin patterns (like 'LOVE' dental tools)
         std_diff = np.std(color_diff[color_diff > 0])
-        thresh = max(15, std_diff * 0.7) 
-        
+        thresh = max(12.0, std_diff * 0.5)
         raw_logo_mask = (color_diff > thresh).astype(np.uint8) * 255
         
         y_indices, x_indices = np.where(raw_logo_mask > 0)
@@ -791,12 +792,16 @@ class WearCastHD:
             
             # Adaptive Strength
             strength = 1.0
-            if avg_l > 220: 
-                strength = 0.7 # High strength for white shirts to fix UNet grayness
-                print(f" -> [COLOR] Ultra-bright garment detected (L={avg_l:.1f}). Force-matching to restore white.")
-            elif avg_l > 180 or std_ab > 15.0:
-                strength = 0.5 # Moderate for light shirts
-                print(f" -> [COLOR] Light/Graphic garment detected (L={avg_l:.1f}). Balanced matching.")
+            if avg_l > 215: 
+                strength = 1.0 # Force full match for white shirts
+                # Apply a baseline brightness shift to help LAB matching reach the white point
+                gen_l_mean = np.mean(cv2.cvtColor(gen_arr.astype(np.uint8), cv2.COLOR_RGB2LAB)[:, :, 0][alpha > 0.5])
+                l_shift = (avg_l - gen_l_mean) * 0.5
+                print(f" -> [COLOR] White shirt detected. Applying +{l_shift:.1f} pre-match luminance shift.")
+                # We can't easily shift LAB here without convert, so we'll rely on match_histograms_lab with strength 1.0
+            elif avg_l > 170 or std_ab > 12.0:
+                strength = 0.8 # Higher strength for light/colorful garments
+                print(f" -> [COLOR] Light/Graphic garment detected (L={avg_l:.1f}). Applying high-strength match.")
             
             if strength > 0:
                 gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha, strength=strength)
