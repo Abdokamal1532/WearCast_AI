@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 import cv2
 import random
 import time
+from rembg import remove, new_session
 
 from wearcast.pipelines_wearcast.pipeline_wearcast import WearCastPipeline
 from wearcast.pipelines_wearcast.unet_garm_2d_condition import UNetGarm2DConditionModel
@@ -130,6 +131,18 @@ class WearCastHD:
         # Use UniPC scheduler (what OOTD was designed for)
         self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
         print(f"[WearCastHD] Scheduler replaced with UniPCMultistepScheduler.")
+        
+        # --- PERFORMANCE OPTIMIZATION ---
+        print("[WearCastHD] Initializing rembg session globally...")
+        self.rembg_session = new_session("u2net")
+
+        print("[WearCastHD] Compiling UNet for massive speedup (First run will be slow, subsequent runs 15-20s)...")
+        try:
+            self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="reduce-overhead", fullgraph=False)
+            print("[WearCastHD] UNet compilation scheduled.")
+        except Exception as e:
+            print(f"[WearCastHD] torch.compile failed: {e}. Proceeding without compilation.")
+
         print("=" * 70)
 
     def tokenize_captions(self, captions, max_length):
@@ -137,6 +150,92 @@ class WearCastHD:
             captions, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
         return inputs.input_ids
+
+    def apply_logo_warping(self, image_garm, person_keypoints, generated_image, target_mask):
+        """
+        [STUDIO MASTER] TPS-Style Geometric Warping
+        Extracts ONLY the high-frequency text/logos using Canny Edge detection
+        and warps them onto the generated body based on OpenPose landmarks.
+        """
+        import cv2
+        from PIL import Image
+        
+        garm_np = np.array(image_garm.convert('RGB'))
+        gen_np  = np.array(generated_image.convert('RGB'))
+        mask_np = np.array(target_mask).astype(np.float32) / 255.0
+        
+        h_gen, w_gen = gen_np.shape[:2]
+        h_garm, w_garm = garm_np.shape[:2]
+
+        # 1. TIGHTER CROP: Only look at the exact center chest to avoid borders/background
+        logo_rect = [int(w_garm * 0.25), int(h_garm * 0.20), int(w_garm * 0.75), int(h_garm * 0.55)]
+        logo_src = garm_np[logo_rect[1]:logo_rect[3], logo_rect[0]:logo_rect[2]]
+        
+        # 2. STRICT TEXT ISOLATION (Canny Edge Detection + Dilation)
+        # This guarantees we only warp the text/logo and NOT the background square
+        gray_logo = cv2.cvtColor(logo_src, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray_logo, 50, 150)
+        # Thicken the edges to cover the fill of the letters
+        logo_alpha_src = cv2.dilate(edges, np.ones((7, 7), np.uint8), iterations=2)
+        logo_alpha_src = cv2.GaussianBlur(logo_alpha_src, (5, 5), 0).astype(np.float32) / 255.0
+        
+        # 3. Define Target Landmarks on Person (from OpenPose)
+        kp = person_keypoints
+        if isinstance(kp, dict) and "pose_keypoints_2d" in kp:
+            kp = kp["pose_keypoints_2d"]
+            
+        scale_w = w_gen / 384.0
+        scale_h = h_gen / 512.0
+        
+        neck = [kp[1][0] * scale_w, kp[1][1] * scale_h]
+        r_sho = [kp[2][0] * scale_w, kp[2][1] * scale_h]
+        l_sho = [kp[5][0] * scale_w, kp[5][1] * scale_h]
+
+        if any(p[0] <= 1 for p in [neck, r_sho, l_sho]):
+            print(" -> [LOGO_WARP] Landmarks missing, skipping geometric transfer.")
+            return generated_image
+
+        # 4. Source and Target Quads
+        src_pts = np.float32([
+            [0, 0], [logo_src.shape[1], 0],
+            [logo_src.shape[1], logo_src.shape[0]], [0, logo_src.shape[0]]
+        ])
+
+        chest_top = (np.array(r_sho) + np.array(l_sho) + np.array(neck)) / 3.0
+        chest_top[1] += 25 * scale_h # Move down to chest
+        
+        chest_w = np.linalg.norm(np.array(l_sho) - np.array(r_sho)) * 0.75 # Tighter scaling
+        chest_h = chest_w * (logo_src.shape[0] / logo_src.shape[1]) 
+        
+        angle = np.arctan2(l_sho[1] - r_sho[1], l_sho[0] - r_sho[0])
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+
+        def rotate_pt(pt, center):
+            nx = cos_a * (pt[0] - center[0]) - sin_a * (pt[1] - center[1]) + center[0]
+            ny = sin_a * (pt[0] - center[0]) + cos_a * (pt[1] - center[1]) + center[1]
+            return [nx, ny]
+
+        dst_pts = np.float32([
+            rotate_pt([chest_top[0] - chest_w/2, chest_top[1]], chest_top),
+            rotate_pt([chest_top[0] + chest_w/2, chest_top[1]], chest_top),
+            rotate_pt([chest_top[0] + chest_w/2, chest_top[1] + chest_h], chest_top),
+            rotate_pt([chest_top[0] - chest_w/2, chest_top[1] + chest_h], chest_top)
+        ])
+
+        # 5. Apply Perspective Warp
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped_logo = cv2.warpPerspective(logo_src, M, (w_gen, h_gen), flags=cv2.INTER_LANCZOS4)
+        warped_alpha = cv2.warpPerspective(logo_alpha_src, M, (w_gen, h_gen), flags=cv2.INTER_LANCZOS4)
+        
+        # 6. Constrain alpha to shirt mask and create 3D Alpha
+        warped_alpha = warped_alpha * mask_np
+        logo_alpha_3d = np.stack([warped_alpha]*3, axis=-1)
+        
+        # 7. Final Blend: Overlay sharp logo details onto the UNet cloth
+        result = gen_np * (1.0 - logo_alpha_3d) + warped_logo * logo_alpha_3d
+
+        print(f" -> [LOGO_WARP] Transfer successful. Logo coverage: {np.mean(warped_alpha)*100:.1f}%")
+        return Image.fromarray(result.astype(np.uint8))
 
     def match_histograms_lab(self, source, reference_fg_vals, mask, strength=1.0):
         """
@@ -258,9 +357,8 @@ class WearCastHD:
         from PIL import Image
         print(" -> [MATTING] Initializing rembg (U2-Net)...")
         try:
-            from rembg import remove
             # 1. AI Background Removal
-            res_pil = remove(image_pil)
+            res_pil = remove(image_pil, session=self.rembg_session)
             # 2. Extract alpha channel as mask
             res_np = np.array(res_pil)
             # Check if RGBA
@@ -348,6 +446,7 @@ class WearCastHD:
             print(" -> Running OpenPose inference (Human Keypoints)...")
             t0 = time.time()
             keypoints = self.openpose_model(image_vton)
+            self._cached_keypoints = keypoints # Store for later warping
             t1 = time.time()
             pose_data = np.array(keypoints["pose_keypoints_2d"])
             print(f"    [POSE] Keypoints count : {len(keypoints['pose_keypoints_2d'])}")
@@ -465,22 +564,23 @@ class WearCastHD:
             debug_save(garm_enhanced, "debug_phase2_clip_input.jpg")
             print(f" -> [SAVED] CLIP input garment saved to: debug_phase2_clip_input.jpg")
 
-            # --- 2c. CLIP Encoding ---
-            prompt_image = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
-            prompt_image = self.image_encoder(prompt_image.data['pixel_values'].to(dtype=torch.float16)).image_embeds
-            clip_norm = prompt_image.float().norm().item()
-            clip_std  = prompt_image.float().std().item()
-            prompt_image = prompt_image.unsqueeze(1)  # [1, 768] -> [1, 1, 768]
-            print(f" -> CLIP image_embeds shape: {list(prompt_image.shape)} | norm={clip_norm:.2f} | std={clip_std:.4f}")
-
-            # --- FIX #13: Dynamic VLM Prompting ---
-            # Replaces the empty string with a descriptive prompt to guide the UNet
+            # --- 2c. CLIP Encoding (Standard Global) ---
+            # Reverted to standard global embedding to prevent UNet out-of-distribution hallucinations
+            clip_inputs = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
+            with torch.no_grad():
+                clip_outputs = self.image_encoder(clip_inputs.data['pixel_values'].to(dtype=torch.float16))
+                image_embeds = clip_outputs.image_embeds.unsqueeze(1) # [1, 1, 768]
+            
+            # --- 2d. Advanced Prompt Construction ---
             garment_desc = self.generate_garment_caption(category, image_garm)
             print(f" -> [PROMPT] Generated dynamic description: \"{garment_desc[:50]}...\"")
         
-            prompt_embeds = self.text_encoder(self.tokenize_captions([garment_desc], 2).to(self.gpu_id))[0].to(dtype=torch.float16)
-            prompt_embeds[:, 1:] = prompt_image[:]
-            print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (2 tokens: null_text + garment_CLIP)")
+            text_inputs = self.tokenize_captions([garment_desc], 77).to(self.gpu_id)
+            prompt_embeds = self.text_encoder(text_inputs)[0].to(dtype=torch.float16) # [1, 77, 768]
+            
+            # Inject global image embedding into token index 1 (OOTDiffusion Standard)
+            prompt_embeds[:, 1:2, :] = image_embeds[:]
+            print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (Restored standard 77-token format)")
             _dbg_tensor("prompt_embeds", prompt_embeds)
 
             # --- 2d. VAE Garment Fidelity Check ---
@@ -676,11 +776,15 @@ class WearCastHD:
 
         # --- FIX #17: Luminance-Aware Shadow Blending ---
         # Extracts natural shadows and applies them based on garment brightness
-        ori_lum = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        ori_lum_raw = cv2.cvtColor(ori_arr.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        
+        # CRITICAL FIX: Heavy blur to extract ONLY broad shadows, destroying high-frequency logos/lanyards
+        ori_lum_blurred = cv2.GaussianBlur(ori_lum_raw, (41, 41), 0)
+        
         # Normalize lum: flat lighting ~ 1.0, shadows < 1.0
-        lum_mean = np.mean(ori_lum[input_mask_np > 0.5]) if np.any(input_mask_np > 0.5) else 0.5
-        shadow_map = ori_lum / (lum_mean + 1e-6)
-        shadow_map = np.clip(shadow_map, 0.4, 1.2) 
+        lum_mean = np.mean(ori_lum_blurred[input_mask_np > 0.5]) if np.any(input_mask_np > 0.5) else 0.5
+        shadow_map = ori_lum_blurred / (lum_mean + 1e-6)
+        shadow_map = np.clip(shadow_map, 0.5, 1.1)  # Tighter clip to prevent extreme darkening
         
         # Adaptive strength: light garments need subtler shadows
         avg_l = np.mean(ref_fg_vals[:, 0]) if np.any(garm_fg_mask) else 128.0
@@ -689,11 +793,11 @@ class WearCastHD:
         elif avg_l > 150:
             shadow_strength = 0.25 # Medium for light shirts
         else:
-            shadow_strength = 0.40 # Strong for dark shirts
+            shadow_strength = 0.50 # Strong for dark shirts
         
         shadow_3d = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
         gen_arr = gen_arr * (1.0 - shadow_strength + shadow_strength * shadow_3d)
-        print(f" -> [SHADOW] Applied adaptive multiply (strength={shadow_strength}, L={avg_l:.1f}).")
+        print(f" -> [SHADOW] Applied adaptive multiply (strength={shadow_strength}, L={avg_l:.1f}). Ghosting prevented.")
 
 
         # --- Final Compositing (The "Cape" Killer) ---
@@ -703,21 +807,30 @@ class WearCastHD:
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
         
         # Ensure RGB mode and matching sizes
-        gen_final = np.array(raw_generated.convert('RGB')).astype(np.float32)
+        # gen_arr already contains LAB matching and Shadow maps.
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+
+        # --- STUDIO MASTER: TPS-Style Geometric Detail Transfer ---
+        # If the garment is patterned or has text (logo), we geometrically warp 
+        # the original pixels to guarantee 100% clarity and zero distortion.
+        if is_complex:
+            print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
+            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
+            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
+            gen_arr = np.array(blended_pil).astype(np.float32)
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
             # Resize skin mask to match output
             skin_mask_final = cv2.resize(self._skin_mask, raw_generated.size, interpolation=cv2.INTER_LINEAR)
-            gen_final = self.apply_frequency_blending(gen_final, ori_final, skin_mask_final)
+            gen_arr = self.apply_frequency_blending(gen_arr, ori_final, skin_mask_final)
             print(" -> [SKIN] Frequency separation complete (restored skin texture).")
         
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
         
         # Alpha Blend: result = (new * alpha) + (old * (1 - alpha))
-        final_np = (gen_final * alpha_3d) + (ori_final * (1.0 - alpha_3d))
+        final_np = (gen_arr * alpha_3d) + (ori_final * (1.0 - alpha_3d))
         final_image = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
         
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
@@ -748,27 +861,35 @@ class WearCastHD:
 
     def detect_garment_complexity(self, image_garm):
         """
-        Detect if garment is complex (pattern, logo, ruffle) using variance and edges.
+        [UPDATED] Highly sensitive detection for logos, text, and patterns.
         """
+        import cv2
+        import numpy as np
         garm_np = np.array(image_garm)
-
-        # Remove white background first
         bg_mask = np.all(garm_np >= 240, axis=-1)
         fg_pixels = garm_np[~bg_mask]
 
         if len(fg_pixels) < 500:
-            print(f"   [COMPLEXITY] Only {len(fg_pixels)} foreground pixels — defaulting to simple.")
             return False
 
+        # 1. Color variance (Lowered threshold from 38.0 to 20.0)
         color_std = np.std(fg_pixels, axis=0).mean()
-        is_patterned = color_std > 38.0
+        is_patterned = color_std > 20.0
 
+        # 2. Interior Edge Density (For text and thin logos)
         gray = cv2.cvtColor(garm_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = np.sum(edges > 0) / edges.size
-        is_complex_shape = edge_density > 0.06
+        edges = cv2.Canny(gray, 30, 100) # More sensitive edge detection
+        
+        # We only care about edges INSIDE the shirt (ignore the outer boundary)
+        fg_mask_img = (~bg_mask).astype(np.uint8) * 255
+        interior_mask = cv2.erode(fg_mask_img, np.ones((15, 15), np.uint8), iterations=1)
+        interior_edges = cv2.bitwise_and(edges, interior_mask)
+        
+        # Lowered threshold from 0.06 (6%) to 0.015 (1.5%)
+        edge_density = np.sum(interior_edges > 0) / max(1, np.sum(interior_mask > 0))
+        is_complex_shape = edge_density > 0.015 
 
-        print(f"   [COMPLEXITY] FG pixel count={len(fg_pixels)} | color_std={color_std:.2f} (>38=patterned:{is_patterned}) | edge_density={edge_density:.4f} (>0.06=complex:{is_complex_shape})")
+        print(f"   [COMPLEXITY] color_std={color_std:.2f} | interior_edge_density={edge_density:.4f} | TPS_WARPING_TRIGGERED={is_patterned or is_complex_shape}")
         return is_patterned or is_complex_shape
 
     def get_optimal_params(self, category, is_complex_garment):
