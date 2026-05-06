@@ -275,13 +275,15 @@ class WearCastHD:
         hull_pts = []
         valid = lambda p: p[0] > 1 and p[1] > 1
         
-        # Moderate lateral padding for T-shirt sleeves (25px)
-        ARM_PAD = int(25 / 512 * height) 
+        # Moderate lateral padding for T-shirt sleeves (35px for better coverage)
+        ARM_PAD = int(35 / 512 * height) 
         
+        # Add more points around shoulders to ensure full deltoid coverage
         for p in [s_r, s_l, e_r, e_l]:
             if valid(p):
                 hull_pts.append([p[0] + ARM_PAD, p[1]])
                 hull_pts.append([p[0] - ARM_PAD, p[1]])
+                hull_pts.append([p[0], p[1] - ARM_PAD // 2]) # Top of shoulder
         
         inpaint_mask = target_area.copy()
         torso_pixels = np.column_stack(np.where(target_area > 0))

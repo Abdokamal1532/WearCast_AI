@@ -352,6 +352,8 @@ async def stream_progress(task_id: str):
                     "remaining": remaining
                 }
                 yield f"data: {json.dumps(data)}\n\n"
+                # Keep-alive ping (standard SSE practice)
+                yield ": ping\n\n"
                 await asyncio.sleep(1) 
         except Exception as e:
             error_data = {"status": "error", "message": f"Stream internal error: {str(e)}"}
