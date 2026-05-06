@@ -291,12 +291,33 @@ class WearCastHD:
             print(f" -> Garment BG analysis: {100*bg_coverage:.1f}% BG pixels (selected threshold>={bg_thresh})")
 
             if bg_coverage > 0.05:
-                print(f" -> White product background detected ({100*bg_coverage:.1f}%), replacing with neutral gray for CLIP...")
                 garm_np_proc = garm_np.copy()
-                garm_np_proc[bg_mask] = [170, 170, 170]
+                # --- Adaptive BG Color ---
+                # For a dark garment (e.g. black shirt), using a medium-grey BG (170,170,170)
+                # biases the CLIP embedding toward grey → UNet generates grey, not black.
+                # FIX: Detect garment foreground luminance and choose a complementary BG:
+                #   - Dark foreground  (<80 lum) → dark BG [30,30,30]  (preserves black)
+                #   - Medium foreground (80-160)  → neutral BG [128,128,128]
+                #   - Light foreground  (>160 lum) → medium-grey BG [170,170,170]
+                fg_pixels = garm_np[~bg_mask]
+                if len(fg_pixels) > 100:
+                    fg_lum = (fg_pixels[:,0]*0.299 + fg_pixels[:,1]*0.587 + fg_pixels[:,2]*0.114).mean()
+                else:
+                    fg_lum = 128.0
+                if fg_lum < 80:
+                    bg_color = [30, 30, 30]
+                    bg_label = "dark (garment is dark/black)"
+                elif fg_lum < 160:
+                    bg_color = [128, 128, 128]
+                    bg_label = "neutral-grey (garment is medium tone)"
+                else:
+                    bg_color = [170, 170, 170]
+                    bg_label = "light-grey (garment is light/white)"
+                print(f" -> Garment FG luminance: {fg_lum:.1f} → using BG color={bg_color} [{bg_label}]")
+                garm_np_proc[bg_mask] = bg_color
                 garm_proc = Image.fromarray(garm_np_proc)
                 debug_save(garm_proc, "debug_phase2_clip_bg_replaced.jpg")
-                print(f" -> [SAVED] CLIP input (BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
+                print(f" -> [SAVED] CLIP input (adaptive BG replaced) saved to: debug_phase2_clip_bg_replaced.jpg")
             else:
                 print(f" -> No significant white BG detected. Using original garment for CLIP.")
                 garm_proc = image_garm.copy()
@@ -426,8 +447,9 @@ class WearCastHD:
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1)
         
-        # Feathering: 3.0 sigma provides a professional "studio" blend
-        feather_sigma = 3.0
+        # Feathering: 5.0 sigma gives a softer, more natural fabric-to-skin transition
+        # (was 3.0 — too sharp at shirt collar and sleeve edges)
+        feather_sigma = 5.0
         alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -447,12 +469,21 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: Professional Luminance Match ---
-        # Balances the UNet lighting to match the original garment reference
+        # --- Luminance Match: Dark-Garment-Aware ---
+        # For dark garments (reference lum < 80, e.g. black shirt) the UNet tends to
+        # generate medium-grey output because diffusion priors are biased toward average
+        # scene brightness. We apply a more aggressive correction in that case:
+        #   - Dark garment  (ref < 80)  : factor=0.85, cap=70 → strong darken
+        #   - Normal garment (ref >= 80) : factor=0.6,  cap=50 → balanced shift
         if abs(lum_gap) > 3.0:
-            shift = np.clip(lum_gap * 0.5, -20, 20)
+            if garm_lum_mean < 80 and lum_gap < 0:
+                # Dark garment: push harder toward black
+                shift = np.clip(lum_gap * 0.85, -70, 0)
+                print(f"   [CORR] Dark-garment mode (ref={garm_lum_mean:.1f}<80): shift={shift:+.1f}")
+            else:
+                shift = np.clip(lum_gap * 0.6, -50, 50)
+                print(f"   [CORR] Standard luminance shift: {shift:+.1f}")
             gen_arr = np.clip(gen_arr + shift, 0, 255)
-            print(f"   [CORR] Applied professional luminance shift: {shift:+.1f}")
         else:
             print(f"   [CORR] Luminance match already within tolerance (gap={lum_gap:.1f})")
 
@@ -795,8 +826,7 @@ class WearCastHD:
 
         # --- Model-type arm width (matches OOTDiffusion exactly) ---
         if model_type == 'hd':
-            # Surgical Arm Masking: 30px is enough for target_w=384
-            arm_width = 30
+            arm_width = 60  # Original OOTDiffusion value — 30 was too thin, losing arm coverage
         elif model_type == 'dc':
             arm_width = 45
         else:
@@ -960,11 +990,12 @@ class WearCastHD:
                 body_radius = int(max(s_width * 0.05, 8))
                 spatial_prior = cv2.dilate(spatial_prior, np.ones((body_radius, body_radius), np.uint8), iterations=1)
                 
-                # Strict Horizontal Corridor (The "Cape Killer" - TIGHTENED: 0.6 -> 0.52)
-                # Any pixel outside 0.52x shoulder width is KILLED
+                # Horizontal Corridor — keeps only pixels within body width.
+                # FIX: Widened from 0.52× → 0.65× and added ±15px padding so that
+                # shirt sides and sleeve transitions are not clipped at straight edges.
                 if s_width > 10:
-                    l_bound = mid_shoulder[0] - s_width * 0.52
-                    r_bound = mid_shoulder[0] + s_width * 0.52
+                    l_bound = mid_shoulder[0] - s_width * 0.65 - 15
+                    r_bound = mid_shoulder[0] + s_width * 0.65 + 15
                     spatial_prior[:, :max(0, int(l_bound))] = 0
                     spatial_prior[:, min(spatial_prior.shape[1], int(r_bound)):] = 0
 
@@ -1028,23 +1059,34 @@ class WearCastHD:
 
             # Combine arm masks into final garment mask
             # TIGHTENED: Reduced dilation (4 -> 1) to prevent background bloat
+
+            # Combine arm masks into final garment mask.
+            # FIX: Also unconditionally union the raw arm segmentation labels (arms_left,
+            # arms_right) into the parse mask for upper_body try-on. This is critical when
+            # the model wears a sleeveless garment but the target has sleeves: the parser
+            # correctly labels bare arms as LeftArm/RightArm, but the old code only used
+            # those labels as a fallback when wrist keypoints were missing (0,0). Now we
+            # always include the full arm parse region so the UNet can synthesise sleeves.
+
             arm_mask = cv2.dilate(
                 np.logical_or(im_arms_left, im_arms_right).astype('float32'),
-                np.ones((5, 5), np.uint16), iterations=1)
+                np.ones((5, 5), np.uint16), iterations=3)  # 3 iterations for proper sleeve area coverage
             parse_mask = np.logical_or(parse_mask, arm_mask).astype(np.float32)
+            # Always add raw arm segmentation — catches bare-arm regions the drawn
+            # arm lines may not fully cover (especially for sleeveless → sleeved transfers)
+            parse_mask = np.logical_or(parse_mask, arms_left).astype(np.float32)
+            parse_mask = np.logical_or(parse_mask, arms_right).astype(np.float32)
+            print(f"   [MASK_GEN] Arm-parse pixels added to mask (sleeveless→sleeved support).")
 
             # ------------------------------------------------------------------
             # FINAL LOCK: Apply Silhouette Lock and Cape Killer to the WHOLE mask
             # ------------------------------------------------------------------
-            # Any pixel outside the 5px silhouette buffer is KILLED
+            # Silhouette Lock: remove any mask pixel that falls outside the person body
+            # (5px dilated silhouette). This kills background bleed without cutting arm coverage.
             parse_mask = np.logical_and(parse_mask, silhouette_lock).astype(np.float32)
-
-            # Re-apply Cape Killer corridor to the final combined mask
-            if s_width > 10:
-                l_bound = mid_shoulder[0] - s_width * 0.52
-                r_bound = mid_shoulder[0] + s_width * 0.52
-                parse_mask[:, :max(0, int(l_bound))] = 0
-                parse_mask[:, min(parse_mask.shape[1], int(r_bound)):] = 0
+            # NOTE: We do NOT re-apply the 0.52× corridor here. The spatial_prior already
+            # uses 0.65× + 15px padding. A second 0.52× pass was causing mask to drop
+            # from ~29% → ~12%, stripping all arm pixels and killing sleeve coverage.
 
             # Hands = arm-parse pixels NOT covered by drawn arm lines → protect them
             hands_left  = np.logical_and(np.logical_not(im_arms_left),  arms_left)
@@ -1057,7 +1099,10 @@ class WearCastHD:
         # ------------------------------------------------------------------
         parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
         # TIGHTENED: Minimum dilation (1 iteration) for seamless edges only
-        parse_mask = cv2.dilate(parse_mask, np.ones((3, 3), np.uint16), iterations=1)
+        # parse_mask = cv2.dilate(parse_mask, np.ones((3, 3), np.uint16), iterations=1)
+        # FIX: Increased from 2 → 3 iterations (15px effective radius) to better cover
+        # arm edges and shirt-hem transitions without over-masking the face/neck.
+        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=3)
 
         if category_norm in ('upper_body', 'dresses'):
             neck_mask = (parse_array == 18).astype(np.float32)
