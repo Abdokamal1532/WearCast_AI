@@ -233,9 +233,6 @@ class BasicTransformerBlock(nn.Module):
 
         spatial_attn_input = hidden_states
         if self.assigned_spatial_attn_idx is not None:
-            # [PERFORMANCE FIX v2] Using .item() or direct indexing on a tensor 
-            # can still trigger recompilation if not careful. 
-            # But making it a Tensor helps Dynamo see it as dynamic data.
             spatial_attn_inputs[self.assigned_spatial_attn_idx] = spatial_attn_input
         else:
             spatial_attn_inputs.append(spatial_attn_input)

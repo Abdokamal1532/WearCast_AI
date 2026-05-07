@@ -791,7 +791,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
         idx = 0
         for module in self.modules():
             if isinstance(module, BasicTransformerBlock):
-                module.assigned_spatial_attn_idx = torch.tensor(idx, dtype=torch.long, device=self.device)
+                module.assigned_spatial_attn_idx = int(idx)
                 idx += 1
         print(f" -> Successfully assigned static spatial_attn_idx to {idx} VTON Transformer Blocks.")
 

@@ -138,8 +138,15 @@ class WearCastHD:
 
         print("[WearCastHD] Compiling UNet for massive speedup (First run will be slow, subsequent runs 15-20s)...")
         try:
+            # [PERFORMANCE FIX v2.1] 
+            # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
+            # 2. Increase recompile limit to accommodate all 16 Transformer blocks
+            import torch._dynamo
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            torch._dynamo.config.recompile_limit = 24 
+            
             self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="reduce-overhead", fullgraph=False)
-            print("[WearCastHD] UNet compilation scheduled.")
+            print("[WearCastHD] UNet compilation scheduled (Dynamic Indexing enabled).")
         except Exception as e:
             print(f"[WearCastHD] torch.compile failed: {e}. Proceeding without compilation.")
 
