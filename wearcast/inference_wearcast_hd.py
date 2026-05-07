@@ -778,6 +778,9 @@ class WearCastHD:
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
         # --- PHASE 4 MASTER: ADAPTIVE SHADOW COMPOSITING ---
+        # 0. Prepare original background reference for shadows and final composite
+        ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+        
         # 1. Extract raw shadows from original image
         # We use a large blur to remove high-frequency details (lanyards, old logos) 
         # and keep only the anatomical lighting (pecs, stomach, folds).
@@ -842,7 +845,7 @@ class WearCastHD:
         
         # Ensure RGB mode and matching sizes
         # gen_arr already contains LAB matching and Shadow maps.
-        ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+        # ori_final is already defined above in Phase 4
 
         # --- STUDIO MASTER: AI-Native Rendering ---
         # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
