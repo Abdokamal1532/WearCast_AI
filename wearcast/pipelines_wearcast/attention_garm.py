@@ -209,6 +209,7 @@ class BasicTransformerBlock(nn.Module):
         # let chunk size default to None
         self._chunk_size = None
         self._chunk_dim = 0
+        self.assigned_spatial_attn_idx = None
 
     def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int):
         # Sets chunk feed-forward
@@ -231,7 +232,10 @@ class BasicTransformerBlock(nn.Module):
         batch_size = hidden_states.shape[0]
 
         spatial_attn_input = hidden_states
-        spatial_attn_inputs.append(spatial_attn_input)
+        if self.assigned_spatial_attn_idx is not None:
+            spatial_attn_inputs[self.assigned_spatial_attn_idx] = spatial_attn_input
+        else:
+            spatial_attn_inputs.append(spatial_attn_input)
 
         if self.use_ada_layer_norm:
             norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -325,13 +329,13 @@ class BasicTransformerBlock(nn.Module):
             num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
             ff_output = torch.cat(
                 [
-                    self.ff(hid_slice, scale=lora_scale)
+                    self.ff(hid_slice)
                     for hid_slice in norm_hidden_states.chunk(num_chunks, dim=self._chunk_dim)
                 ],
                 dim=self._chunk_dim,
             )
         else:
-            ff_output = self.ff(norm_hidden_states, scale=lora_scale)
+            ff_output = self.ff(norm_hidden_states)
 
         if self.use_ada_layer_norm_zero:
             ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -392,11 +396,8 @@ class FeedForward(nn.Module):
         if final_dropout:
             self.net.append(nn.Dropout(dropout))
 
-    def forward(self, hidden_states: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         compatible_cls = (GEGLU,) if USE_PEFT_BACKEND else (GEGLU, LoRACompatibleLinear)
         for module in self.net:
-            if isinstance(module, compatible_cls):
-                hidden_states = module(hidden_states, scale)
-            else:
-                hidden_states = module(hidden_states)
+            hidden_states = module(hidden_states)
         return hidden_states
