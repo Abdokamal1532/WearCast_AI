@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import os
 import torch
+import torch._dynamo
 import numpy as np
 from PIL import Image, ImageDraw
 import cv2
@@ -141,7 +142,6 @@ class WearCastHD:
             # [PERFORMANCE FIX v2.1] 
             # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
             # 2. Increase recompile limit to accommodate all 16 Transformer blocks
-            import torch._dynamo
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.recompile_limit = 24 
             
