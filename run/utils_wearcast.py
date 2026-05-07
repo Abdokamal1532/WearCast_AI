@@ -1,5 +1,3 @@
-import pdb
-
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw
@@ -26,14 +24,13 @@ label_map = {
 }
 
 def extend_arm_mask(wrist, elbow, scale):
-  wrist = elbow + scale * (wrist - elbow)
-  return wrist
+    wrist = elbow + scale * (wrist - elbow)
+    return wrist
 
 def hole_fill(img):
-    img = np.pad(img[1:-1, 1:-1], pad_width = 1, mode = 'constant', constant_values=0)
+    img = np.pad(img[1:-1, 1:-1], pad_width=1, mode='constant', constant_values=0)
     img_copy = img.copy()
     mask = np.zeros((img.shape[0] + 2, img.shape[1] + 2), dtype=np.uint8)
-
     cv2.floodFill(img, mask, (0, 0), 255)
     img_inverse = cv2.bitwise_not(img)
     dst = cv2.bitwise_or(img_copy, img_inverse)
@@ -50,130 +47,90 @@ def refine_mask(mask):
     if len(area) != 0:
         i = area.index(max(area))
         cv2.drawContours(refine_mask, contours, i, color=255, thickness=-1)
-
     return refine_mask
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384,height=512):
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
+    import cv2
+    import numpy as np
+    
     im_parse = model_parse.resize((width, height), Image.NEAREST)
     parse_array = np.array(im_parse)
 
-    arm_width = 60
+    print(" -> Constructing High-Precision Mask (Strict Clothing Boundaries)...")
 
-    parse_head = (parse_array == 1).astype(np.float32) + \
-                 (parse_array == 3).astype(np.float32) + \
-                 (parse_array == 11).astype(np.float32)
+    # 1. Base Mask: ONLY Upper clothes (4) and Dress (7)
+    # لا ندمج الأذرع هنا أبداً لمنع تحول الجلد إلى قماش
+    inpaint_mask = ((parse_array == 4) | (parse_array == 7)).astype(np.uint8) * 255
 
-    parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
-                        (parse_array == label_map["right_shoe"]).astype(np.float32) + \
-                        (parse_array == label_map["hat"]).astype(np.float32) + \
-                        (parse_array == label_map["sunglasses"]).astype(np.float32) + \
-                        (parse_array == label_map["bag"]).astype(np.float32)
+    # 2. Add Neck area (to allow collar changes)
+    pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
+    scale_factor = height / 512.0
+    pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
-    parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
+    if pt(1)[0] > 1: # Neck keypoint
+        cv2.circle(inpaint_mask, (int(pt(1)[0]), int(pt(1)[1])), int(15 * scale_factor), 255, -1)
 
-    arms_left = (parse_array == 14).astype(np.float32)
-    arms_right = (parse_array == 15).astype(np.float32)
-    arms = arms_left + arms_right
-
-    parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
-    parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + \
-                                    (parse_array == label_map["pants"]).astype(np.float32)
-    parser_mask_fixed += parser_mask_fixed_lower_cloth
-    parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
-
-    # Load pose points
-    pose_data = keypoint["pose_keypoints_2d"]
-    pose_data = np.array(pose_data)
-    pose_data = pose_data.reshape((-1, 2))
-
-    im_arms_left = Image.new('L', (width, height))
-    im_arms_right = Image.new('L', (width, height))
-    arms_draw_left = ImageDraw.Draw(im_arms_left)
-    arms_draw_right = ImageDraw.Draw(im_arms_right)
-    # IMPORTANT: Calculate scale based on the actual height of model_parse (source image)
-    # instead of hardcoding 512.0. This fixes the pose-offset bug.
-    source_height = model_parse.height
-    scale_factor = height / float(source_height)
-
-    shoulder_right = np.multiply(tuple(pose_data[2][:2]), scale_factor)
-    shoulder_left = np.multiply(tuple(pose_data[5][:2]), scale_factor)
-    elbow_right = np.multiply(tuple(pose_data[3][:2]), scale_factor)
-    elbow_left = np.multiply(tuple(pose_data[6][:2]), scale_factor)
-    wrist_right = np.multiply(tuple(pose_data[4][:2]), scale_factor)
-    wrist_left = np.multiply(tuple(pose_data[7][:2]), scale_factor)
-    ARM_LINE_WIDTH = int(arm_width / 512 * height)
-    size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
-    size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
-                  shoulder_right[1] + ARM_LINE_WIDTH // 2]
+    # 3. Protect Identity & Skin (Face, Hair, Hat, Bare Arms)
+    # نحمي الأذرع والوجه صراحةً حتى لو تمدد القناع لا يغطيهم
+    skin_protect = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
     
+    # 4. Protect Bottoms (Pants, Skirts)
+    bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
+    
+    # 5. Dilation: Give the UNet room to draw the shirt slightly larger
+    mask_expanded = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
+    
+    # Apply protections (طرح مناطق الحماية من القناع المتمدد)
+    mask_expanded[skin_protect == 255] = 0
+    mask_expanded[bottoms == 255] = 0
 
-    if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
-        im_arms_right = arms_right
-    else:
-        wrist_right = extend_arm_mask(wrist_right, elbow_right, 1.2)
-        arms_draw_right.line(np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-        arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+    # 6. Fill internal holes
+    def hole_fill_local(img):
+        img = np.pad(img[1:-1, 1:-1], pad_width=1, mode='constant', constant_values=0)
+        img_copy = img.copy()
+        mask_fill = np.zeros((img.shape[0] + 2, img.shape[1] + 2), dtype=np.uint8)
+        cv2.floodFill(img, mask_fill, (0, 0), 255)
+        img_inverse = cv2.bitwise_not(img)
+        return cv2.bitwise_or(img_copy, img_inverse)
 
-    if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
-        im_arms_left = arms_left
-    else:
-        wrist_left = extend_arm_mask(wrist_left, elbow_left, 1.2)
-        arms_draw_left.line(np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
-        arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
+    mask_hard = hole_fill_local(mask_expanded)
 
-    hands_left = np.logical_and(np.logical_not(im_arms_left), arms_left)
-    hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
-    parser_mask_fixed += hands_left + hands_right
+    # Organic Smoothing
+    mask_hard = cv2.GaussianBlur(mask_hard, (11, 11), 0)
+    mask_hard = (mask_hard > 127).astype(np.uint8) * 255
 
-    parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-    parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
-    neck_mask = (parse_array == 18).astype(np.float32)
-    neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
-    neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
-    parse_mask = np.logical_or(parse_mask, neck_mask)
-    arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
-    parse_mask += np.logical_or(parse_mask, arm_mask)
+    # Feathered Soft Mask
+    mask_soft = cv2.GaussianBlur(mask_hard.astype(np.float32), (9, 9), 0)
+    inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
-    parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
+    percentage = 100 * np.sum(mask_hard > 0) / (width * height)
+    print(f" -> Optimized Mask: {percentage:.1f}% coverage. Clothing only, arms protected.")
 
-    parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
-    inpaint_mask = 1 - parse_mask_total
-    img = np.where(inpaint_mask, 255, 0)
-    dst = hole_fill(img.astype(np.uint8))
-    dst = refine_mask(dst)
-    inpaint_mask = dst / 255 * 1
-    mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
-    mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
+    return Image.fromarray(mask_hard), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
 
-    return mask, mask_gray
 
 def smart_resize(img: Image.Image, target_size=(768, 1024), fill_color=(255, 255, 255)):
     """
     Resizes image while maintaining aspect ratio, adding padding to reach target_size.
-    This prevents the 'stretched' look common in naive resizing.
     """
     img_w, img_h = img.size
     target_w, target_h = target_size
-    
-    # Calculate aspect ratios
+
     aspect = img_w / img_h
     target_aspect = target_w / target_h
-    
+
     if aspect > target_aspect:
-        # Image is wider than target: fit to width
         new_w = target_w
         new_h = int(target_w / aspect)
     else:
-        # Image is taller than target: fit to height
         new_h = target_h
         new_w = int(target_h * aspect)
-        
+
     img_resized = img.resize((new_w, new_h), Image.LANCZOS)
-    
-    # Create background and paste
+
     new_img = Image.new("RGB", target_size, fill_color)
     paste_x = (target_w - new_w) // 2
     paste_y = (target_h - new_h) // 2
     new_img.paste(img_resized, (paste_x, paste_y))
-    
+
     return new_img

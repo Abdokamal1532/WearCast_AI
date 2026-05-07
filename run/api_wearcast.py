@@ -21,6 +21,7 @@ import subprocess
 import json
 from pathlib import Path
 from typing import Dict, Optional
+import argparse
 
 # ============================================================
 # 1. AUTO-DEPENDENCY INSTALLATION (For Kaggle/Professional Use)
@@ -109,13 +110,31 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Ngrok Setup
-# EXACT token from user: 37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a
+# Load Ngrok token from argument or environment variable
 NGROK_TOKEN = "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a"
 PORT = 8000
 
-def start_ngrok():
+def start_ngrok(token=None, port=None):
+    global NGROK_TOKEN, PORT
+    if token:
+        NGROK_TOKEN = token
+    else:
+        NGROK_TOKEN = os.environ.get("NGROK_AUTH_TOKEN", "37TuVJjPQ5gDI1YioSlO45Zj6WS_3fRgJK5Huea4d9pJScX2a")
+        
+    if port:
+        PORT = port
+
+    if not NGROK_TOKEN:
+        print("\n" + "!"*70)
+        print("[ERROR] NGROK_AUTH_TOKEN not set!")
+        print("Please provide it via --token argument or set NGROK_AUTH_TOKEN env var.")
+        print("Get your token at: https://dashboard.ngrok.com/get-started/your-authtoken")
+        print("!"*70 + "\n")
+        # We don't raise RuntimeError here to allow the FastAPI server to still start locally
+        return None
+
     from pyngrok import conf, ngrok
-    print(f"[DEBUG] Force-setting Ngrok token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
+    print(f"[DEBUG] Setting Ngrok token: {NGROK_TOKEN[:6]}...{NGROK_TOKEN[-6:]}")
     
     # 1. Update the global configuration directly
     conf.get_default().auth_token = NGROK_TOKEN
@@ -128,7 +147,11 @@ def start_ngrok():
         pass
     
     # 2. Connect with the explicit token
-    public_url = ngrok.connect(PORT).public_url
+    try:
+        public_url = ngrok.connect(PORT).public_url
+    except Exception as e:
+        print(f"[ERROR] Ngrok connection failed: {e}")
+        return None
     print("\n" + "="*70)
     print(f"🚀 WEARCAST API IS LIVE!")
     print(f"🔗 Public URL: {public_url}")
@@ -144,8 +167,8 @@ def run_inference(task_id: str, vton_img: Image.Image, garm_img: Image.Image):
     tasks[task_id]["status"] = "processing"
     tasks[task_id]["start_time"] = time.time()
     
-    # Use fixed 20 steps as requested by user (previously was dynamic 15-20)
-    total_steps = 20
+    # Use 30 steps for professional high-fidelity output
+    total_steps = 30
     
     tasks[task_id]["total_steps"] = total_steps
     tasks[task_id]["current_step"] = 0
@@ -351,7 +374,11 @@ async def stream_progress(task_id: str):
                     "message": message,
                     "remaining": remaining
                 }
+                print(f"[DEBUG] SSE Stream {task_id}: Sending {current_status} ({remaining}s remaining)")
                 yield f"data: {json.dumps(data)}\n\n"
+                
+                # Keep-alive ping every second
+                yield ": ping - keepalive\n\n"
                 await asyncio.sleep(1) 
         except Exception as e:
             error_data = {"status": "error", "message": f"Stream internal error: {str(e)}"}
@@ -399,9 +426,14 @@ async def get_debug_image(task_id: str, filename: str):
 # 5. EXECUTION
 # ============================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="WearCast AI Professional API Server")
+    parser.add_argument("--token", type=str, help="Ngrok Auth Token")
+    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
+    args = parser.parse_args()
+
     # 1. Start the Ngrok Tunnel
-    public_url = start_ngrok()
+    public_url = start_ngrok(token=args.token, port=args.port)
     
     # 2. Run the FastAPI Server
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=args.port)
