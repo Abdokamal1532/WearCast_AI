@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import os
 import torch
+import torch._dynamo
 import numpy as np
 from PIL import Image, ImageDraw
 import cv2
@@ -138,8 +139,14 @@ class WearCastHD:
 
         print("[WearCastHD] Compiling UNet for massive speedup (First run will be slow, subsequent runs 15-20s)...")
         try:
+            # [PERFORMANCE FIX v2.1] 
+            # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
+            # 2. Increase recompile limit to accommodate all 16 Transformer blocks
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            torch._dynamo.config.recompile_limit = 24 
+            
             self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="reduce-overhead", fullgraph=False)
-            print("[WearCastHD] UNet compilation scheduled.")
+            print("[WearCastHD] UNet compilation scheduled (Dynamic Indexing enabled).")
         except Exception as e:
             print(f"[WearCastHD] torch.compile failed: {e}. Proceeding without compilation.")
 
@@ -770,13 +777,23 @@ class WearCastHD:
         lum_gap = garm_lum_mean - gen_lum_mean
         print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
 
-        # --- NEW: Professional Luminance Match ---
-        # Balances the UNet lighting to match the original garment reference.
-        # FIX: Raised cap from ±20 → ±50 with a 0.6 multiplier so that large gaps
-        # (e.g. −53.6 from Case 1) are actually corrected instead of leaving a ~33pt
-        # residual that produces the grey "cape" artifact around the waist.
-        # --- FIX #16: Smart Adaptive Color Matching ---
-        # Detects if the garment is light or complex and adjusts LAB matching strength
+        # --- PHASE 4 MASTER: ADAPTIVE SHADOW COMPOSITING ---
+        # 0. Prepare original background reference for shadows and final composite
+        ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+        
+        # 1. Extract raw shadows from original image
+        # We use a large blur to remove high-frequency details (lanyards, old logos) 
+        # and keep only the anatomical lighting (pecs, stomach, folds).
+        print(" -> [SHADOWS] Extracting and blurring adaptive shadow map...")
+        ori_gray = cv2.cvtColor(ori_final.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+        # Heavy blur (sigma=20) to kill ghosts (Lanyards, etc.)
+        shadow_base = cv2.GaussianBlur(ori_gray, (0, 0), 20)
+        # Ratio of original to blurred gives us the lighting map
+        shadow_map = np.clip(ori_gray / (shadow_base + 1e-6), 0.2, 1.5)
+        shadow_map = cv2.GaussianBlur(shadow_map, (0, 0), 5) # Smooth the map
+        shadow_map_3d = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
+
+        # --- FIX #16: Smart Adaptive Color Matching & Shadow Blending ---
         garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
         # FIX: Raise threshold to 254 to include white shirt pixels in the foreground
         garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
@@ -790,22 +807,33 @@ class WearCastHD:
             # Variance in AB channels helps detect colorful graphics
             std_ab = np.std(ref_fg_vals[:, 1:]) 
             
-            # Adaptive Strength
+            # Adaptive Strength for LAB Match
             strength = 1.0
+            # Shadow Strength Logic: 
+            # - White/Light shirt: Low shadow strength (10-15%) to prevent "dirty" look.
+            # - Dark shirt: High shadow strength (30-50%) for depth.
+            shadow_strength = 0.4 # Default
+            
             if avg_l > 215: 
-                strength = 1.0 # Force full match for white shirts
-                # Apply a baseline brightness shift to help LAB matching reach the white point
-                gen_l_mean = np.mean(cv2.cvtColor(gen_arr.astype(np.uint8), cv2.COLOR_RGB2LAB)[:, :, 0][alpha > 0.5])
-                l_shift = (avg_l - gen_l_mean) * 0.5
-                print(f" -> [COLOR] White shirt detected. Applying +{l_shift:.1f} pre-match luminance shift.")
-                # We can't easily shift LAB here without convert, so we'll rely on match_histograms_lab with strength 1.0
-            elif avg_l > 170 or std_ab > 12.0:
-                strength = 0.8 # Higher strength for light/colorful garments
-                print(f" -> [COLOR] Light/Graphic garment detected (L={avg_l:.1f}). Applying high-strength match.")
+                strength = 1.0
+                shadow_strength = 0.12 # Very low for white shirts
+                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (12%).")
+            elif avg_l > 170:
+                strength = 0.8
+                shadow_strength = 0.25 # Medium-low for light shirts
+                print(f" -> [COLOR] Light garment detected (L={avg_l:.1f}). Using 25% shadows.")
+            else:
+                print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using full 40% shadows.")
             
             if strength > 0:
                 gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha, strength=strength)
-                print(f" -> [COLOR] Applied LAB matching (strength={strength}) for deep contrast.")
+                print(f" -> [COLOR] Applied LAB matching (strength={strength}).")
+
+            # 2. Apply Adaptive Multiply Blend
+            # result = unet_output * shadow_map (blended by strength)
+            shadowed_gen = gen_arr * shadow_map_3d
+            gen_arr = (1.0 - shadow_strength) * gen_arr + shadow_strength * shadowed_gen
+            print(f" -> [SHADOWS] Applied adaptive multiply blend (strength={shadow_strength}).")
 
 
 
@@ -817,16 +845,16 @@ class WearCastHD:
         
         # Ensure RGB mode and matching sizes
         # gen_arr already contains LAB matching and Shadow maps.
-        ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
+        # ori_final is already defined above in Phase 4
 
-        # --- STUDIO MASTER: TPS-Style Geometric Detail Transfer ---
-        # If the garment is patterned or has text (logo), we geometrically warp 
-        # the original pixels to guarantee 100% clarity and zero distortion.
-        if is_complex:
-            print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
-            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
-            gen_arr = np.array(blended_pil).astype(np.float32)
+        # --- STUDIO MASTER: AI-Native Rendering ---
+        # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
+        # This prevents "Double Logos" and allows the UNet to render graphics organically.
+        # if is_complex:
+        #    print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
+        #    blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
+        #    blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
+        #    gen_arr = np.array(blended_pil).astype(np.float32)
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
