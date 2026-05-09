@@ -636,6 +636,7 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
             self.position_net = PositionNet(
                 positive_len=positive_len, out_dim=cross_attention_dim, feature_type=feature_type
             )
+        self._assign_spatial_attn_indices()
 
     @property
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
@@ -780,6 +781,19 @@ class UNetVton2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMi
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
+
+    def _assign_spatial_attn_indices(self):
+        """
+        [PERFORMANCE FIX] Assigns a static index to every BasicTransformerBlock.
+        This prevents torch._dynamo from recompiling the graph 8+ times due to dynamic indexing.
+        """
+        from .attention_vton import BasicTransformerBlock
+        idx = 0
+        for module in self.modules():
+            if isinstance(module, BasicTransformerBlock):
+                module.assigned_spatial_attn_idx = int(idx)
+                idx += 1
+        print(f" -> Successfully assigned static spatial_attn_idx to {idx} VTON Transformer Blocks.")
 
     def enable_freeu(self, s1, s2, b1, b2):
         r"""Enables the FreeU mechanism from https://arxiv.org/abs/2309.11497.

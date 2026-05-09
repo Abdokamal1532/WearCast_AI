@@ -78,7 +78,14 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
     
     # 5. Dilation: Give the UNet room to draw the shirt slightly larger
+    # --- [PRODUCTION FIX] Silhouette-Locked Dilation ---
     mask_expanded = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
+    
+    # SILHOUETTE LOCK: 
+    # We strictly prevent the mask from going outside the human body boundary (Labels > 0)
+    # This kills the "Gray Wings" effect on the background.
+    silhouette = (parse_array > 0).astype(np.uint8) * 255
+    mask_expanded = cv2.bitwise_and(mask_expanded, silhouette)
     
     # Apply protections (طرح مناطق الحماية من القناع المتمدد)
     mask_expanded[skin_protect == 255] = 0
