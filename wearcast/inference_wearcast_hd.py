@@ -142,10 +142,11 @@ class WearCastHD:
             # [PERFORMANCE FIX v2.1] 
             # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
             # 2. Increase recompile limit to accommodate all 16 Transformer blocks
+            torch.backends.cudnn.benchmark = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.recompile_limit = 24 
             
-            self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="reduce-overhead", fullgraph=False)
+            self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="default", fullgraph=False)
             print("[WearCastHD] UNet compilation scheduled (Dynamic Indexing enabled).")
         except Exception as e:
             print(f"[WearCastHD] torch.compile failed: {e}. Proceeding without compilation.")
@@ -462,6 +463,24 @@ class WearCastHD:
         generator = torch.manual_seed(seed)
 
         # =========================================================
+        # PRE-PHASE: Garment Matting & Analysis
+        # =========================================================
+        def debug_save(img, name):
+            if output_dir:
+                img.save(os.path.join(output_dir, name))
+            else:
+                img.save(name)
+
+        print(" -> [MATTING] Running AI-powered garment extraction (rembg)...")
+        t_mat = time.time()
+        garm_proc, garm_mask = self.remove_garment_background_rembg(image_garm)
+        self._cached_garm_mask = garm_mask
+        print(f" -> [MATTING] Extraction complete in {time.time() - t_mat:.2f}s")
+        
+        from run.utils_wearcast import analyze_sleeve_length
+        is_long_sleeve = analyze_sleeve_length(garm_mask)
+
+        # =========================================================
         # PHASE 1 — AI Preprocessing (OpenPose + HumanParsing + Mask)
         # =========================================================
         if mask is None:
@@ -526,7 +545,8 @@ class WearCastHD:
                 model_parse, 
                 keypoints,
                 width=384,
-                height=512
+                height=512,
+                is_long_sleeve=is_long_sleeve
             )
             self._cached_hard_mask = mask
 
@@ -545,12 +565,6 @@ class WearCastHD:
             print(f" -> Mask after bilinear resize and re-binarization: {mask.size}")
 
             # Save mask debug images
-            def debug_save(img, name):
-                if output_dir:
-                    img.save(os.path.join(output_dir, name))
-                else:
-                    img.save(name)
-
             debug_save(mask, "debug_phase1_hard_mask.jpg")
             print(f" -> [SAVED] Hard mask (255-binary) saved")
             debug_save(mask_gray, "debug_phase1_soft_mask.jpg")
@@ -579,11 +593,7 @@ class WearCastHD:
             from PIL import ImageEnhance
 
             # --- 2a. AI Garment Matting (rembg) ---
-            # Uses rembg (AI-based) for perfect extraction, with GrabCut as fallback
-            print(" -> [MATTING] Running AI-powered garment extraction (rembg)...")
-            t_mat = time.time()
-            garm_proc, garm_mask = self.remove_garment_background_rembg(image_garm)
-            print(f" -> [MATTING] Extraction complete in {time.time() - t_mat:.2f}s")
+            # Extraction already completed in PRE-PHASE
             debug_save(garm_proc, "debug_phase2_clip_bg_replaced.jpg")
 
             # Save the original garment for reference comparison
@@ -795,8 +805,11 @@ class WearCastHD:
 
         # --- FIX #16: Smart Adaptive Color Matching & Shadow Blending ---
         garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        # FIX: Raise threshold to 254 to include white shirt pixels in the foreground
-        garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
+        if hasattr(self, '_cached_garm_mask'):
+            garm_mask_resized = np.array(Image.fromarray(self._cached_garm_mask * 255).resize(raw_generated.size, Image.NEAREST))
+            garm_fg_mask = garm_mask_resized > 127
+        else:
+            garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
         
         if np.any(garm_fg_mask):
             garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -860,8 +873,13 @@ class WearCastHD:
         if hasattr(self, '_skin_mask'):
             # Resize skin mask to match output
             skin_mask_final = cv2.resize(self._skin_mask, raw_generated.size, interpolation=cv2.INTER_LINEAR)
+            
+            # Prevent skin texture from bleeding onto newly generated fabric
+            # Since alpha represents the new garment, we subtract it from the skin mask
+            skin_mask_final = skin_mask_final * (1.0 - alpha)
+            
             gen_arr = self.apply_frequency_blending(gen_arr, ori_final, skin_mask_final)
-            print(" -> [SKIN] Frequency separation complete (restored skin texture).")
+            print(" -> [SKIN] Frequency separation complete (restored skin texture on bare areas).")
         
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
