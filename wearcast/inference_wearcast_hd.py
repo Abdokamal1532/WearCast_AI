@@ -829,8 +829,8 @@ class WearCastHD:
             
             if avg_l > 215: 
                 strength = 1.0
-                shadow_strength = 0.12 # Very low for white shirts
-                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (12%).")
+                shadow_strength = 0.20 # Increased from 0.12 for better folds on white shirts
+                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (20%).")
             elif avg_l > 170:
                 strength = 0.8
                 shadow_strength = 0.25 # Medium-low for light shirts
@@ -1001,9 +1001,14 @@ class WearCastHD:
         gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
-        raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
-        # FIX: V shift cap at 30 — needs headroom for UNet's ~55pt brightness deficit
-        shift_v     = min(max(raw_shift_v, 0.0), 30.0)              # only boost, never darken; cap at 30
+        
+        if is_white_garm:
+            raw_shift_v = (garm_mean_v - gen_mean_v) * 0.95
+            shift_v     = min(max(raw_shift_v, 0.0), 85.0)  # High cap to allow UNet grey to reach pure white
+        else:
+            raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
+            shift_v     = min(max(raw_shift_v, 0.0), 35.0)  # Standard cap for colored/dark shirts
+            
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
         # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
@@ -1032,7 +1037,16 @@ class WearCastHD:
             shift_s  = (garm_mean_s - gen_mean_s) * 0.90
         print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
         corrected_s = gen_hsv[:, :, 1].copy()
-        corrected_s[mask_bool] = corrected_s[mask_bool] * ratio_s + shift_s
+        
+        # Protect vivid graphic elements from being desaturated (like we do for brightness)
+        sat_mask_s   = gen_hsv[:, :, 1]
+        sat_weight_s = np.clip(1.0 - sat_mask_s / 50.0, 0.0, 1.0) # S<15 -> weight~1, S>50 -> weight~0
+        
+        base_s = corrected_s[mask_bool]
+        target_s = base_s * ratio_s + shift_s
+        weight_in_mask = sat_weight_s[mask_bool]
+        
+        corrected_s[mask_bool] = base_s * (1.0 - weight_in_mask) + target_s * weight_in_mask
         gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
 
         # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
