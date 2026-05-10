@@ -65,17 +65,14 @@ def analyze_sleeve_length(garm_mask_np):
     height = np.max(y_indices) - np.min(y_indices)
     width = np.max(x_indices) - np.min(x_indices)
     
-    aspect_ratio = width / max(1, height)
-    
-    if aspect_ratio > 1.15:
-        return True
-        
     y_min, y_max = np.min(y_indices), np.max(y_indices)
     x_min, x_max = np.min(x_indices), np.max(x_indices)
     
-    bottom_y_start = y_max - int(0.3 * height)
-    left_x_end = x_min + int(0.25 * width)
-    right_x_start = x_max - int(0.25 * width)
+    # Check bottom 25% of the image height
+    bottom_y_start = y_max - int(0.25 * height)
+    # Check outer 20% of the image width
+    left_x_end = x_min + int(0.20 * width)
+    right_x_start = x_max - int(0.20 * width)
     
     bottom_left_region = garm_mask_np[bottom_y_start:y_max, x_min:left_x_end]
     bottom_right_region = garm_mask_np[bottom_y_start:y_max, right_x_start:x_max]
@@ -83,7 +80,9 @@ def analyze_sleeve_length(garm_mask_np):
     left_density = np.sum(bottom_left_region > 0) / max(1, bottom_left_region.size)
     right_density = np.sum(bottom_right_region > 0) / max(1, bottom_right_region.size)
     
-    if left_density > 0.15 and right_density > 0.15:
+    # Require BOTH sides to have >10% fabric density, or one side to have >30% fabric density
+    # This prevents wide t-shirts from being classified as long sleeve
+    if (left_density > 0.10 and right_density > 0.10) or (left_density > 0.30) or (right_density > 0.30):
         return True
         
     return False
