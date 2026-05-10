@@ -838,9 +838,11 @@ class WearCastHD:
             else:
                 print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using full 40% shadows.")
             
-            if strength > 0:
-                gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha, strength=strength)
-                print(f" -> [COLOR] Applied LAB matching (strength={strength}).")
+            gen_image = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
+            mask_hard_image = Image.fromarray((alpha * 255).astype(np.uint8))
+            gen_image = self.local_color_correction(gen_image, image_garm, mask_hard_image)
+            gen_arr = np.array(gen_image).astype(np.float32)
+            print(f" -> [COLOR] Applied Advanced HSV Local Color Correction.")
 
             # 2. Apply Adaptive Multiply Blend
             # result = unet_output * shadow_map (blended by strength)
