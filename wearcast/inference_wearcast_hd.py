@@ -915,39 +915,58 @@ class WearCastHD:
         print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
         print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # 4. Apply Dynamic Shift Curves
-        # Instead of guessing what a "graphic" is or scaling standard deviations, we use a smart multiplier curve.
-        # The base color gets 100% of the shift. As pixels approach 0 (black) or 255 (white), the shift drops to 0%.
-        # This perfectly preserves logos, deep 3D shadows, and bright 3D highlights without clipping!
+        # 4. Asymmetric Shift Multipliers + Soft Clipping
+        # This preserves 100% of the 3D contrast (folds/shadows) while gracefully protecting logos and preventing clamping.
         corrected_lab = gen_lab.copy()
         
         # L Channel (Lightness)
         source_l = gen_lab[:, :, 0]
         shift_l = target_median[0] - source_median[0]
         
-        # Calculate dynamic multiplier based on distance from endpoints (0 and 255)
-        multiplier_l = np.where(
-            source_l <= source_median[0],
-            source_l / (source_median[0] + 1e-6),                      # Scale down shift towards 0 (Protects deep shadows & black logos)
-            (255.0 - source_l) / (255.0 - source_median[0] + 1e-6)     # Scale down shift towards 255 (Protects highlights & white logos)
-        )
+        if shift_l < 0:
+            # Darkening: Protect bright pixels (white logos, bright highlights) from being darkened
+            multiplier_l = np.where(
+                source_l <= source_median[0],
+                1.0,
+                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6)
+            )
+        else:
+            # Brightening: Protect dark pixels (black logos, deep shadows) from being brightened
+            multiplier_l = np.where(
+                source_l >= source_median[0],
+                1.0,
+                source_l / (source_median[0] + 1e-6)
+            )
+            
+        shifted_l = source_l + shift_l * multiplier_l
         
-        # Apply the dynamically scaled shift (only inside the garment mask)
-        corrected_lab[mask_bool, 0] = source_l[mask_bool] + shift_l * multiplier_l[mask_bool]
+        # Logarithmic Soft-Clipping (Prevent crushed blacks and blown whites)
+        # Highlights (compress above 220, max approaches 255)
+        high_mask = shifted_l > 220
+        if high_mask.sum() > 0:
+            excess = shifted_l[high_mask] - 220
+            shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
+            
+        # Shadows (compress below 30, max approaches 0)
+        low_mask = shifted_l < 30
+        if low_mask.sum() > 0:
+            deficit = 30 - shifted_l[low_mask]
+            shifted_l[low_mask] = 30 - 30.0 * (1.0 - np.exp(-deficit / 30.0))
+            
+        corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
         
         # A and B Channels (Color)
+        # Protect colorful graphics using pure A/B distance (ignoring L to prevent false-positives on shadows)
+        ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
+        color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        
         for i in [1, 2]:
             source_c = gen_lab[:, :, i]
             shift_c = target_median[i] - source_median[i]
             
-            # Color channels also range 0-255 in OpenCV LAB representation
-            multiplier_c = np.where(
-                source_c <= source_median[i],
-                source_c / (source_median[i] + 1e-6),
-                (255.0 - source_c) / (255.0 - source_median[i] + 1e-6)
-            )
-            
-            corrected_lab[mask_bool, i] = source_c[mask_bool] + shift_c * multiplier_c[mask_bool]
+            # Apply shift, but scale it down for highly saturated graphics
+            shifted_c = source_c + shift_c * color_transfer_weight
+            corrected_lab[mask_bool, i] = shifted_c[mask_bool]
             
         corrected_lab = np.clip(corrected_lab, 0, 255)
         
