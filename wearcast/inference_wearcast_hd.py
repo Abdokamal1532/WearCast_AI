@@ -928,11 +928,12 @@ class WearCastHD:
         if shift_l < 0:
             # Darkening (e.g. Black shirt)
             # Shadows are moving towards 0. Decay shift to prevent crushing.
-            # Highlights are moving safely away from 255. Keep 1.0x shift to preserve 3D folds!
+            # Only decay when close to the bottom (L < 35).
+            decay_start = min(source_median[0], 35.0)
             multiplier_l = np.where(
-                source_l <= source_median[0],
-                source_l / (source_median[0] + 1e-6),  # Decay shadows
-                1.0  # Keep 100% for highlights
+                source_l <= decay_start,
+                source_l / (decay_start + 1e-6),  # Decay shadows
+                1.0  # Keep 100% for midtones and highlights
             )
             # Absolute protection for white logos (L > 200)
             logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
@@ -940,11 +941,12 @@ class WearCastHD:
         else:
             # Brightening (e.g. White shirt)
             # Highlights are moving towards 255. Decay shift to prevent blowout!
-            # Shadows are moving safely away from 0. Keep 1.0x shift to preserve 3D folds!
+            # Only decay when close to the top (L > 220).
+            decay_start = max(source_median[0], 220.0)
             multiplier_l = np.where(
-                source_l >= source_median[0],
-                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
-                1.0  # Keep 100% for shadows
+                source_l >= decay_start,
+                (255.0 - source_l) / (255.0 - decay_start + 1e-6),  # Decay highlights
+                1.0  # Keep 100% for midtones and shadows
             )
             # Absolute protection for black logos (L < 50)
             logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
