@@ -49,7 +49,45 @@ def refine_mask(mask):
         cv2.drawContours(refine_mask, contours, i, color=255, thickness=-1)
     return refine_mask
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512):
+def analyze_sleeve_length(garm_mask_np):
+    """
+    Classify garment as short_sleeve or long_sleeve based on mask.
+    """
+    import numpy as np
+    
+    if len(garm_mask_np.shape) == 3:
+        garm_mask_np = garm_mask_np[:, :, 0]
+        
+    y_indices, x_indices = np.where(garm_mask_np > 0)
+    if len(y_indices) == 0:
+        return False
+
+    height = np.max(y_indices) - np.min(y_indices)
+    width = np.max(x_indices) - np.min(x_indices)
+    
+    y_min, y_max = np.min(y_indices), np.max(y_indices)
+    x_min, x_max = np.min(x_indices), np.max(x_indices)
+    
+    # Check bottom 25% of the image height
+    bottom_y_start = y_max - int(0.25 * height)
+    # Check outer 20% of the image width
+    left_x_end = x_min + int(0.20 * width)
+    right_x_start = x_max - int(0.20 * width)
+    
+    bottom_left_region = garm_mask_np[bottom_y_start:y_max, x_min:left_x_end]
+    bottom_right_region = garm_mask_np[bottom_y_start:y_max, right_x_start:x_max]
+    
+    left_density = np.sum(bottom_left_region > 0) / max(1, bottom_left_region.size)
+    right_density = np.sum(bottom_right_region > 0) / max(1, bottom_right_region.size)
+    
+    # Require BOTH sides to have >10% fabric density, or one side to have >30% fabric density
+    # This prevents wide t-shirts from being classified as long sleeve
+    if (left_density > 0.10 and right_density > 0.10) or (left_density > 0.30) or (right_density > 0.30):
+        return True
+        
+    return False
+
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
     import cv2
     import numpy as np
     
@@ -59,35 +97,52 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     print(" -> Constructing High-Precision Mask (Strict Clothing Boundaries)...")
 
     # 1. Base Mask: ONLY Upper clothes (4) and Dress (7)
-    # لا ندمج الأذرع هنا أبداً لمنع تحول الجلد إلى قماش
     inpaint_mask = ((parse_array == 4) | (parse_array == 7)).astype(np.uint8) * 255
 
-    # 2. Add Neck area (to allow collar changes)
     pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
     scale_factor = height / 512.0
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
-    if pt(1)[0] > 1: # Neck keypoint
-        cv2.circle(inpaint_mask, (int(pt(1)[0]), int(pt(1)[1])), int(15 * scale_factor), 255, -1)
+    # 3. Protect Identity & Skin (Face, Hair, Hat, Neck)
+    # Neck is explicitly protected to avoid glitches around collar
+    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
 
-    # 3. Protect Identity & Skin (Face, Hair, Hat, Bare Arms)
-    # نحمي الأذرع والوجه صراحةً حتى لو تمدد القناع لا يغطيهم
-    skin_protect = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+    if category == 'upperbody':
+        if is_long_sleeve:
+            print(" -> [MASK] Long sleeve detected. Including full arms in generation mask.")
+            arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+            inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
+            skin_protect = skin_protect_base
+        else:
+            print(" -> [MASK] Short sleeve detected. Dilating shoulders and protecting lower arms.")
+            # Dilate upper clothing downwards towards elbows
+            for s_idx, e_idx in [(2, 3), (5, 6)]:
+                if pt(s_idx)[0] > 1 and pt(e_idx)[0] > 1:
+                    s_pt = (int(pt(s_idx)[0]), int(pt(s_idx)[1]))
+                    e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
+                    dx = e_pt[0] - s_pt[0]
+                    dy = e_pt[1] - s_pt[1]
+                    mid_pt = (int(s_pt[0] + dx * 0.5), int(s_pt[1] + dy * 0.5))
+                    cv2.line(inpaint_mask, s_pt, mid_pt, 255, int(30 * scale_factor))
+            
+            # Keep arms in skin_protect for short sleeves
+            arms_protect = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+            skin_protect = cv2.bitwise_or(skin_protect_base, arms_protect)
+    else:
+        arms_protect = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+        skin_protect = cv2.bitwise_or(skin_protect_base, arms_protect)
     
     # 4. Protect Bottoms (Pants, Skirts)
     bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
     
-    # 5. Dilation: Give the UNet room to draw the shirt slightly larger
-    # --- [PRODUCTION FIX] Silhouette-Locked Dilation ---
+    # 5. Dilation
     mask_expanded = cv2.dilate(inpaint_mask, np.ones((15, 15), np.uint8), iterations=1)
     
     # SILHOUETTE LOCK: 
-    # We strictly prevent the mask from going outside the human body boundary (Labels > 0)
-    # This kills the "Gray Wings" effect on the background.
     silhouette = (parse_array > 0).astype(np.uint8) * 255
     mask_expanded = cv2.bitwise_and(mask_expanded, silhouette)
     
-    # Apply protections (طرح مناطق الحماية من القناع المتمدد)
+    # Apply protections
     mask_expanded[skin_protect == 255] = 0
     mask_expanded[bottoms == 255] = 0
 
@@ -111,7 +166,7 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
 
     percentage = 100 * np.sum(mask_hard > 0) / (width * height)
-    print(f" -> Optimized Mask: {percentage:.1f}% coverage. Clothing only, arms protected.")
+    print(f" -> Optimized Mask: {percentage:.1f}% coverage.")
 
     return Image.fromarray(mask_hard), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
 

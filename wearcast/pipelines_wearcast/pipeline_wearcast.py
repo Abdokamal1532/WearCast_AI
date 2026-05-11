@@ -601,7 +601,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         if not output_type == "latent":
             print(f"[PIPELINE] Decoding latents via VAE (scaling_factor={self.vae.config.scaling_factor})...")
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image = self.vae.decode(latents.to(dtype=self.vae.dtype) / self.vae.config.scaling_factor, return_dict=False)[0]
             print(f"[PIPELINE] VAE decoded image: shape={list(image.shape)} dtype={image.dtype} range=[{image.float().min().item():.4f},{image.float().max().item():.4f}]")
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
@@ -913,7 +913,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             image_latents = torch.cat([image_latents], dim=0)
 
         # No doubling here; we handle it in the main denoising loop for consistency
-        return image_latents
+        return image_latents.to(dtype=dtype)
     
     def prepare_vton_latents(
         self, image, mask, image_ori, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, generator=None
@@ -994,9 +994,9 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         # No doubling here; we handle it in the main denoising loop for consistency and to avoid double-doubling
         # Final Device Anchor: Force all return tensors back to GPU
-        image_latents = image_latents.to(device=device)
-        mask = mask.to(device=device)
-        image_ori_latents = image_ori_latents.to(device=device)
+        image_latents = image_latents.to(device=device, dtype=dtype)
+        mask = mask.to(device=device, dtype=dtype)
+        image_ori_latents = image_ori_latents.to(device=device, dtype=dtype)
 
         return image_latents, mask, image_ori_latents
 
