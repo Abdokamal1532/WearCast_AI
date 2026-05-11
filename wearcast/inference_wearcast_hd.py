@@ -915,39 +915,72 @@ class WearCastHD:
         print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
         print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # 4. Apply Dynamic Shift Curves
-        # Instead of guessing what a "graphic" is or scaling standard deviations, we use a smart multiplier curve.
-        # The base color gets 100% of the shift. As pixels approach 0 (black) or 255 (white), the shift drops to 0%.
-        # This perfectly preserves logos, deep 3D shadows, and bright 3D highlights without clipping!
+        # 4. Optimal Asymmetric Gamut-Aware Color Transfer + Soft Clipping
+        # - When Brightening: Highlights decay to avoid RGB Gamut blowout; Shadows get 1.0x shift to preserve 3D depth.
+        # - When Darkening: Shadows decay to avoid crushing to black; Highlights get 1.0x shift to preserve 3D depth.
+        # - Pure black/white graphics are protected via absolute thresholds.
         corrected_lab = gen_lab.copy()
         
         # L Channel (Lightness)
         source_l = gen_lab[:, :, 0]
         shift_l = target_median[0] - source_median[0]
         
-        # Calculate dynamic multiplier based on distance from endpoints (0 and 255)
-        multiplier_l = np.where(
-            source_l <= source_median[0],
-            source_l / (source_median[0] + 1e-6),                      # Scale down shift towards 0 (Protects deep shadows & black logos)
-            (255.0 - source_l) / (255.0 - source_median[0] + 1e-6)     # Scale down shift towards 255 (Protects highlights & white logos)
-        )
+        if shift_l < 0:
+            # Darkening (e.g. Black shirt)
+            # Shadows are moving towards 0. Decay shift to prevent crushing.
+            # Only decay when close to the bottom (L < 35).
+            decay_start = min(source_median[0], 35.0)
+            multiplier_l = np.where(
+                source_l <= decay_start,
+                source_l / (decay_start + 1e-6),  # Decay shadows
+                1.0  # Keep 100% for midtones and highlights
+            )
+            # Absolute protection for white logos (L > 200)
+            logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
+            multiplier_l = np.minimum(multiplier_l, logo_protect)
+        else:
+            # Brightening (e.g. White shirt)
+            # Highlights are moving towards 255. Decay shift to prevent blowout!
+            # Only decay when close to the top (L > 220).
+            decay_start = max(source_median[0], 220.0)
+            multiplier_l = np.where(
+                source_l >= decay_start,
+                (255.0 - source_l) / (255.0 - decay_start + 1e-6),  # Decay highlights
+                1.0  # Keep 100% for midtones and shadows
+            )
+            # Absolute protection for black logos (L < 50)
+            logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
+            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            
+        shifted_l = source_l + shift_l * multiplier_l
         
-        # Apply the dynamically scaled shift (only inside the garment mask)
-        corrected_lab[mask_bool, 0] = source_l[mask_bool] + shift_l * multiplier_l[mask_bool]
+        # Logarithmic Soft-Clipping (Prevent crushed blacks and blown whites)
+        # Highlights (compress above 220, max approaches 255)
+        high_mask = shifted_l > 220
+        if high_mask.sum() > 0:
+            excess = shifted_l[high_mask] - 220
+            shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
+            
+        # Shadows (compress below 30, max approaches 0)
+        low_mask = shifted_l < 30
+        if low_mask.sum() > 0:
+            deficit = 30 - shifted_l[low_mask]
+            shifted_l[low_mask] = 30 - 30.0 * (1.0 - np.exp(-deficit / 30.0))
+            
+        corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
         
         # A and B Channels (Color)
+        # Protect colorful graphics using pure A/B distance (ignoring L to prevent false-positives on shadows)
+        ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
+        color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        
         for i in [1, 2]:
             source_c = gen_lab[:, :, i]
             shift_c = target_median[i] - source_median[i]
             
-            # Color channels also range 0-255 in OpenCV LAB representation
-            multiplier_c = np.where(
-                source_c <= source_median[i],
-                source_c / (source_median[i] + 1e-6),
-                (255.0 - source_c) / (255.0 - source_median[i] + 1e-6)
-            )
-            
-            corrected_lab[mask_bool, i] = source_c[mask_bool] + shift_c * multiplier_c[mask_bool]
+            # Apply shift, but scale it down for highly saturated graphics
+            shifted_c = source_c + shift_c * color_transfer_weight
+            corrected_lab[mask_bool, i] = shifted_c[mask_bool]
             
         corrected_lab = np.clip(corrected_lab, 0, 255)
         
