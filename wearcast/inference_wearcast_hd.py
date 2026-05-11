@@ -915,9 +915,10 @@ class WearCastHD:
         print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
         print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # 4. Absolute Threshold Graphic Protection + Soft Clipping
-        # We apply exactly 1.0x shift to the fabric and its 3D shadows/highlights to perfectly preserve depth.
-        # We ONLY decay the shift for pixels that are extremely far from the median (i.e. pure black/white logos).
+        # 4. Optimal Asymmetric Gamut-Aware Color Transfer + Soft Clipping
+        # - When Brightening: Highlights decay to avoid RGB Gamut blowout; Shadows get 1.0x shift to preserve 3D depth.
+        # - When Darkening: Shadows decay to avoid crushing to black; Highlights get 1.0x shift to preserve 3D depth.
+        # - Pure black/white graphics are protected via absolute thresholds.
         corrected_lab = gen_lab.copy()
         
         # L Channel (Lightness)
@@ -925,15 +926,29 @@ class WearCastHD:
         shift_l = target_median[0] - source_median[0]
         
         if shift_l < 0:
-            # Darkening: Protect bright white logos from being darkened.
-            # Apply 100% shift to all pixels below median + 40 (fabric, shadows, normal highlights).
-            # Decay to 0% shift by median + 100 (pure white logos).
-            multiplier_l = np.clip((source_median[0] + 100.0 - source_l) / 60.0, 0.0, 1.0)
+            # Darkening (e.g. Black shirt)
+            # Shadows are moving towards 0. Decay shift to prevent crushing.
+            # Highlights are moving safely away from 255. Keep 1.0x shift to preserve 3D folds!
+            multiplier_l = np.where(
+                source_l <= source_median[0],
+                source_l / (source_median[0] + 1e-6),  # Decay shadows
+                1.0  # Keep 100% for highlights
+            )
+            # Absolute protection for white logos (L > 200)
+            logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
+            multiplier_l = np.minimum(multiplier_l, logo_protect)
         else:
-            # Brightening: Protect dark black logos from being brightened.
-            # Apply 100% shift to all pixels above median - 80 (fabric, normal shadows, highlights).
-            # Decay to 0% shift by median - 140 (pure black logos).
-            multiplier_l = np.clip((source_l - (source_median[0] - 140.0)) / 60.0, 0.0, 1.0)
+            # Brightening (e.g. White shirt)
+            # Highlights are moving towards 255. Decay shift to prevent blowout!
+            # Shadows are moving safely away from 0. Keep 1.0x shift to preserve 3D folds!
+            multiplier_l = np.where(
+                source_l >= source_median[0],
+                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
+                1.0  # Keep 100% for shadows
+            )
+            # Absolute protection for black logos (L < 50)
+            logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
+            multiplier_l = np.minimum(multiplier_l, logo_protect)
             
         shifted_l = source_l + shift_l * multiplier_l
         
