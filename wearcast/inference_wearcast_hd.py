@@ -755,18 +755,16 @@ class WearCastHD:
         # Binarize
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
-        # FIX #4: Tighten and stabilize the blend alpha
-        # 1. Erode mask inward to guarantee no garment bleeds outside body
+        # FIX #4: Seamless Photographic Alpha Blend
+        # 1. Very gentle erosion to avoid bleeds but keep boundary natural
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
         
-        # 2. Use a HARD center + soft edge mask
-        feather_sigma = 3.0
-        blurred = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        # 2. Wide, soft photographic feathering instead of jagged cutouts
+        feather_sigma = 15.0
+        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         
-        # 3. Force center pixels to be fully opaque (1.0)
-        core_mask = cv2.erode(eroded_mask, np.ones((11, 11), np.uint8), iterations=1)
-        alpha = np.where(core_mask > 0, 1.0, blurred)
+        # No more forcing the core_mask to 1.0. The wide blur naturally transitions.
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
@@ -828,14 +826,15 @@ class WearCastHD:
             
             if avg_l > 215: 
                 strength = 1.0
-                shadow_strength = 0.20 # Increased from 0.12 for better folds on white shirts
-                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (20%).")
+                shadow_strength = 0.10 # Super minimal for white shirts to avoid dirtiness
+                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (10%).")
             elif avg_l > 170:
                 strength = 0.8
-                shadow_strength = 0.25 # Medium-low for light shirts
-                print(f" -> [COLOR] Light garment detected (L={avg_l:.1f}). Using 25% shadows.")
+                shadow_strength = 0.15 # Low for light shirts
+                print(f" -> [COLOR] Light garment detected (L={avg_l:.1f}). Using 15% shadows.")
             else:
-                print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using full 40% shadows.")
+                shadow_strength = 0.25 # Max 25% to avoid muddying dark shirts
+                print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using 25% shadows.")
             
             # 2. Apply Adaptive Multiply Blend FIRST
             # result = unet_output * shadow_map (blended by strength)
@@ -1001,10 +1000,11 @@ class WearCastHD:
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
         ratio_v     = min(garm_std_v / gen_std_v, 1.50)  # Allow darkening/lightening based purely on stats
         
+        # Drastically reduced from 0.95/0.85 to preserve the UNet's native 3D shading!
         if is_white_garm:
-            shift_v     = (garm_mean_v - gen_mean_v) * 0.95
+            shift_v     = (garm_mean_v - gen_mean_v) * 0.35
         else:
-            shift_v     = (garm_mean_v - gen_mean_v) * 0.85
+            shift_v     = (garm_mean_v - gen_mean_v) * 0.20
             
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
@@ -1026,11 +1026,11 @@ class WearCastHD:
         if is_white_garm:
             # White garment: compress saturation gently
             ratio_s  = min(garm_std_s / gen_std_s, 0.90)
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.85
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.40 # Softened
         else:
             # Colorful garment: allow expansion or compression
-            ratio_s  = min(garm_std_s / gen_std_s, 1.80)
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.95
+            ratio_s  = min(garm_std_s / gen_std_s, 1.30) # Capped
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.40 # Softened
         print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
         corrected_s = gen_hsv[:, :, 1].copy()
         
@@ -1052,7 +1052,7 @@ class WearCastHD:
         if is_white_garm:
             gen_mean_h  = gen_hsv[mask_bool, 0].mean()
             garm_mean_h = garm_hsv[valid_garm, 0].mean()
-            hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.60, -15, 15)  # gentle hue correction (max ±15)
+            hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.30, -10, 10)  # gentle hue correction (max ±10)
             corrected_h = gen_hsv[:, :, 0].copy()
             # Only shift low-saturation (near-white shirt) pixels — protect vivid graphic colors
             sat_in_mask = gen_hsv[:, :, 1][mask_bool]  # saturation at mask pixels
