@@ -601,7 +601,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         if not output_type == "latent":
             print(f"[PIPELINE] Decoding latents via VAE (scaling_factor={self.vae.config.scaling_factor})...")
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image = self.vae.decode(latents.to(dtype=self.vae.dtype) / self.vae.config.scaling_factor, return_dict=False)[0]
             print(f"[PIPELINE] VAE decoded image: shape={list(image.shape)} dtype={image.dtype} range=[{image.float().min().item():.4f},{image.float().max().item():.4f}]")
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
