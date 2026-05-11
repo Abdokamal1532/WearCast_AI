@@ -770,9 +770,9 @@ class WearCastHD:
         
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
 
-        # We completely removed HSV Color Correction and Shadow Multiplication.
-        # The AI (UNet) naturally generates physically accurate shadows and environmental lighting.
-        print(" -> [NATIVE RENDER] Bypassed manual color/shadow filters to preserve pure AI photorealism.")
+        # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
+        # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
+        gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
 
         # --- Final Compositing ---
         # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
@@ -875,171 +875,76 @@ class WearCastHD:
             return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
 
 
-    def local_color_correction(self, generated, original_garment, mask_hard):
+    def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """
-        Match overall H/S/V stats of the generated garment to the original garment,
-        restricted precisely to the mask boundary, and gently capped.
+        Reinhard Statistical Color Transfer in LAB space.
+        Transfers the exact mean color/brightness of the original garment to the generated garment,
+        while preserving the AI's generated standard deviation (3D folds, wrinkles, highlights).
         """
-        print(f"   [COLOR] Starting correction. Gen shape: {generated.size}, Garm shape: {original_garment.size}")
-        gen_np  = np.array(generated).astype(np.float32)
-        garm_np = np.array(original_garment.resize(generated.size)).astype(np.float32)
-        msk_np  = np.array(mask_hard.resize(generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-
-        gen_hsv  = cv2.cvtColor(gen_np.astype(np.uint8),  cv2.COLOR_RGB2HSV).astype(np.float32)
-        garm_hsv = cv2.cvtColor(garm_np.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-
-        mask_bool = msk_np > 0.5
-        print(f"   [COLOR] Mask interior area: {mask_bool.sum()} pixels  ({100*mask_bool.mean():.1f}% of image)")
-
-        if mask_bool.sum() < 100:
-            print("   [COLOR] Skipped: Mask interior area too small (<100px).")
-            return generated
-
-        bg_garm  = np.all(garm_np >= 238, axis=-1)
-        valid_garm = ~bg_garm
-        print(f"   [COLOR] Valid garment pixels (non-BG): {valid_garm.sum()}  ({100*valid_garm.mean():.1f}%)")
-
-        if valid_garm.sum() < 100:
-            valid_garm = np.ones_like(bg_garm)
-            print("   [COLOR] Warning: Product image had almost no valid foreground pixels. Using entire image stats.")
-
-        ref_lum_mean  = garm_hsv[valid_garm, 2].mean()   # reference V mean (brightness)
-        ref_sat_mean  = garm_hsv[valid_garm, 1].mean()   # reference S mean (saturation)
-        is_white_garm = ref_lum_mean > 180 and ref_sat_mean < 60  # garment is primarily white/light
-        print(f"   [COLOR] Garment profile: ref_lum={ref_lum_mean:.1f}, ref_sat={ref_sat_mean:.1f}, is_white={is_white_garm}")
-
-        # ── Channel 2: V (Brightness) ──────────────────────────────────────────
-        # KEY FIX: Weight the brightness boost by (1 - normalized_saturation).
-        # Vivid graphic elements (high-S: blue jeans illustration, red text) get weight~0 → no brightness change.
-        # White shirt background (low-S) gets weight~1 → full brightness boost.
-        # This PRESERVES graphic colors while whitening the shirt background.
-        gen_mean_v  = gen_hsv[mask_bool, 2].mean()
-        garm_mean_v = garm_hsv[valid_garm, 2].mean()
-        gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
-        garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
-        ratio_v     = min(garm_std_v / gen_std_v, 1.50)  # Allow darkening/lightening based purely on stats
+        print(" -> [COLOR] Applying Statistical LAB Color Transfer...")
         
-        # Drastically reduced from 0.95/0.85 to preserve the UNet's native 3D shading!
-        if is_white_garm:
-            shift_v     = (garm_mean_v - gen_mean_v) * 0.35
+        # 1. Prepare target garment pixels
+        garm_arr = np.array(image_garm.resize((gen_arr.shape[1], gen_arr.shape[0]))).astype(np.float32)
+        # Find valid foreground pixels (not pure white background)
+        if hasattr(self, '_cached_garm_mask'):
+            garm_mask_resized = np.array(Image.fromarray(self._cached_garm_mask * 255).resize((gen_arr.shape[1], gen_arr.shape[0]), Image.NEAREST))
+            valid_garm = garm_mask_resized > 127
         else:
-            shift_v     = (garm_mean_v - gen_mean_v) * 0.20
+            valid_garm = ~np.all(garm_arr >= 240, axis=-1)
             
-        print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
-        corrected_v = gen_hsv[:, :, 2].copy()
-        # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
-        sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
-        # FIX: Tightest saturation guard S/50 — pixels with S>50 are graphic/
-        # illustration elements and must NOT receive any brightness boost. This prevents the
-        # blue scribbles, red text, and yellow figure from being washed out.
-        sat_weight   = np.clip(1.0 - sat_mask / 50.0, 0.0, 1.0)   # S<15→weight~1.0, S>50→weight~0.0
-        v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
-        corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
-        gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
-
-        # ── Channel 1: S (Saturation) ──────────────────────────────────────────
-        gen_mean_s  = gen_hsv[mask_bool, 1].mean()
-        garm_mean_s = garm_hsv[valid_garm, 1].mean()
-        gen_std_s   = gen_hsv[mask_bool,  1].std() + 1e-6
-        garm_std_s  = garm_hsv[valid_garm, 1].std() + 1e-6
-        if is_white_garm:
-            # White garment: compress saturation gently
-            ratio_s  = min(garm_std_s / gen_std_s, 0.90)
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.40 # Softened
-        else:
-            # Colorful garment: allow expansion or compression
-            ratio_s  = min(garm_std_s / gen_std_s, 1.30) # Capped
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.40 # Softened
-        print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
-        corrected_s = gen_hsv[:, :, 1].copy()
+        if valid_garm.sum() < 100:
+            print("   [COLOR] Not enough valid garment pixels to calculate stats. Skipping transfer.")
+            return gen_arr
+            
+        # 2. Get valid mask pixels for the generated garment
+        mask_bool = alpha_mask > 0.5
+        if mask_bool.sum() < 100:
+            return gen_arr
+            
+        # 3. Convert to LAB color space
+        gen_lab = cv2.cvtColor(np.clip(gen_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        garm_lab = cv2.cvtColor(np.clip(garm_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         
-        # Protect vivid graphic elements from being desaturated (like we do for brightness)
-        sat_mask_s   = gen_hsv[:, :, 1]
-        sat_weight_s = np.clip(1.0 - sat_mask_s / 50.0, 0.0, 1.0) # S<15 -> weight~1, S>50 -> weight~0
+        # 4. Calculate Mean and Standard Deviation for Target (Garment)
+        target_pixels = garm_lab[valid_garm]
+        target_mean = np.mean(target_pixels, axis=0)
+        target_std = np.std(target_pixels, axis=0) + 1e-6
         
-        base_s = corrected_s[mask_bool]
-        target_s = base_s * ratio_s + shift_s
-        weight_in_mask = sat_weight_s[mask_bool]
+        # 5. Calculate Mean and Standard Deviation for Source (Generated)
+        source_pixels = gen_lab[mask_bool]
+        source_mean = np.mean(source_pixels, axis=0)
+        source_std = np.std(source_pixels, axis=0) + 1e-6
         
-        corrected_s[mask_bool] = base_s * (1.0 - weight_in_mask) + target_s * weight_in_mask
-        gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
+        print(f"   [COLOR] LAB Transfer Stats:")
+        print(f"   [COLOR]   Target Mean: L={target_mean[0]:.1f}, a={target_mean[1]:.1f}, b={target_mean[2]:.1f}")
+        print(f"   [COLOR]   Source Mean: L={source_mean[0]:.1f}, a={source_mean[1]:.1f}, b={source_mean[2]:.1f}")
 
-        # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
-        # FIX 3: Hue shift is now ONLY applied to low-saturation pixels (S < 40), i.e.
-        # the white shirt body. High-saturation pixels (blue collar, red "FOLLOW THE SUN"
-        # text, yellow illustration) keep their original hue untouched.
-        if is_white_garm:
-            gen_mean_h  = gen_hsv[mask_bool, 0].mean()
-            garm_mean_h = garm_hsv[valid_garm, 0].mean()
-            hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.30, -10, 10)  # gentle hue correction (max ±10)
-            corrected_h = gen_hsv[:, :, 0].copy()
-            # Only shift low-saturation (near-white shirt) pixels — protect vivid graphic colors
-            sat_in_mask = gen_hsv[:, :, 1][mask_bool]  # saturation at mask pixels
-            # FIX: Tightened from S<40 to S<25 — only truly white pixels get hue shift
-            low_sat_sel = sat_in_mask < 25             # S < 25 → truly near-white shirt background
-            mask_rows, mask_cols = np.where(mask_bool)
-            corrected_h[mask_rows[low_sat_sel], mask_cols[low_sat_sel]] += hue_shift
-            gen_hsv[:, :, 0] = np.clip(corrected_h, 0, 180)  # OpenCV H range is 0–180
-            low_sat_pct = 100 * low_sat_sel.sum() / max(mask_bool.sum(), 1)
-            print(f"   [COLOR] {'Hue':<18}: Ref Mean={garm_mean_h:.1f}, Gen Mean={gen_mean_h:.1f} | Shift={hue_shift:.1f} | Applied to {low_sat_pct:.1f}% of mask (S<40 only)")
+        # Protect against extreme std scaling (prevents deep blacks from becoming noisy/blown out)
+        std_ratio = target_std / source_std
+        std_ratio = np.clip(std_ratio, 0.5, 1.5)  # Cap variance scaling to prevent artifacting
 
-        corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-
-        # Luminance rescue disabled — brightness shift already handles white correction.
-        # The rescue was over-modifying 70%+ of mask pixels.
-        if False and ref_lum_mean > 200:  # reference is a white/light garment
-            mask_r = corrected_rgb[mask_bool, 0]
-            mask_g = corrected_rgb[mask_bool, 1]
-            mask_b = corrected_rgb[mask_bool, 2]
-            rgb_lum      = mask_r * 0.299 + mask_g * 0.587 + mask_b * 0.114
-            rgb_sum      = mask_r + mask_g + mask_b + 1e-6
-            rgb_min      = np.minimum(np.minimum(mask_r, mask_g), mask_b)
-            # Desaturation fraction: 0=pure gray/white, 1=fully saturated color
-            rgb_sat_frac = 1.0 - 3.0 * rgb_min / rgb_sum
-            # Only rescue pixels that are: dark AND low-saturation (near-white, not colorful)
-            # FIX 2 (part 2): Tighten luminance rescue threshold 220→210 to avoid boosting
-            # near-white graphic highlight regions (e.g. white shirt background inside illustration)
-            dark_and_light = (rgb_lum < 210) & (rgb_sat_frac < 0.30)  # low-S guard: S<30% → near-white
-            dark_idx = np.where(mask_bool)
-            dark_sel = dark_and_light
-            if dark_sel.sum() > 0:
-                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.6, 0, 30)
-                corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
-                    corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
-                )
-                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} near-white dark pixels boosted to target=230 (ref_lum={ref_lum_mean:.1f})")
-
-        # === Final pass: flatten residual blue in NEAR-WHITE pixels only ===
-        # GUARD: Only apply to pixels that are both: (1) blue-biased AND (2) already bright/near-white.
-        # Dark pixels belong to the graphic/illustration — their blue is intentional (blue jeans art, scribbles).
-        if is_white_garm:
-            mask_pix_r = corrected_rgb[mask_bool, 0]
-            mask_pix_g = corrected_rgb[mask_bool, 1]
-            mask_pix_b = corrected_rgb[mask_bool, 2]
-            lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
-            blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
-            # FIX: Raised lum guard from 210→230 — only desaturate truly white-area blue tinting,
-            # not blue collar/trim which is legitimately blue but bright
-            blue_sel   = (blue_bias > 10) & (lum_pix > 230)
-            if blue_sel.sum() > 0:
-                # FIX: Reduced max blend from 0.35→0.20 for gentler correction
-                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.20)  # gentle: max 20% desaturation
-                r_idx, c_idx = np.where(mask_bool)
-                r_blue = r_idx[blue_sel]
-                c_blue = c_idx[blue_sel]
-                lum_b  = lum_pix[blue_sel]
-                for ch in range(3):
-                    ch_vals = corrected_rgb[r_blue, c_blue, ch]
-                    corrected_rgb[r_blue, c_blue, ch] = ch_vals * (1 - blend_str) + lum_b * blend_str
-                print(f"   [COLOR] Blue-desaturation (near-white only): {blue_sel.sum()} px (guarded from {(blue_bias>10).sum()} total blue-biased)")
-
-        # Blend zone: 19px tight feather — avoids the 51px halo while still blending mask boundary
-        blend_mask    = cv2.GaussianBlur(msk_np, (19, 19), 4)   # tightened: 51→19px kills white halo glow
-        blend_mask_3d = np.stack([blend_mask]*3, axis=-1)
-
-        result_float = corrected_rgb * blend_mask_3d + gen_np * (1.0 - blend_mask_3d)
-        print("   [COLOR] Execution sequence entirely completed.")
-        return Image.fromarray(np.clip(result_float, 0, 255).astype(np.uint8))
+        # For L channel (Lightness), if target is very dark, we aggressively pull the mean, but keep ratio close to 1.0 to preserve smooth AI shadows
+        if target_mean[0] < 80: # Dark garment
+            std_ratio[0] = np.clip(std_ratio[0], 0.8, 1.2)
+        
+        # 6. Apply Transfer: result = (source - source_mean) * (target_std / source_std) + target_mean
+        corrected_lab = gen_lab.copy()
+        
+        for i in range(3): # L, a, b
+            corrected_lab[mask_bool, i] = (source_pixels[:, i] - source_mean[i]) * std_ratio[i] + target_mean[i]
+            
+        # LAB bounds: L [0, 255], a/b [0, 255] in OpenCV uint8 representation
+        corrected_lab = np.clip(corrected_lab, 0, 255)
+        
+        # 7. Convert back to RGB
+        corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+        
+        # Blend smoothly at the edges using the alpha mask
+        alpha_3d = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
+        final_arr = corrected_rgb * alpha_3d + gen_arr * (1.0 - alpha_3d)
+        
+        print("   [COLOR] Statistical LAB transfer complete.")
+        return final_arr
 
     def laplacian_pyramid_blend(self, generated, original, mask_soft, levels=5):
         """
