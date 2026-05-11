@@ -659,19 +659,9 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # --- FIX #18: UNet Context Silhouette Constraint ---
-            # Prevents "Gray Wings" by blacking out anything outside the body silhouette.
-            # This forces the UNet to only generate content within the person's boundaries.
-            if hasattr(self, '_cached_parse'):
-                sil = (self._cached_parse > 0).astype(np.float32)
-                sil = cv2.resize(sil, (768, 1024), interpolation=cv2.INTER_NEAREST)
-                person_np = np.array(image_ori.resize((768, 1024))).astype(np.float32)
-                # Black out everything outside silhouette
-                person_np = person_np * sil[:, :, np.newaxis]
-                image_ori_constrained = Image.fromarray(person_np.astype(np.uint8))
-                print(" -> [CONTEXT] Constrained person silhouette for UNet (Killed Wings).")
-            else:
-                image_ori_constrained = image_ori
+            # Removed Silhouette Constraint to allow UNet to natively render background
+            image_ori_constrained = image_ori
+            print(" -> [CONTEXT] Using full original image for UNet context (Native background rendering).")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -776,89 +766,18 @@ class WearCastHD:
         # --- Pre-compositing diagnostics ---
         mask_bool = binary_mask > 0.5
         gen_in_mask = gen_arr[mask_bool]
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
-        garm_fg_valid = ~garm_fg_mask
         gen_lum_mean = float((gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114).mean()) if len(gen_in_mask) > 0 else 128.0
-        garm_lum_mean = float((garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114).mean()) if garm_fg_valid.sum() > 0 else 128.0
-        lum_gap = garm_lum_mean - gen_lum_mean
-        print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
-
-        # --- PHASE 4 MASTER: ADAPTIVE SHADOW COMPOSITING ---
-        # 0. Prepare original background reference for shadows and final composite
+        
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
-        
-        # 1. Extract raw shadows from original image
-        # We use a large blur to remove high-frequency details (lanyards, old logos) 
-        # and keep only the anatomical lighting (pecs, stomach, folds).
-        print(" -> [SHADOWS] Extracting and blurring adaptive shadow map...")
-        ori_gray = cv2.cvtColor(ori_final.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
-        # Heavy blur (sigma=20) to kill ghosts (Lanyards, etc.)
-        shadow_base = cv2.GaussianBlur(ori_gray, (0, 0), 20)
-        # Ratio of original to blurred gives us the lighting map
-        shadow_map = np.clip(ori_gray / (shadow_base + 1e-6), 0.2, 1.5)
-        shadow_map = cv2.GaussianBlur(shadow_map, (0, 0), 5) # Smooth the map
-        shadow_map_3d = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
 
-        # --- FIX #16: Smart Adaptive Color Matching & Shadow Blending ---
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        if hasattr(self, '_cached_garm_mask'):
-            garm_mask_resized = np.array(Image.fromarray(self._cached_garm_mask * 255).resize(raw_generated.size, Image.NEAREST))
-            garm_fg_mask = garm_mask_resized > 127
-        else:
-            garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
-        
-        if np.any(garm_fg_mask):
-            garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-            ref_fg_vals = garm_lab[garm_fg_mask]
-            
-            # Analyze luminance: skip or reduce if white/light
-            avg_l = np.mean(ref_fg_vals[:, 0])
-            # Variance in AB channels helps detect colorful graphics
-            std_ab = np.std(ref_fg_vals[:, 1:]) 
-            
-            # Adaptive Strength for LAB Match
-            strength = 1.0
-            # Shadow Strength Logic: 
-            # - White/Light shirt: Low shadow strength (10-15%) to prevent "dirty" look.
-            # - Dark shirt: High shadow strength (30-50%) for depth.
-            shadow_strength = 0.4 # Default
-            
-            if avg_l > 215: 
-                strength = 1.0
-                shadow_strength = 0.10 # Super minimal for white shirts to avoid dirtiness
-                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (10%).")
-            elif avg_l > 170:
-                strength = 0.8
-                shadow_strength = 0.15 # Low for light shirts
-                print(f" -> [COLOR] Light garment detected (L={avg_l:.1f}). Using 15% shadows.")
-            else:
-                shadow_strength = 0.25 # Max 25% to avoid muddying dark shirts
-                print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using 25% shadows.")
-            
-            # 2. Apply Adaptive Multiply Blend FIRST
-            # result = unet_output * shadow_map (blended by strength)
-            shadowed_gen = gen_arr * shadow_map_3d
-            gen_arr = (1.0 - shadow_strength) * gen_arr + shadow_strength * shadowed_gen
-            print(f" -> [SHADOWS] Applied adaptive multiply blend (strength={shadow_strength}).")
+        # We completely removed HSV Color Correction and Shadow Multiplication.
+        # The AI (UNet) naturally generates physically accurate shadows and environmental lighting.
+        print(" -> [NATIVE RENDER] Bypassed manual color/shadow filters to preserve pure AI photorealism.")
 
-            gen_image = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-            mask_hard_image = Image.fromarray((alpha * 255).astype(np.uint8))
-            gen_image = self.local_color_correction(gen_image, image_garm, mask_hard_image)
-            gen_arr = np.array(gen_image).astype(np.float32)
-            print(f" -> [COLOR] Applied Advanced HSV Local Color Correction.")
-
-
-
-        # --- Final Compositing (The "Cape" Killer) ---
-        # We forcefully paste the AI-generated garment onto the ORIGINAL background.
-        # This physically deletes any background noise or "capes" the AI created.
+        # --- Final Compositing ---
+        # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
-        
-        # Ensure RGB mode and matching sizes
-        # gen_arr already contains LAB matching and Shadow maps.
-        # ori_final is already defined above in Phase 4
 
         # --- STUDIO MASTER: AI-Native Rendering ---
         # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
