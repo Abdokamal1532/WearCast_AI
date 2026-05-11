@@ -67,7 +67,7 @@ class WearCastHD:
         vae = AutoencoderKL.from_pretrained(
             MODEL_PATH,
             subfolder="vae",
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float32,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -143,7 +143,6 @@ class WearCastHD:
             # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
             # 2. Increase recompile limit to accommodate all 16 Transformer blocks
             torch.backends.cudnn.benchmark = True
-            torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.recompile_limit = 24 
             
             self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="default", fullgraph=False)
@@ -629,7 +628,7 @@ class WearCastHD:
             # --- 2d. VAE Garment Fidelity Check ---
             # Encode garment through VAE and decode back to check reconstruction quality
             print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
-            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float16)
+            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float32)
             garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
             garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
             # Undo: [-1,1] -> [0,255]
@@ -838,17 +837,17 @@ class WearCastHD:
             else:
                 print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using full 40% shadows.")
             
+            # 2. Apply Adaptive Multiply Blend FIRST
+            # result = unet_output * shadow_map (blended by strength)
+            shadowed_gen = gen_arr * shadow_map_3d
+            gen_arr = (1.0 - shadow_strength) * gen_arr + shadow_strength * shadowed_gen
+            print(f" -> [SHADOWS] Applied adaptive multiply blend (strength={shadow_strength}).")
+
             gen_image = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
             mask_hard_image = Image.fromarray((alpha * 255).astype(np.uint8))
             gen_image = self.local_color_correction(gen_image, image_garm, mask_hard_image)
             gen_arr = np.array(gen_image).astype(np.float32)
             print(f" -> [COLOR] Applied Advanced HSV Local Color Correction.")
-
-            # 2. Apply Adaptive Multiply Blend
-            # result = unet_output * shadow_map (blended by strength)
-            shadowed_gen = gen_arr * shadow_map_3d
-            gen_arr = (1.0 - shadow_strength) * gen_arr + shadow_strength * shadowed_gen
-            print(f" -> [SHADOWS] Applied adaptive multiply blend (strength={shadow_strength}).")
 
 
 
@@ -1000,14 +999,12 @@ class WearCastHD:
         garm_mean_v = garm_hsv[valid_garm, 2].mean()
         gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
         garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
-        ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
+        ratio_v     = min(garm_std_v / gen_std_v, 1.50)  # Allow darkening/lightening based purely on stats
         
         if is_white_garm:
-            raw_shift_v = (garm_mean_v - gen_mean_v) * 0.95
-            shift_v     = min(max(raw_shift_v, 0.0), 85.0)  # High cap to allow UNet grey to reach pure white
+            shift_v     = (garm_mean_v - gen_mean_v) * 0.95
         else:
-            raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
-            shift_v     = min(max(raw_shift_v, 0.0), 35.0)  # Standard cap for colored/dark shirts
+            shift_v     = (garm_mean_v - gen_mean_v) * 0.85
             
         print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
         corrected_v = gen_hsv[:, :, 2].copy()
@@ -1027,14 +1024,13 @@ class WearCastHD:
         gen_std_s   = gen_hsv[mask_bool,  1].std() + 1e-6
         garm_std_s  = garm_hsv[valid_garm, 1].std() + 1e-6
         if is_white_garm:
-            # White garment: compress saturation gently (cap ratio at 0.85)
-            # FIX: Reduced from 1.00→0.85 and shift 1.20→0.80 to prevent washing out colored elements
-            ratio_s  = min(garm_std_s / gen_std_s, 0.85)          # cap at 0.85: gentler compression
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.80          # gentler pull toward low-S white
+            # White garment: compress saturation gently
+            ratio_s  = min(garm_std_s / gen_std_s, 0.90)
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.85
         else:
-            # Colorful garment: allow expansion for vibrancy
-            ratio_s  = min(garm_std_s / gen_std_s, 1.60)
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.90
+            # Colorful garment: allow expansion or compression
+            ratio_s  = min(garm_std_s / gen_std_s, 1.80)
+            shift_s  = (garm_mean_s - gen_mean_s) * 0.95
         print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
         corrected_s = gen_hsv[:, :, 1].copy()
         

@@ -913,7 +913,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             image_latents = torch.cat([image_latents], dim=0)
 
         # No doubling here; we handle it in the main denoising loop for consistency
-        return image_latents
+        return image_latents.to(dtype=dtype)
     
     def prepare_vton_latents(
         self, image, mask, image_ori, batch_size, num_images_per_prompt, dtype, device, do_classifier_free_guidance, generator=None
@@ -994,9 +994,9 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
         # No doubling here; we handle it in the main denoising loop for consistency and to avoid double-doubling
         # Final Device Anchor: Force all return tensors back to GPU
-        image_latents = image_latents.to(device=device)
-        mask = mask.to(device=device)
-        image_ori_latents = image_ori_latents.to(device=device)
+        image_latents = image_latents.to(device=device, dtype=dtype)
+        mask = mask.to(device=device, dtype=dtype)
+        image_ori_latents = image_ori_latents.to(device=device, dtype=dtype)
 
         return image_latents, mask, image_ori_latents
 
