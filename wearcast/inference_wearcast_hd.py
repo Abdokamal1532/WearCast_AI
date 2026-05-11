@@ -877,15 +877,14 @@ class WearCastHD:
 
     def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """
-        Reinhard Statistical Color Transfer in LAB space.
-        Transfers the exact mean color/brightness of the original garment to the generated garment,
-        while preserving the AI's generated standard deviation (3D folds, wrinkles, highlights).
+        Content-Aware Statistical Color Transfer in LAB space.
+        Uses Median to find the true fabric color (ignoring logos) and softly shifts
+        the AI generation towards it while preserving 3D variance and protecting graphics.
         """
-        print(" -> [COLOR] Applying Statistical LAB Color Transfer...")
+        print(" -> [COLOR] Applying Content-Aware LAB Color Transfer...")
         
         # 1. Prepare target garment pixels
         garm_arr = np.array(image_garm.resize((gen_arr.shape[1], gen_arr.shape[0]))).astype(np.float32)
-        # Find valid foreground pixels (not pure white background)
         if hasattr(self, '_cached_garm_mask'):
             garm_mask_resized = np.array(Image.fromarray(self._cached_garm_mask * 255).resize((gen_arr.shape[1], gen_arr.shape[0]), Image.NEAREST))
             valid_garm = garm_mask_resized > 127
@@ -896,54 +895,80 @@ class WearCastHD:
             print("   [COLOR] Not enough valid garment pixels to calculate stats. Skipping transfer.")
             return gen_arr
             
-        # 2. Get valid mask pixels for the generated garment
         mask_bool = alpha_mask > 0.5
         if mask_bool.sum() < 100:
             return gen_arr
             
-        # 3. Convert to LAB color space
+        # 2. Convert to LAB color space
         gen_lab = cv2.cvtColor(np.clip(gen_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         garm_lab = cv2.cvtColor(np.clip(garm_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         
-        # 4. Calculate Mean and Standard Deviation for Target (Garment)
+        # 3. Use MEDIAN to find the true base color (ignoring bright/dark logos)
         target_pixels = garm_lab[valid_garm]
-        target_mean = np.mean(target_pixels, axis=0)
+        target_median = np.median(target_pixels, axis=0)
         target_std = np.std(target_pixels, axis=0) + 1e-6
         
-        # 5. Calculate Mean and Standard Deviation for Source (Generated)
         source_pixels = gen_lab[mask_bool]
-        source_mean = np.mean(source_pixels, axis=0)
+        source_median = np.median(source_pixels, axis=0)
         source_std = np.std(source_pixels, axis=0) + 1e-6
         
-        print(f"   [COLOR] LAB Transfer Stats:")
-        print(f"   [COLOR]   Target Mean: L={target_mean[0]:.1f}, a={target_mean[1]:.1f}, b={target_mean[2]:.1f}")
-        print(f"   [COLOR]   Source Mean: L={source_mean[0]:.1f}, a={source_mean[1]:.1f}, b={source_mean[2]:.1f}")
+        print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
+        print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # Protect against extreme std scaling (prevents deep blacks from becoming noisy/blown out)
-        std_ratio = target_std / source_std
-        std_ratio = np.clip(std_ratio, 0.5, 1.5)  # Cap variance scaling to prevent artifacting
-
-        # For L channel (Lightness), if target is very dark, we aggressively pull the mean, but keep ratio close to 1.0 to preserve smooth AI shadows
-        if target_mean[0] < 80: # Dark garment
-            std_ratio[0] = np.clip(std_ratio[0], 0.8, 1.2)
+        # 4. Protect Graphics (Content-Aware Masking)
+        # Calculate color distance in LAB space to detect graphics vs base fabric.
+        # L difference is weighted less (0.2) because 3D shadows naturally deviate from the median L.
+        l_diff = np.abs(gen_lab[:, :, 0] - source_median[0])
+        ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
         
-        # 6. Apply Transfer: result = (source - source_mean) * (target_std / source_std) + target_mean
+        # Deviation metric: heavily penalize A/B (color) shifts, lightly penalize L (shadows)
+        deviation = (l_diff * 0.2) + ab_diff
+        
+        # Map deviation to a protection weight: < 15 -> full shift, > 40 -> protected graphic
+        transfer_weight = np.clip((40.0 - deviation) / 25.0, 0.0, 1.0)
+        
+        # Cap variance scaling to prevent noisy artifacting
+        std_ratio = target_std / source_std
+        std_ratio = np.clip(std_ratio, 0.6, 1.4) 
+        
         corrected_lab = gen_lab.copy()
         
-        for i in range(3): # L, a, b
-            corrected_lab[mask_bool, i] = (source_pixels[:, i] - source_mean[i]) * std_ratio[i] + target_mean[i]
+        # 5. Apply Transfer with Soft-Clipping for L Channel
+        source_l = gen_lab[:, :, 0]
+        
+        # Linear shift
+        shifted_l = (source_l - source_median[0]) * std_ratio[0] + target_median[0]
+        
+        # Apply Soft-Clipping (Logarithmic compression) to prevent glowing whites and crushed blacks
+        # Highlights (compress above 220, max approaches 255)
+        high_mask = shifted_l > 220
+        if high_mask.sum() > 0:
+            excess = shifted_l[high_mask] - 220
+            shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
             
-        # LAB bounds: L [0, 255], a/b [0, 255] in OpenCV uint8 representation
+        # Shadows (compress below 30, max approaches 0)
+        low_mask = shifted_l < 30
+        if low_mask.sum() > 0:
+            deficit = 30 - shifted_l[low_mask]
+            shifted_l[low_mask] = 30 - 30.0 * (1.0 - np.exp(-deficit / 30.0))
+            
+        # Combine using the graphic protection weight
+        corrected_lab[:, :, 0] = source_l * (1.0 - transfer_weight) + shifted_l * transfer_weight
+        
+        # A and B channels (Color)
+        for i in [1, 2]:
+            source_c = gen_lab[:, :, i]
+            shifted_c = (source_c - source_median[i]) * std_ratio[i] + target_median[i]
+            corrected_lab[:, :, i] = source_c * (1.0 - transfer_weight) + shifted_c * transfer_weight
+            
         corrected_lab = np.clip(corrected_lab, 0, 255)
         
-        # 7. Convert back to RGB
+        # 6. Convert back to RGB and blend
         corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
-        
-        # Blend smoothly at the edges using the alpha mask
         alpha_3d = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
         final_arr = corrected_rgb * alpha_3d + gen_arr * (1.0 - alpha_3d)
         
-        print("   [COLOR] Statistical LAB transfer complete.")
+        print("   [COLOR] Content-Aware LAB transfer complete.")
         return final_arr
 
     def laplacian_pyramid_blend(self, generated, original, mask_soft, levels=5):
