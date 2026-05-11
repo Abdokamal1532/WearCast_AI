@@ -67,7 +67,7 @@ class WearCastHD:
         vae = AutoencoderKL.from_pretrained(
             MODEL_PATH,
             subfolder="vae",
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float32,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -142,10 +142,10 @@ class WearCastHD:
             # [PERFORMANCE FIX v2.1] 
             # 1. Allow integer attributes on modules without recompiling (crucial for block indices)
             # 2. Increase recompile limit to accommodate all 16 Transformer blocks
-            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            torch.backends.cudnn.benchmark = True
             torch._dynamo.config.recompile_limit = 24 
             
-            self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="reduce-overhead", fullgraph=False)
+            self.pipe.unet_vton = torch.compile(self.pipe.unet_vton, mode="default", fullgraph=False)
             print("[WearCastHD] UNet compilation scheduled (Dynamic Indexing enabled).")
         except Exception as e:
             print(f"[WearCastHD] torch.compile failed: {e}. Proceeding without compilation.")
@@ -462,6 +462,24 @@ class WearCastHD:
         generator = torch.manual_seed(seed)
 
         # =========================================================
+        # PRE-PHASE: Garment Matting & Analysis
+        # =========================================================
+        def debug_save(img, name):
+            if output_dir:
+                img.save(os.path.join(output_dir, name))
+            else:
+                img.save(name)
+
+        print(" -> [MATTING] Running AI-powered garment extraction (rembg)...")
+        t_mat = time.time()
+        garm_proc, garm_mask = self.remove_garment_background_rembg(image_garm)
+        self._cached_garm_mask = garm_mask
+        print(f" -> [MATTING] Extraction complete in {time.time() - t_mat:.2f}s")
+        
+        from run.utils_wearcast import analyze_sleeve_length
+        is_long_sleeve = analyze_sleeve_length(garm_mask)
+
+        # =========================================================
         # PHASE 1 — AI Preprocessing (OpenPose + HumanParsing + Mask)
         # =========================================================
         if mask is None:
@@ -526,7 +544,8 @@ class WearCastHD:
                 model_parse, 
                 keypoints,
                 width=384,
-                height=512
+                height=512,
+                is_long_sleeve=is_long_sleeve
             )
             self._cached_hard_mask = mask
 
@@ -545,12 +564,6 @@ class WearCastHD:
             print(f" -> Mask after bilinear resize and re-binarization: {mask.size}")
 
             # Save mask debug images
-            def debug_save(img, name):
-                if output_dir:
-                    img.save(os.path.join(output_dir, name))
-                else:
-                    img.save(name)
-
             debug_save(mask, "debug_phase1_hard_mask.jpg")
             print(f" -> [SAVED] Hard mask (255-binary) saved")
             debug_save(mask_gray, "debug_phase1_soft_mask.jpg")
@@ -579,11 +592,7 @@ class WearCastHD:
             from PIL import ImageEnhance
 
             # --- 2a. AI Garment Matting (rembg) ---
-            # Uses rembg (AI-based) for perfect extraction, with GrabCut as fallback
-            print(" -> [MATTING] Running AI-powered garment extraction (rembg)...")
-            t_mat = time.time()
-            garm_proc, garm_mask = self.remove_garment_background_rembg(image_garm)
-            print(f" -> [MATTING] Extraction complete in {time.time() - t_mat:.2f}s")
+            # Extraction already completed in PRE-PHASE
             debug_save(garm_proc, "debug_phase2_clip_bg_replaced.jpg")
 
             # Save the original garment for reference comparison
@@ -619,7 +628,7 @@ class WearCastHD:
             # --- 2d. VAE Garment Fidelity Check ---
             # Encode garment through VAE and decode back to check reconstruction quality
             print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
-            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float16)
+            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float32)
             garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
             garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
             # Undo: [-1,1] -> [0,255]
@@ -650,19 +659,9 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # --- FIX #18: UNet Context Silhouette Constraint ---
-            # Prevents "Gray Wings" by blacking out anything outside the body silhouette.
-            # This forces the UNet to only generate content within the person's boundaries.
-            if hasattr(self, '_cached_parse'):
-                sil = (self._cached_parse > 0).astype(np.float32)
-                sil = cv2.resize(sil, (768, 1024), interpolation=cv2.INTER_NEAREST)
-                person_np = np.array(image_ori.resize((768, 1024))).astype(np.float32)
-                # Black out everything outside silhouette
-                person_np = person_np * sil[:, :, np.newaxis]
-                image_ori_constrained = Image.fromarray(person_np.astype(np.uint8))
-                print(" -> [CONTEXT] Constrained person silhouette for UNet (Killed Wings).")
-            else:
-                image_ori_constrained = image_ori
+            # Removed Silhouette Constraint to allow UNet to natively render background
+            image_ori_constrained = image_ori
+            print(" -> [CONTEXT] Using full original image for UNet context (Native background rendering).")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -746,18 +745,16 @@ class WearCastHD:
         # Binarize
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
-        # FIX #4: Tighten and stabilize the blend alpha
-        # 1. Erode mask inward to guarantee no garment bleeds outside body
+        # FIX #4: Seamless Photographic Alpha Blend
+        # 1. Very gentle erosion to avoid bleeds but keep boundary natural
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
         
-        # 2. Use a HARD center + soft edge mask
-        feather_sigma = 3.0
-        blurred = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        # 2. Wide, soft photographic feathering instead of jagged cutouts
+        feather_sigma = 15.0
+        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         
-        # 3. Force center pixels to be fully opaque (1.0)
-        core_mask = cv2.erode(eroded_mask, np.ones((11, 11), np.uint8), iterations=1)
-        alpha = np.where(core_mask > 0, 1.0, blurred)
+        # No more forcing the core_mask to 1.0. The wide blur naturally transitions.
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
@@ -769,83 +766,18 @@ class WearCastHD:
         # --- Pre-compositing diagnostics ---
         mask_bool = binary_mask > 0.5
         gen_in_mask = gen_arr[mask_bool]
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        garm_fg_mask = np.all(garm_arr >= 240, axis=-1)
-        garm_fg_valid = ~garm_fg_mask
         gen_lum_mean = float((gen_in_mask[:, 0]*0.299 + gen_in_mask[:, 1]*0.587 + gen_in_mask[:, 2]*0.114).mean()) if len(gen_in_mask) > 0 else 128.0
-        garm_lum_mean = float((garm_arr[garm_fg_valid, 0]*0.299 + garm_arr[garm_fg_valid, 1]*0.587 + garm_arr[garm_fg_valid, 2]*0.114).mean()) if garm_fg_valid.sum() > 0 else 128.0
-        lum_gap = garm_lum_mean - gen_lum_mean
-        print(f"   [DIAG] Raw UNet luminance: {gen_lum_mean:.1f} | Reference: {garm_lum_mean:.1f} | Gap: {lum_gap:.1f}")
-
-        # --- PHASE 4 MASTER: ADAPTIVE SHADOW COMPOSITING ---
-        # 0. Prepare original background reference for shadows and final composite
+        
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
-        
-        # 1. Extract raw shadows from original image
-        # We use a large blur to remove high-frequency details (lanyards, old logos) 
-        # and keep only the anatomical lighting (pecs, stomach, folds).
-        print(" -> [SHADOWS] Extracting and blurring adaptive shadow map...")
-        ori_gray = cv2.cvtColor(ori_final.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
-        # Heavy blur (sigma=20) to kill ghosts (Lanyards, etc.)
-        shadow_base = cv2.GaussianBlur(ori_gray, (0, 0), 20)
-        # Ratio of original to blurred gives us the lighting map
-        shadow_map = np.clip(ori_gray / (shadow_base + 1e-6), 0.2, 1.5)
-        shadow_map = cv2.GaussianBlur(shadow_map, (0, 0), 5) # Smooth the map
-        shadow_map_3d = np.repeat(shadow_map[:, :, np.newaxis], 3, axis=2)
 
-        # --- FIX #16: Smart Adaptive Color Matching & Shadow Blending ---
-        garm_arr = np.array(image_garm.resize(raw_generated.size)).astype(np.float32)
-        # FIX: Raise threshold to 254 to include white shirt pixels in the foreground
-        garm_fg_mask = ~np.all(garm_arr > 253, axis=-1)
-        
-        if np.any(garm_fg_mask):
-            garm_lab = cv2.cvtColor(garm_arr.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-            ref_fg_vals = garm_lab[garm_fg_mask]
-            
-            # Analyze luminance: skip or reduce if white/light
-            avg_l = np.mean(ref_fg_vals[:, 0])
-            # Variance in AB channels helps detect colorful graphics
-            std_ab = np.std(ref_fg_vals[:, 1:]) 
-            
-            # Adaptive Strength for LAB Match
-            strength = 1.0
-            # Shadow Strength Logic: 
-            # - White/Light shirt: Low shadow strength (10-15%) to prevent "dirty" look.
-            # - Dark shirt: High shadow strength (30-50%) for depth.
-            shadow_strength = 0.4 # Default
-            
-            if avg_l > 215: 
-                strength = 1.0
-                shadow_strength = 0.12 # Very low for white shirts
-                print(f" -> [COLOR] White shirt detected (L={avg_l:.1f}). Using minimal shadows (12%).")
-            elif avg_l > 170:
-                strength = 0.8
-                shadow_strength = 0.25 # Medium-low for light shirts
-                print(f" -> [COLOR] Light garment detected (L={avg_l:.1f}). Using 25% shadows.")
-            else:
-                print(f" -> [COLOR] Dark garment detected (L={avg_l:.1f}). Using full 40% shadows.")
-            
-            if strength > 0:
-                gen_arr = self.match_histograms_lab(gen_arr, ref_fg_vals, alpha, strength=strength)
-                print(f" -> [COLOR] Applied LAB matching (strength={strength}).")
+        # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
+        # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
+        gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
 
-            # 2. Apply Adaptive Multiply Blend
-            # result = unet_output * shadow_map (blended by strength)
-            shadowed_gen = gen_arr * shadow_map_3d
-            gen_arr = (1.0 - shadow_strength) * gen_arr + shadow_strength * shadowed_gen
-            print(f" -> [SHADOWS] Applied adaptive multiply blend (strength={shadow_strength}).")
-
-
-
-        # --- Final Compositing (The "Cape" Killer) ---
-        # We forcefully paste the AI-generated garment onto the ORIGINAL background.
-        # This physically deletes any background noise or "capes" the AI created.
+        # --- Final Compositing ---
+        # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
-        
-        # Ensure RGB mode and matching sizes
-        # gen_arr already contains LAB matching and Shadow maps.
-        # ori_final is already defined above in Phase 4
 
         # --- STUDIO MASTER: AI-Native Rendering ---
         # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
@@ -860,8 +792,13 @@ class WearCastHD:
         if hasattr(self, '_skin_mask'):
             # Resize skin mask to match output
             skin_mask_final = cv2.resize(self._skin_mask, raw_generated.size, interpolation=cv2.INTER_LINEAR)
+            
+            # Prevent skin texture from bleeding onto newly generated fabric
+            # Since alpha represents the new garment, we subtract it from the skin mask
+            skin_mask_final = skin_mask_final * (1.0 - alpha)
+            
             gen_arr = self.apply_frequency_blending(gen_arr, ori_final, skin_mask_final)
-            print(" -> [SKIN] Frequency separation complete (restored skin texture).")
+            print(" -> [SKIN] Frequency separation complete (restored skin texture on bare areas).")
         
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
@@ -938,159 +875,89 @@ class WearCastHD:
             return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
 
 
-    def local_color_correction(self, generated, original_garment, mask_hard):
+    def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """
-        Match overall H/S/V stats of the generated garment to the original garment,
-        restricted precisely to the mask boundary, and gently capped.
+        Content-Aware Statistical Color Transfer in LAB space.
+        Uses Median to find the true fabric color (ignoring logos) and softly shifts
+        the AI generation towards it while preserving 3D variance and protecting graphics.
         """
-        print(f"   [COLOR] Starting correction. Gen shape: {generated.size}, Garm shape: {original_garment.size}")
-        gen_np  = np.array(generated).astype(np.float32)
-        garm_np = np.array(original_garment.resize(generated.size)).astype(np.float32)
-        msk_np  = np.array(mask_hard.resize(generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-
-        gen_hsv  = cv2.cvtColor(gen_np.astype(np.uint8),  cv2.COLOR_RGB2HSV).astype(np.float32)
-        garm_hsv = cv2.cvtColor(garm_np.astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-
-        mask_bool = msk_np > 0.5
-        print(f"   [COLOR] Mask interior area: {mask_bool.sum()} pixels  ({100*mask_bool.mean():.1f}% of image)")
-
-        if mask_bool.sum() < 100:
-            print("   [COLOR] Skipped: Mask interior area too small (<100px).")
-            return generated
-
-        bg_garm  = np.all(garm_np >= 238, axis=-1)
-        valid_garm = ~bg_garm
-        print(f"   [COLOR] Valid garment pixels (non-BG): {valid_garm.sum()}  ({100*valid_garm.mean():.1f}%)")
-
-        if valid_garm.sum() < 100:
-            valid_garm = np.ones_like(bg_garm)
-            print("   [COLOR] Warning: Product image had almost no valid foreground pixels. Using entire image stats.")
-
-        ref_lum_mean  = garm_hsv[valid_garm, 2].mean()   # reference V mean (brightness)
-        ref_sat_mean  = garm_hsv[valid_garm, 1].mean()   # reference S mean (saturation)
-        is_white_garm = ref_lum_mean > 180 and ref_sat_mean < 60  # garment is primarily white/light
-        print(f"   [COLOR] Garment profile: ref_lum={ref_lum_mean:.1f}, ref_sat={ref_sat_mean:.1f}, is_white={is_white_garm}")
-
-        # ── Channel 2: V (Brightness) ──────────────────────────────────────────
-        # KEY FIX: Weight the brightness boost by (1 - normalized_saturation).
-        # Vivid graphic elements (high-S: blue jeans illustration, red text) get weight~0 → no brightness change.
-        # White shirt background (low-S) gets weight~1 → full brightness boost.
-        # This PRESERVES graphic colors while whitening the shirt background.
-        gen_mean_v  = gen_hsv[mask_bool, 2].mean()
-        garm_mean_v = garm_hsv[valid_garm, 2].mean()
-        gen_std_v   = gen_hsv[mask_bool,  2].std() + 1e-6
-        garm_std_v  = garm_hsv[valid_garm, 2].std() + 1e-6
-        ratio_v     = max(min(garm_std_v / gen_std_v, 1.30), 1.00)  # floor=1.0: NEVER compress brightness
-        raw_shift_v = (garm_mean_v - gen_mean_v) * 0.70
-        # FIX: V shift cap at 30 — needs headroom for UNet's ~55pt brightness deficit
-        shift_v     = min(max(raw_shift_v, 0.0), 30.0)              # only boost, never darken; cap at 30
-        print(f"   [COLOR] {'Value / Brightness':<18}: Ref Mean={garm_mean_v:.1f}, Gen Mean={gen_mean_v:.1f} | Ref Std={garm_std_v:.1f}, Gen Std={gen_std_v:.1f} | Ratio={ratio_v:.2f}, Shift={shift_v:.1f}")
-        corrected_v = gen_hsv[:, :, 2].copy()
-        # Saturation-weighted boost: high-S (colorful) pixels get <10% of shift; low-S (white) get 100%
-        sat_mask     = gen_hsv[:, :, 1]  # 0–255 saturation map
-        # FIX: Tightest saturation guard S/50 — pixels with S>50 are graphic/
-        # illustration elements and must NOT receive any brightness boost. This prevents the
-        # blue scribbles, red text, and yellow figure from being washed out.
-        sat_weight   = np.clip(1.0 - sat_mask / 50.0, 0.0, 1.0)   # S<15→weight~1.0, S>50→weight~0.0
-        v_boost_map  = sat_weight * shift_v                          # per-pixel boost amount
-        corrected_v[mask_bool] = corrected_v[mask_bool] * ratio_v + v_boost_map[mask_bool]
-        gen_hsv[:, :, 2] = np.clip(corrected_v, 0, 255)
-
-        # ── Channel 1: S (Saturation) ──────────────────────────────────────────
-        gen_mean_s  = gen_hsv[mask_bool, 1].mean()
-        garm_mean_s = garm_hsv[valid_garm, 1].mean()
-        gen_std_s   = gen_hsv[mask_bool,  1].std() + 1e-6
-        garm_std_s  = garm_hsv[valid_garm, 1].std() + 1e-6
-        if is_white_garm:
-            # White garment: compress saturation gently (cap ratio at 0.85)
-            # FIX: Reduced from 1.00→0.85 and shift 1.20→0.80 to prevent washing out colored elements
-            ratio_s  = min(garm_std_s / gen_std_s, 0.85)          # cap at 0.85: gentler compression
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.80          # gentler pull toward low-S white
+        print(" -> [COLOR] Applying Content-Aware LAB Color Transfer...")
+        
+        # 1. Prepare target garment pixels
+        garm_arr = np.array(image_garm.resize((gen_arr.shape[1], gen_arr.shape[0]))).astype(np.float32)
+        if hasattr(self, '_cached_garm_mask'):
+            garm_mask_resized = np.array(Image.fromarray(self._cached_garm_mask * 255).resize((gen_arr.shape[1], gen_arr.shape[0]), Image.NEAREST))
+            valid_garm = garm_mask_resized > 127
         else:
-            # Colorful garment: allow expansion for vibrancy
-            ratio_s  = min(garm_std_s / gen_std_s, 1.60)
-            shift_s  = (garm_mean_s - gen_mean_s) * 0.90
-        print(f"   [COLOR] {'Saturation':<18}: Ref Mean={garm_mean_s:.1f}, Gen Mean={gen_mean_s:.1f} | Ref Std={garm_std_s:.1f}, Gen Std={gen_std_s:.1f} | Ratio={ratio_s:.2f}, Shift={shift_s:.1f}")
-        corrected_s = gen_hsv[:, :, 1].copy()
-        corrected_s[mask_bool] = corrected_s[mask_bool] * ratio_s + shift_s
-        gen_hsv[:, :, 1] = np.clip(corrected_s, 0, 255)
+            valid_garm = ~np.all(garm_arr >= 240, axis=-1)
+            
+        if valid_garm.sum() < 100:
+            print("   [COLOR] Not enough valid garment pixels to calculate stats. Skipping transfer.")
+            return gen_arr
+            
+        mask_bool = alpha_mask > 0.5
+        if mask_bool.sum() < 100:
+            return gen_arr
+            
+        # 2. Convert to LAB color space
+        gen_lab = cv2.cvtColor(np.clip(gen_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        garm_lab = cv2.cvtColor(np.clip(garm_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        
+        # 3. Use MEDIAN to find the true base color (ignoring bright/dark logos)
+        target_pixels = garm_lab[valid_garm]
+        target_median = np.median(target_pixels, axis=0)
+        target_std = np.std(target_pixels, axis=0) + 1e-6
+        
+        source_pixels = gen_lab[mask_bool]
+        source_median = np.median(source_pixels, axis=0)
+        source_std = np.std(source_pixels, axis=0) + 1e-6
+        
+        print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
+        print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # ── Channel 0: H (Hue) — pull toward reference hue for white-base garments ──
-        # FIX 3: Hue shift is now ONLY applied to low-saturation pixels (S < 40), i.e.
-        # the white shirt body. High-saturation pixels (blue collar, red "FOLLOW THE SUN"
-        # text, yellow illustration) keep their original hue untouched.
-        if is_white_garm:
-            gen_mean_h  = gen_hsv[mask_bool, 0].mean()
-            garm_mean_h = garm_hsv[valid_garm, 0].mean()
-            hue_shift   = np.clip((garm_mean_h - gen_mean_h) * 0.60, -15, 15)  # gentle hue correction (max ±15)
-            corrected_h = gen_hsv[:, :, 0].copy()
-            # Only shift low-saturation (near-white shirt) pixels — protect vivid graphic colors
-            sat_in_mask = gen_hsv[:, :, 1][mask_bool]  # saturation at mask pixels
-            # FIX: Tightened from S<40 to S<25 — only truly white pixels get hue shift
-            low_sat_sel = sat_in_mask < 25             # S < 25 → truly near-white shirt background
-            mask_rows, mask_cols = np.where(mask_bool)
-            corrected_h[mask_rows[low_sat_sel], mask_cols[low_sat_sel]] += hue_shift
-            gen_hsv[:, :, 0] = np.clip(corrected_h, 0, 180)  # OpenCV H range is 0–180
-            low_sat_pct = 100 * low_sat_sel.sum() / max(mask_bool.sum(), 1)
-            print(f"   [COLOR] {'Hue':<18}: Ref Mean={garm_mean_h:.1f}, Gen Mean={gen_mean_h:.1f} | Shift={hue_shift:.1f} | Applied to {low_sat_pct:.1f}% of mask (S<40 only)")
-
-        corrected_rgb = cv2.cvtColor(gen_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-
-        # Luminance rescue disabled — brightness shift already handles white correction.
-        # The rescue was over-modifying 70%+ of mask pixels.
-        if False and ref_lum_mean > 200:  # reference is a white/light garment
-            mask_r = corrected_rgb[mask_bool, 0]
-            mask_g = corrected_rgb[mask_bool, 1]
-            mask_b = corrected_rgb[mask_bool, 2]
-            rgb_lum      = mask_r * 0.299 + mask_g * 0.587 + mask_b * 0.114
-            rgb_sum      = mask_r + mask_g + mask_b + 1e-6
-            rgb_min      = np.minimum(np.minimum(mask_r, mask_g), mask_b)
-            # Desaturation fraction: 0=pure gray/white, 1=fully saturated color
-            rgb_sat_frac = 1.0 - 3.0 * rgb_min / rgb_sum
-            # Only rescue pixels that are: dark AND low-saturation (near-white, not colorful)
-            # FIX 2 (part 2): Tighten luminance rescue threshold 220→210 to avoid boosting
-            # near-white graphic highlight regions (e.g. white shirt background inside illustration)
-            dark_and_light = (rgb_lum < 210) & (rgb_sat_frac < 0.30)  # low-S guard: S<30% → near-white
-            dark_idx = np.where(mask_bool)
-            dark_sel = dark_and_light
-            if dark_sel.sum() > 0:
-                boost = np.clip((220 - rgb_lum[dark_sel]) * 0.6, 0, 30)
-                corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] = np.clip(
-                    corrected_rgb[dark_idx[0][dark_sel], dark_idx[1][dark_sel]] + boost[:, None], 0, 255
-                )
-                print(f"   [COLOR] RGB luminance rescue: {dark_sel.sum()} near-white dark pixels boosted to target=230 (ref_lum={ref_lum_mean:.1f})")
-
-        # === Final pass: flatten residual blue in NEAR-WHITE pixels only ===
-        # GUARD: Only apply to pixels that are both: (1) blue-biased AND (2) already bright/near-white.
-        # Dark pixels belong to the graphic/illustration — their blue is intentional (blue jeans art, scribbles).
-        if is_white_garm:
-            mask_pix_r = corrected_rgb[mask_bool, 0]
-            mask_pix_g = corrected_rgb[mask_bool, 1]
-            mask_pix_b = corrected_rgb[mask_bool, 2]
-            lum_pix    = (mask_pix_r * 0.299 + mask_pix_g * 0.587 + mask_pix_b * 0.114)
-            blue_bias  = mask_pix_b - (mask_pix_r + mask_pix_g) / 2.0
-            # FIX: Raised lum guard from 210→230 — only desaturate truly white-area blue tinting,
-            # not blue collar/trim which is legitimately blue but bright
-            blue_sel   = (blue_bias > 10) & (lum_pix > 230)
-            if blue_sel.sum() > 0:
-                # FIX: Reduced max blend from 0.35→0.20 for gentler correction
-                blend_str = np.clip(blue_bias[blue_sel] / 50.0, 0, 0.20)  # gentle: max 20% desaturation
-                r_idx, c_idx = np.where(mask_bool)
-                r_blue = r_idx[blue_sel]
-                c_blue = c_idx[blue_sel]
-                lum_b  = lum_pix[blue_sel]
-                for ch in range(3):
-                    ch_vals = corrected_rgb[r_blue, c_blue, ch]
-                    corrected_rgb[r_blue, c_blue, ch] = ch_vals * (1 - blend_str) + lum_b * blend_str
-                print(f"   [COLOR] Blue-desaturation (near-white only): {blue_sel.sum()} px (guarded from {(blue_bias>10).sum()} total blue-biased)")
-
-        # Blend zone: 19px tight feather — avoids the 51px halo while still blending mask boundary
-        blend_mask    = cv2.GaussianBlur(msk_np, (19, 19), 4)   # tightened: 51→19px kills white halo glow
-        blend_mask_3d = np.stack([blend_mask]*3, axis=-1)
-
-        result_float = corrected_rgb * blend_mask_3d + gen_np * (1.0 - blend_mask_3d)
-        print("   [COLOR] Execution sequence entirely completed.")
-        return Image.fromarray(np.clip(result_float, 0, 255).astype(np.uint8))
+        # 4. Apply Dynamic Shift Curves
+        # Instead of guessing what a "graphic" is or scaling standard deviations, we use a smart multiplier curve.
+        # The base color gets 100% of the shift. As pixels approach 0 (black) or 255 (white), the shift drops to 0%.
+        # This perfectly preserves logos, deep 3D shadows, and bright 3D highlights without clipping!
+        corrected_lab = gen_lab.copy()
+        
+        # L Channel (Lightness)
+        source_l = gen_lab[:, :, 0]
+        shift_l = target_median[0] - source_median[0]
+        
+        # Calculate dynamic multiplier based on distance from endpoints (0 and 255)
+        multiplier_l = np.where(
+            source_l <= source_median[0],
+            source_l / (source_median[0] + 1e-6),                      # Scale down shift towards 0 (Protects deep shadows & black logos)
+            (255.0 - source_l) / (255.0 - source_median[0] + 1e-6)     # Scale down shift towards 255 (Protects highlights & white logos)
+        )
+        
+        # Apply the dynamically scaled shift (only inside the garment mask)
+        corrected_lab[mask_bool, 0] = source_l[mask_bool] + shift_l * multiplier_l[mask_bool]
+        
+        # A and B Channels (Color)
+        for i in [1, 2]:
+            source_c = gen_lab[:, :, i]
+            shift_c = target_median[i] - source_median[i]
+            
+            # Color channels also range 0-255 in OpenCV LAB representation
+            multiplier_c = np.where(
+                source_c <= source_median[i],
+                source_c / (source_median[i] + 1e-6),
+                (255.0 - source_c) / (255.0 - source_median[i] + 1e-6)
+            )
+            
+            corrected_lab[mask_bool, i] = source_c[mask_bool] + shift_c * multiplier_c[mask_bool]
+            
+        corrected_lab = np.clip(corrected_lab, 0, 255)
+        
+        # 6. Convert back to RGB and blend
+        corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+        alpha_3d = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
+        final_arr = corrected_rgb * alpha_3d + gen_arr * (1.0 - alpha_3d)
+        
+        print("   [COLOR] Content-Aware LAB transfer complete.")
+        return final_arr
 
     def laplacian_pyramid_blend(self, generated, original, mask_soft, levels=5):
         """
