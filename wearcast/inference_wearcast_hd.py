@@ -628,7 +628,11 @@ class WearCastHD:
             # --- 2d. VAE Garment Fidelity Check ---
             # Encode garment through VAE and decode back to check reconstruction quality
             print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
-            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=torch.float32)
+            # FIX #6: Light sharpening before VAE encoding to preserve fine graphic/text details.
+            # This is intentionally NOT applied to garm_proc (CLIP input) to avoid CLIP OOD artifacts.
+            from PIL import ImageFilter
+            image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.0, percent=130, threshold=3))
+            garm_tensor = self.pipe.image_processor.preprocess(image_garm_for_vae).to(device=self.gpu_id, dtype=torch.float32)
             garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
             garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
             # Undo: [-1,1] -> [0,255]
@@ -869,17 +873,21 @@ class WearCastHD:
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
             # Complex/patterned garments: 30 steps for maximum fidelity
-            return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
+            # FIX #5: Restored image_scale from 1.5 → 2.0 (OOTD-HD recommended baseline)
+            return {"num_steps": 30, "image_scale": 2.0}
         else:
             # Simple garments: 30 steps for premium realism
-            return {"num_steps": 30, "image_scale": 1.5} # Lowered from 2.0
+            return {"num_steps": 30, "image_scale": 2.0}
 
 
     def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """
         Content-Aware Statistical Color Transfer in LAB space.
-        Uses Median to find the true fabric color (ignoring logos) and softly shifts
-        the AI generation towards it while preserving 3D variance and protecting graphics.
+        FIX #1: Uses directional percentiles (not median) to find the true fabric color,
+        so that logos/graphics don't contaminate the target measurement.
+        FIX #2: Returns corrected gen_arr WITHOUT doing an alpha blend — the caller
+        performs the single authoritative composite. Eliminates the double-blend bug
+        that caused garments to look transparent/pasted.
         """
         print(" -> [COLOR] Applying Content-Aware LAB Color Transfer...")
         
@@ -903,94 +911,104 @@ class WearCastHD:
         gen_lab = cv2.cvtColor(np.clip(gen_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         garm_lab = cv2.cvtColor(np.clip(garm_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
         
-        # 3. Use MEDIAN to find the true base color (ignoring bright/dark logos)
+        # 3. FIX #1: Directional-Percentile Target Measurement
+        # -------------------------------------------------------
+        # OLD: np.median(target_pixels) — biased by white/dark logos on opposite-tone shirts.
+        # NEW: When darkening (target < source), use 20th-pct to get true dark-fabric tone.
+        #      When brightening (target > source), use 80th-pct to get true light-fabric tone.
+        # This removes the logo-contamination effect that was making black shirts appear grey.
         target_pixels = garm_lab[valid_garm]
-        target_median = np.median(target_pixels, axis=0)
-        target_std = np.std(target_pixels, axis=0) + 1e-6
-        
         source_pixels = gen_lab[mask_bool]
         source_median = np.median(source_pixels, axis=0)
+
+        # Determine shift direction per channel before choosing percentile
+        rough_shift = np.median(target_pixels, axis=0) - source_median
+        target_repr = np.zeros(3)
+        for ch in range(3):
+            if rough_shift[ch] < -5:      # Darkening: use lower percentile (true dark fabric)
+                target_repr[ch] = np.percentile(target_pixels[:, ch], 20)
+            elif rough_shift[ch] > 5:     # Brightening: use upper percentile (true light fabric)
+                target_repr[ch] = np.percentile(target_pixels[:, ch], 80)
+            else:                          # Neutral: use median (no strong shift needed)
+                target_repr[ch] = np.median(target_pixels[:, ch])
+
+        target_median = target_repr  # use the directional representative value
+        target_std = np.std(target_pixels, axis=0) + 1e-6
         source_std = np.std(source_pixels, axis=0) + 1e-6
         
-        print(f"   [COLOR] Target Median: L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
+        print(f"   [COLOR] Target Rep (directional pct): L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
         print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # 4. Optimal Asymmetric Gamut-Aware Color Transfer + Soft Clipping
-        # - When Brightening: Highlights decay to avoid RGB Gamut blowout; Shadows get 1.0x shift to preserve 3D depth.
-        # - When Darkening: Shadows decay to avoid crushing to black; Highlights get 1.0x shift to preserve 3D depth.
-        # - Pure black/white graphics are protected via absolute thresholds.
+        # 4. Asymmetric Gamut-Aware L-Channel Transfer
         corrected_lab = gen_lab.copy()
-        
-        # L Channel (Lightness)
         source_l = gen_lab[:, :, 0]
         shift_l = target_median[0] - source_median[0]
         
         if shift_l < 0:
             # Darkening (e.g. Black shirt)
-            # Shadows are moving towards 0. Decay shift to prevent crushing.
-            # Only decay when close to the bottom (L < 35).
-            decay_start = min(source_median[0], 35.0)
+            # Shadows approach 0 — decay the shift to avoid full crush.
+            # Highlights are moving away from 255 — full shift preserves 3D fold depth.
             multiplier_l = np.where(
-                source_l <= decay_start,
-                source_l / (decay_start + 1e-6),  # Decay shadows
-                1.0  # Keep 100% for midtones and highlights
+                source_l <= source_median[0],
+                source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
+                1.0  # Full shift for highlights
             )
-            # Absolute protection for white logos (L > 200)
+            # Protect pure-white logo pixels (L > 200) — avoid turning them grey
             logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
             multiplier_l = np.minimum(multiplier_l, logo_protect)
         else:
             # Brightening (e.g. White shirt)
-            # Highlights are moving towards 255. Decay shift to prevent blowout!
-            # Only decay when close to the top (L > 220).
-            decay_start = max(source_median[0], 220.0)
+            # Highlights approach 255 — decay to prevent blowout.
+            # Shadows are moving away from 0 — full shift preserves 3D fold depth.
             multiplier_l = np.where(
-                source_l >= decay_start,
-                (255.0 - source_l) / (255.0 - decay_start + 1e-6),  # Decay highlights
-                1.0  # Keep 100% for midtones and shadows
+                source_l >= source_median[0],
+                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
+                1.0  # Full shift for shadows
             )
-            # Absolute protection for black logos (L < 50)
+            # Protect pure-black logo pixels (L < 50) — avoid brightening them
             logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
             multiplier_l = np.minimum(multiplier_l, logo_protect)
             
         shifted_l = source_l + shift_l * multiplier_l
         
-        # Logarithmic Soft-Clipping (Prevent crushed blacks and blown whites)
-        # Highlights (compress above 220, max approaches 255)
+        # FIX #1b: Reduced shadow soft-clip floor from L=30 → L=10
+        # OLD floor of 30 was preventing true black (L≈5-15) from ever being reached.
         high_mask = shifted_l > 220
         if high_mask.sum() > 0:
             excess = shifted_l[high_mask] - 220
             shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
             
-        # Shadows (compress below 30, max approaches 0)
-        low_mask = shifted_l < 30
+        # Shadows: compress below 10 (not 30), allowing near-black fabric
+        low_mask = shifted_l < 10
         if low_mask.sum() > 0:
-            deficit = 30 - shifted_l[low_mask]
-            shifted_l[low_mask] = 30 - 30.0 * (1.0 - np.exp(-deficit / 30.0))
+            deficit = 10 - shifted_l[low_mask]
+            shifted_l[low_mask] = 10 - 10.0 * (1.0 - np.exp(-deficit / 10.0))
             
         corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
         
         # A and B Channels (Color)
-        # Protect colorful graphics using pure A/B distance (ignoring L to prevent false-positives on shadows)
+        # Protect colorful graphics using pure A/B distance from the source neutral
         ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
         color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
         
         for i in [1, 2]:
             source_c = gen_lab[:, :, i]
             shift_c = target_median[i] - source_median[i]
-            
-            # Apply shift, but scale it down for highly saturated graphics
             shifted_c = source_c + shift_c * color_transfer_weight
             corrected_lab[mask_bool, i] = shifted_c[mask_bool]
             
         corrected_lab = np.clip(corrected_lab, 0, 255)
         
-        # 6. Convert back to RGB and blend
+        # FIX #2: Return corrected pixels WITHOUT an alpha blend.
+        # Previously this function blended internally AND the caller blended again,
+        # causing a double-composite that made garments look semi-transparent.
+        # Now: only pixels inside the mask region are updated; caller does the one blend.
         corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
-        alpha_3d = np.repeat(alpha_mask[:, :, np.newaxis], 3, axis=2)
-        final_arr = corrected_rgb * alpha_3d + gen_arr * (1.0 - alpha_3d)
+        result = gen_arr.copy()
+        result[mask_bool] = corrected_rgb[mask_bool]
         
         print("   [COLOR] Content-Aware LAB transfer complete.")
-        return final_arr
+        return result
 
     def laplacian_pyramid_blend(self, generated, original, mask_soft, levels=5):
         """
