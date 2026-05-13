@@ -672,10 +672,10 @@ class WearCastHD:
                 mem_before = torch.cuda.memory_allocated(0) / 1e9
                 print(f" -> GPU VRAM before UNet call: {mem_before:.2f} GB")
 
-            # FIX #6 (Correction): Apply sharpening to the actual garment passed to the pipeline
+            # FIX #6 (Correction): Apply STRONGER sharpening to the actual garment passed to the pipeline
             # to preserve fine details through the VAE bottleneck.
             from PIL import ImageFilter
-            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=1.0, percent=130, threshold=3))
+            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=2.0, percent=200, threshold=0))
 
             t_unet_start = time.time()
             images = self.pipe(
