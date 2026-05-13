@@ -80,9 +80,9 @@ def analyze_sleeve_length(garm_mask_np):
     left_density = np.sum(bottom_left_region > 0) / max(1, bottom_left_region.size)
     right_density = np.sum(bottom_right_region > 0) / max(1, bottom_right_region.size)
     
-    # Require BOTH sides to have >10% fabric density, or one side to have >30% fabric density
+    # Require BOTH sides to have >20% fabric density, or one side to have >40% fabric density
     # This prevents wide t-shirts from being classified as long sleeve
-    if (left_density > 0.10 and right_density > 0.10) or (left_density > 0.30) or (right_density > 0.30):
+    if (left_density > 0.20 and right_density > 0.20) or (left_density > 0.40) or (right_density > 0.40):
         return True
         
     return False
