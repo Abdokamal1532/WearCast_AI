@@ -672,23 +672,34 @@ class WearCastHD:
 
             # [FIX: GHOSTING + COLOR CONTAMINATION]
             # Neutralize original garment pixels inside the mask region before sending
-            # to the UNet as context (image_ori). Without this fix, the UNet sees the
-            # OLD clothing's color and geometry as a strong prior, causing:
-            #   - Ghosting: old garment shape bleeds into generated result (Run 3)
-            #   - Color contamination: dark original garment contaminates white target (Run 2)
-            # We replace the masked region with neutral grey (128, 128, 128) — the
-            # training-distribution neutral value — with a soft boundary blur.
+            # to the UNet as context (image_ori). 
+            # We must KEEP the original luminance variations (wrinkles, folds, faint outlines)
+            # so the UNet has a 3D structural prior, but we NEUTRALIZE the color (greyscale)
+            # and shift the overall brightness to 128 (neutral).
             _mask_np_ctx = np.array(mask.resize(image_ori.size, Image.NEAREST)).astype(np.float32) / 255.0
-            # Soft boundary: gaussian blur on the mask boundary
             _ctx_alpha = cv2.GaussianBlur(_mask_np_ctx, (0, 0), 8.0)
-            _ctx_alpha = np.clip(_ctx_alpha, 0.0, 1.0)
+            _ctx_alpha = np.clip(_ctx_alpha, 0.0, 1.0)[:, :, np.newaxis]
+            
             _ori_np_full = np.array(image_ori).astype(np.float32)
-            _neutral_fill = np.full_like(_ori_np_full, 128.0)
-            _ori_ctx_np = (
-                _ori_np_full * (1.0 - _ctx_alpha[:, :, np.newaxis])
-                + _neutral_fill * _ctx_alpha[:, :, np.newaxis]
-            )
-            image_ori_constrained = Image.fromarray(np.clip(_ori_ctx_np, 0, 255).astype(np.uint8))
+            
+            # Convert to LAB for luminance manipulation
+            _ori_lab = cv2.cvtColor(np.clip(_ori_np_full, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+            
+            # Neutralize color (A and B channels to 128)
+            _ori_lab[:, :, 1] = _ori_lab[:, :, 1] * (1.0 - _ctx_alpha[:,:,0]) + 128.0 * _ctx_alpha[:,:,0]
+            _ori_lab[:, :, 2] = _ori_lab[:, :, 2] * (1.0 - _ctx_alpha[:,:,0]) + 128.0 * _ctx_alpha[:,:,0]
+            
+            # Shift luminance to 128 and reduce contrast by 50% to soften hard logos
+            mask_bool_ctx = _ctx_alpha[:,:,0] > 0.5
+            if mask_bool_ctx.sum() > 0:
+                current_l_median = np.median(_ori_lab[mask_bool_ctx, 0])
+                _new_l = 128.0 + (_ori_lab[:, :, 0] - current_l_median) * 0.5
+                _ori_lab[:, :, 0] = _ori_lab[:, :, 0] * (1.0 - _ctx_alpha[:,:,0]) + _new_l * _ctx_alpha[:,:,0]
+                
+            _ori_lab = np.clip(_ori_lab, 0, 255).astype(np.uint8)
+            _ori_ctx_np = cv2.cvtColor(_ori_lab, cv2.COLOR_LAB2RGB)
+            
+            image_ori_constrained = Image.fromarray(_ori_ctx_np)
             debug_save(image_ori_constrained, "debug_phase3_ori_context.jpg")
             print(" -> [CONTEXT] Neutralized garment region in UNet context (Ghosting + Color Contamination fix).")
             print(f" -> [CONTEXT] Mask coverage in context: {100.0*float(_ctx_alpha.mean()):.2f}% neutralized.")
