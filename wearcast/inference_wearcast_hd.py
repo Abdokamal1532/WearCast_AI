@@ -663,9 +663,28 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # Removed Silhouette Constraint to allow UNet to natively render background
-            image_ori_constrained = image_ori
-            print(" -> [CONTEXT] Using full original image for UNet context (Native background rendering).")
+            # [FIX: GHOSTING + COLOR CONTAMINATION]
+            # Neutralize original garment pixels inside the mask region before sending
+            # to the UNet as context (image_ori). Without this fix, the UNet sees the
+            # OLD clothing's color and geometry as a strong prior, causing:
+            #   - Ghosting: old garment shape bleeds into generated result (Run 3)
+            #   - Color contamination: dark original garment contaminates white target (Run 2)
+            # We replace the masked region with neutral grey (128, 128, 128) — the
+            # training-distribution neutral value — with a soft boundary blur.
+            _mask_np_ctx = np.array(mask.resize(image_ori.size, Image.NEAREST)).astype(np.float32) / 255.0
+            # Soft boundary: gaussian blur on the mask boundary
+            _ctx_alpha = cv2.GaussianBlur(_mask_np_ctx, (0, 0), 8.0)
+            _ctx_alpha = np.clip(_ctx_alpha, 0.0, 1.0)
+            _ori_np_full = np.array(image_ori).astype(np.float32)
+            _neutral_fill = np.full_like(_ori_np_full, 128.0)
+            _ori_ctx_np = (
+                _ori_np_full * (1.0 - _ctx_alpha[:, :, np.newaxis])
+                + _neutral_fill * _ctx_alpha[:, :, np.newaxis]
+            )
+            image_ori_constrained = Image.fromarray(np.clip(_ori_ctx_np, 0, 255).astype(np.uint8))
+            debug_save(image_ori_constrained, "debug_phase3_ori_context.jpg")
+            print(" -> [CONTEXT] Neutralized garment region in UNet context (Ghosting + Color Contamination fix).")
+            print(f" -> [CONTEXT] Mask coverage in context: {100.0*float(_ctx_alpha.mean()):.2f}% neutralized.")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
