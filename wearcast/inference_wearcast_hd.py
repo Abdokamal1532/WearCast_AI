@@ -788,17 +788,16 @@ class WearCastHD:
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
 
-        # --- [FIX] Logo Rescue: Apply warping AFTER color transfer for graphic garments ---
-        # Re-enabled: when the UNet+VAE cannot faithfully reproduce fine graphic details
-        # (PSNR < 30 dB), the logo warping provides a direct pixel-transfer fallback.
-        # This runs AFTER apply_statistical_color_transfer so color is already corrected,
-        # which prevents the double-logo artifact that caused the previous disabling.
-        if is_complex and hasattr(self, '_cached_keypoints'):
-            print(" -> [LOGO] Patterned/Graphic garment detected. Applying Logo Rescue Warping...")
-            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-            alpha_pil = Image.fromarray((alpha * 255).astype(np.uint8))
-            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha_pil)
-            gen_arr = np.array(blended_pil).astype(np.float32)
+        # --- Logo Warping: DISABLED ---
+        # The perspective transform maps the FULL product image bounding box onto the
+        # person at mismatched scale. This causes 500-1000% pattern coverage and
+        # creates psychedelic/glitch artifacts on top of the UNet's correct output.
+        # The LAB color transfer (±28 cap) is sufficient to fix color fidelity.
+        # Re-enable only after apply_logo_warping is rewritten with TPS/optical-flow
+        # warping guided by body keypoints rather than a naive perspective bounding box.
+        # if is_complex and hasattr(self, '_cached_keypoints'):
+        #     ...
+        print(" -> [LOGO] Logo warping disabled (bounding-box perspective causes glitch artifacts).")
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
