@@ -106,45 +106,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
 
     if category == 'upperbody':
-        if is_long_sleeve:
-            print(" -> [MASK] Long sleeve detected. Including full arms in generation mask.")
-            arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
-            inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
-            skin_protect = skin_protect_base
-        else:
-            # FIX #3: Short-sleeve — include only the UPPER half of each arm (shoulder→elbow).
-            # Previously the full arm to the wrist was sometimes included, creating phantom
-            # sleeve strips when the person wore a sleeveless garment originally.
-            print(" -> [MASK] Short sleeve detected. Including upper arm only (shoulder→elbow).")
-            # Draw thick line from shoulder keypoint to a point 50% down towards the elbow
-            for s_idx, e_idx in [(2, 3), (5, 6)]:
-                if pt(s_idx)[0] > 1 and pt(e_idx)[0] > 1:
-                    s_pt = (int(pt(s_idx)[0]), int(pt(s_idx)[1]))
-                    e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
-                    dx = e_pt[0] - s_pt[0]
-                    dy = e_pt[1] - s_pt[1]
-                    # [FIX] Draw to 75% of shoulder→elbow distance (was 45%).
-                    # 45% was too conservative: target garment sleeves were wider than
-                    # original, leaving shoulder gaps in the composite output.
-                    mid_pt = (int(s_pt[0] + dx * 0.75), int(s_pt[1] + dy * 0.75))
-                    cv2.line(inpaint_mask, s_pt, mid_pt, 255, int(28 * scale_factor))
-
-            # FIX #3: Protect the LOWER arm (elbow→wrist) but NOT the upper arm near the sleeve.
-            # Build a forearm-only mask using the elbow/wrist keypoints.
-            forearm_protect = np.zeros_like(parse_array, dtype=np.uint8)
-            for e_idx, w_idx in [(3, 4), (6, 7)]:   # (RElbow→RWrist), (LElbow→LWrist)
-                if pt(e_idx)[0] > 1 and pt(w_idx)[0] > 1:
-                    e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
-                    w_pt = (int(pt(w_idx)[0]), int(pt(w_idx)[1]))
-                    cv2.line(forearm_protect, e_pt, w_pt, 255, int(24 * scale_factor))
-            forearm_protect = cv2.dilate(forearm_protect, np.ones((9, 9), np.uint8), iterations=1)
-
-            # Combine: protect face/hair/neck + forearms (below elbow)
-            arms_protect = cv2.bitwise_or(
-                ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255,
-                forearm_protect
-            )
-            skin_protect = cv2.bitwise_or(skin_protect_base, forearm_protect)
+        print(" -> [MASK] Covering full arms in generation mask to ensure all old sleeves are hidden.")
+        arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+        inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
+        skin_protect = skin_protect_base
     else:
         arms_protect = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
         skin_protect = cv2.bitwise_or(skin_protect_base, arms_protect)
