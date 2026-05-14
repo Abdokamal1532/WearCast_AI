@@ -628,10 +628,17 @@ class WearCastHD:
             # --- 2d. VAE Garment Fidelity Check ---
             # Encode garment through VAE and decode back to check reconstruction quality
             print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
-            # FIX #6: Light sharpening before VAE encoding to preserve fine graphic/text details.
-            # This is intentionally NOT applied to garm_proc (CLIP input) to avoid CLIP OOD artifacts.
+            # FIX #6: Adaptive sharpening before VAE encoding to preserve fine graphic/text details.
+            # Complex garments (prints, text, logos) get stronger sharpening to compensate
+            # for the VAE's natural blurring tendency (PSNR ~27 dB for this checkpoint).
+            # Simple garments stay gentle to avoid edge halos on fabric folds.
             from PIL import ImageFilter
-            image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.0, percent=130, threshold=3))
+            if is_complex:
+                # Strong sharpening for graphic/patterned garments
+                image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=2))
+            else:
+                # Gentle sharpening for solid-color garments
+                image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
             garm_tensor = self.pipe.image_processor.preprocess(image_garm_for_vae).to(device=self.gpu_id, dtype=torch.float32)
             garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
             garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
@@ -832,6 +839,29 @@ class WearCastHD:
         
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
 
+        # --- [FIX PATTERN CLARITY] Post-Composite Adaptive Sharpening ---
+        # The VAE encode/decode cycle loses high-frequency detail (PSNR ~27 dB).
+        # We recover edge sharpness by applying an UnsharpMask ONLY on the garment region.
+        # Strength scales with garment complexity: stronger for prints/text, gentle for solids.
+        if is_complex:
+            _sharp_radius  = 1.2
+            _sharp_percent = 140
+            _sharp_thresh  = 2
+        else:
+            _sharp_radius  = 0.8
+            _sharp_percent = 110
+            _sharp_thresh  = 3
+        _final_pil    = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+        _final_sharp  = _final_pil.filter(ImageFilter.UnsharpMask(
+            radius=_sharp_radius, percent=_sharp_percent, threshold=_sharp_thresh
+        ))
+        # Blend sharpened result ONLY within the garment mask (alpha_3d), preserve background as-is
+        _sharp_np  = np.array(_final_sharp).astype(np.float32)
+        final_np   = _sharp_np * alpha_3d + final_np * (1.0 - alpha_3d)
+        final_image = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+        print(f" -> [SHARP] Post-composite sharpening applied (complex={is_complex}, r={_sharp_radius}, p={_sharp_percent}%).")
+
+
 
         # --- Post-compositing diagnostics ---
         final_np = np.array(final_image).astype(np.float32)
@@ -891,11 +921,13 @@ class WearCastHD:
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
-            # Complex/patterned garments: 30 steps for maximum fidelity
-            # FIX #5: Restored image_scale from 1.5 → 2.0 (OOTD-HD recommended baseline)
-            return {"num_steps": 30, "image_scale": 2.0}
+            # [FIX PATTERN CLARITY] Complex/patterned garments:
+            # Raised image_scale from 2.0 → 2.5 to strengthen garment conditioning.
+            # Higher guidance = UNet follows source garment more faithfully,
+            # which reduces pattern distortion from the VAE encode/decode cycle.
+            return {"num_steps": 30, "image_scale": 2.5}
         else:
-            # Simple garments: 30 steps for premium realism
+            # Simple solid garments: 30 steps, 2.0 scale (lower scale = smoother, natural drape)
             return {"num_steps": 30, "image_scale": 2.0}
 
 
