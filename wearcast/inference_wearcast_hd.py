@@ -950,14 +950,6 @@ class WearCastHD:
         corrected_lab = gen_lab.copy()
         source_l = gen_lab[:, :, 0]
 
-        # [FIX A] Compute SOURCE median from FABRIC-ONLY pixels, not all mask pixels.
-        # When the UNet places a white LOVE graphic on a dark shirt, the mask pixels
-        # include BOTH dark fabric and bright logo. A simple median pulls toward grey.
-        # Solution: estimate the true fabric tone using the DARK end of the distribution
-        # for dark-target garments, and the LIGHT end for light-target garments.
-        target_l_approx = target_median[0]  # already directional-percentile of garment
-        source_all_l = source_pixels[:, 0]
-        if target_l_approx < 128:   # dark shirt target → fabric is the DARKEST pixels in UNet output
         print(f"   [COLOR] Source fabric L (median): {source_median[0]:.1f}  (Target: {target_median[0]:.1f})")
 
         # [FIX] Overhauled LAB Shift Logic
