@@ -797,7 +797,9 @@ class WearCastHD:
         feather_sigma = 15.0
         alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         
-        # No more forcing the core_mask to 1.0. The wide blur naturally transitions.
+        # FIX: Restore the solid core so thin sleeves don't become translucent from the blur
+        core_mask = cv2.erode(binary_mask, np.ones((7, 7), np.uint8), iterations=1).astype(np.float32)
+        alpha = np.maximum(alpha, core_mask)
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
@@ -1017,8 +1019,8 @@ class WearCastHD:
                 source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
                 1.0  # Full shift for highlights
             )
-            # Protect pure-white logo pixels (L > 200) — avoid turning them grey
-            logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
+            # Protect pure-white logo pixels (L > 180) — avoid turning them grey
+            logo_protect = np.clip((210.0 - source_l) / 50.0, 0.0, 1.0)
             multiplier_l = np.minimum(multiplier_l, logo_protect)
         else:
             # Brightening (e.g. White shirt)
@@ -1029,8 +1031,8 @@ class WearCastHD:
                 (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
                 1.0  # Full shift for shadows
             )
-            # Protect pure-black logo pixels (L < 50) — avoid brightening them
-            logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
+            # Protect pure-black logo pixels (L < 60) — avoid brightening them
+            logo_protect = np.clip((source_l - 30.0) / 50.0, 0.0, 1.0)
             multiplier_l = np.minimum(multiplier_l, logo_protect)
             
         shifted_l = source_l + shift_l * multiplier_l
