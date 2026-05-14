@@ -566,28 +566,24 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # =====================================================================
-                # [FIX LATENT DRIFT] Adaptive Latent Rescaling
-                # Context Nullification (grey region) gives the UNet extra creative
-                # freedom, which can cause the masked-region latent std to rise above 1.0
-                # (observed: 1.0 → 1.044 across 30 steps). This drift causes:
-                #   1. Pattern/sleeve boundary artifacts in the final composite
-                #   2. Over-hallucinated textures in solid-color garment areas
-                # Fix: if std > 1.02, gently rescale ONLY the mask region back to 1.0.
-                # The background (non-mask) latents are left completely untouched.
-                # Threshold of 1.02 allows normal denoising variance while capping drift.
+                # [FIX LATENT DRIFT] Adaptive Masked-Region Latent Rescaling
+                # Context Nullification gives the UNet extra freedom in the garment
+                # region, causing masked-region std to drift above 1.0 (observed up to
+                # 1.05+). The garment mask covers only 15-25% of the image, so a
+                # *global* std check is diluted by the stable background (75-85%).
+                # Fix: ALWAYS compute std directly on the masked region and rescale
+                # only those latents if they drift above 1.02. Background untouched.
                 # =====================================================================
-                _lat_std = latents.float().std().item()
-                if _lat_std > 1.02:
-                    # Compute the mean and std of only the masked-region latents
-                    _mask_flat = mask_latents[:latents.shape[0]]  # align batch dim
-                    _mask_bool = (_mask_flat > 0.5)
-                    _masked_vals = latents[_mask_bool.expand_as(latents)]
-                    if _masked_vals.numel() > 0:
-                        _m_std = _masked_vals.float().std().item()
-                        if _m_std > 1.02:
-                            _scale = 1.0 / _m_std
-                            _mask_3d = _mask_bool.expand_as(latents)
-                            latents = torch.where(_mask_3d, latents * _scale, latents)
+                _mask_flat = mask_latents[:latents.shape[0]]  # align batch dim
+                _mask_bool = (_mask_flat > 0.5).expand_as(latents)
+                _masked_vals = latents[_mask_bool]
+                if _masked_vals.numel() > 16:  # sanity: need enough samples
+                    _m_std = _masked_vals.float().std().item()
+                    if _m_std > 1.02:
+                        _scale = 1.0 / _m_std
+                        latents = torch.where(_mask_bool, latents * _scale, latents)
+                        if i % 5 == 0:
+                            print(f"   [RESCALE] Step {i}: masked_std={_m_std:.4f} → rescaled to 1.0")
 
                 # =====================================================================
                 # RESTORED SDEdit latent blending (OOTDiffusion default)

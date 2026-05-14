@@ -750,7 +750,20 @@ class WearCastHD:
         parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
         
         # Label 4 = upper_clothes, Label 7 = dress
-        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+        # Also include arm labels (14=LeftArm, 15=RightArm) when the original
+        # inpaint mask covered the arms (long/short sleeve garments).
+        # Without this, translucent/low-contrast sleeves in the UNet output are
+        # re-classified as bare skin and get cut from the composite mask.
+        _orig_mask_coverage = 0.0
+        if hasattr(self, '_cached_hard_mask'):
+            _hm = np.array(self._cached_hard_mask)
+            _orig_mask_coverage = np.mean(_hm > 0)
+
+        _include_arms = _orig_mask_coverage > 0.03  # arms present if mask > 3% coverage above torso baseline ~15%
+        if _include_arms:
+            dynamic_mask = ((parse_new == 4) | (parse_new == 7) | (parse_new == 14) | (parse_new == 15)).astype(np.float32)
+        else:
+            dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
         
         # --- FIX #20: Strict Dynamic Bounding ---
         # Reduces relaxation kernel and ensures result is strictly inside the silhouette.
