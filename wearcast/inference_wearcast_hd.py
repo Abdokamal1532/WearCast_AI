@@ -949,40 +949,57 @@ class WearCastHD:
         # 4. Asymmetric Gamut-Aware L-Channel Transfer
         corrected_lab = gen_lab.copy()
         source_l = gen_lab[:, :, 0]
-        # [FIX] Cap the maximum L-shift to ±28 LAB units to prevent extreme
-        # darkening/brightening that destroys logo pixel values.
-        # Previously uncapped — could reach -51 units for black shirts,
-        # pulling white logos to bronze/sepia.
-        MAX_L_SHIFT = 28.0
-        shift_l = np.clip(target_median[0] - source_median[0], -MAX_L_SHIFT, MAX_L_SHIFT)
-        print(f"   [COLOR] L-shift (capped ±{MAX_L_SHIFT}): {shift_l:.1f} units")
+
+        # [FIX A] Compute SOURCE median from FABRIC-ONLY pixels, not all mask pixels.
+        # When the UNet places a white LOVE graphic on a dark shirt, the mask pixels
+        # include BOTH dark fabric and bright logo. A simple median pulls toward grey.
+        # Solution: estimate the true fabric tone using the DARK end of the distribution
+        # for dark-target garments, and the LIGHT end for light-target garments.
+        target_l_approx = target_median[0]  # already directional-percentile of garment
+        source_all_l = source_pixels[:, 0]
+        if target_l_approx < 128:   # dark shirt target → fabric is the DARKEST pixels in UNet output
+            fabric_pct = 25
+        else:                        # light shirt target → fabric is the BRIGHTEST pixels in UNet output
+            fabric_pct = 75
+        source_fabric_l = np.percentile(source_all_l, fabric_pct)
+        print(f"   [COLOR] Source fabric L (pct={fabric_pct}): {source_fabric_l:.1f}  (vs naive median {source_median[0]:.1f})")
+
+        # [FIX A] Asymmetric L-shift cap:
+        # - Darkening (black shirt): keep ±28 to protect bright logo pixels from being crushed
+        # - Brightening (white shirt): allow up to ±60 to reach true white from a grey UNet baseline
+        raw_shift_l = target_median[0] - source_fabric_l
+        if raw_shift_l < 0:     # darkening
+            MAX_L_SHIFT = 28.0
+        else:                   # brightening
+            MAX_L_SHIFT = 60.0
+        shift_l = np.clip(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
+        print(f"   [COLOR] L-shift (raw={raw_shift_l:.1f}, capped ±{MAX_L_SHIFT}): {shift_l:.1f} units")
         
         if shift_l < 0:
             # Darkening (e.g. Black shirt)
+            # Pivot around source_fabric_l — the true fabric tone (not logo-contaminated median).
             # Shadows approach 0 — decay the shift to avoid full crush.
             multiplier_l = np.where(
-                source_l <= source_median[0],
-                source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
-                1.0  # Full shift for highlights
+                source_l <= source_fabric_l,
+                source_l / (source_fabric_l + 1e-6),  # Proportional decay for shadows
+                1.0  # Full shift for pixels above fabric tone (includes logo highlights)
             )
-            # [FIX] Protect logo pixels by L-DISTANCE FROM FABRIC TONE.
-            # Old method used L>200 absolute threshold — failed when UNet generates
-            # slightly-grey whites (L≈170-190) for logos on black shirts.
-            # New method: any pixel significantly brighter than the fabric median
-            # (e.g. white logo on black shirt) gets diminishing shift applied.
-            l_above_fabric = np.clip((source_l - source_median[0]) / (255.0 - source_median[0] + 1e-6), 0.0, 1.0)
-            # Pixels far above median brightness get a REDUCED darkening shift
-            logo_protect = 1.0 - l_above_fabric ** 0.5  # Gentle curve: brighter = more protected
+            # Protect logo pixels: anything significantly BRIGHTER than fabric gets less darkening.
+            # e.g. white LOVE text on a black shirt: L≈180 vs fabric L≈35 → nearly zero shift.
+            l_above_fabric = np.clip((source_l - source_fabric_l) / (255.0 - source_fabric_l + 1e-6), 0.0, 1.0)
+            logo_protect = 1.0 - l_above_fabric ** 0.5  # Brighter = more protected from darkening
             multiplier_l = multiplier_l * logo_protect
         else:
             # Brightening (e.g. White shirt)
+            # Pivot around source_fabric_l (75th-pct brightest pixels = true fabric for white shirts).
             multiplier_l = np.where(
-                source_l >= source_median[0],
-                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
-                1.0  # Full shift for shadows
+                source_l >= source_fabric_l,
+                (255.0 - source_l) / (255.0 - source_fabric_l + 1e-6),  # Decay near-white to avoid blowout
+                1.0  # Full shift for pixels below fabric tone (dark logo on white shirt)
             )
-            # [FIX] For brightening: protect dark logo pixels (L far BELOW fabric)
-            l_below_fabric = np.clip((source_median[0] - source_l) / (source_median[0] + 1e-6), 0.0, 1.0)
+            # Protect logo pixels: anything significantly DARKER than fabric gets less brightening.
+            # e.g. black text on a white shirt: L≈20 vs fabric L≈210 → nearly zero shift.
+            l_below_fabric = np.clip((source_fabric_l - source_l) / (source_fabric_l + 1e-6), 0.0, 1.0)
             logo_protect = 1.0 - l_below_fabric ** 0.5
             multiplier_l = multiplier_l * logo_protect
             

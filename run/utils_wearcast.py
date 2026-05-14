@@ -152,11 +152,20 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     # 4. Protect Bottoms (Pants, Skirts)
     bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
     
-    # 5. Dilation
-    # [FIX] Increased kernel from 21x21 → 25x25 to bring mask coverage from ~13-18%
-    # up to the OOTD-HD training distribution of ~20-25%. Under-masking (caused by
-    # wider arm stub + forearm protection) left original garment color bleeding through.
-    mask_expanded = cv2.dilate(inpaint_mask, np.ones((25, 25), np.uint8), iterations=1)
+    # 5. Adaptive Dilation
+    # [FIX B] Kernel size adapts to how much of the image is already labeled as garment.
+    # Large people (Gemini-style product models) often have UpperClothes = 20–30% of frame,
+    # so 25x25 causes 34%+ coverage \u2192 boundary seams. Small/real people at 10–15% need 25x25
+    # to meet the OOTD-HD training distribution of 20–25%.
+    garment_pixel_pct = np.sum(parse_array == 4) / max(1, parse_array.size)
+    if garment_pixel_pct > 0.15:
+        dilation_kernel_size = 15   # Already large parsed region — keep expansion conservative
+    elif garment_pixel_pct > 0.10:
+        dilation_kernel_size = 20   # Medium: balanced
+    else:
+        dilation_kernel_size = 25   # Small parsed region — expand aggressively
+    print(f"   [MASK] garment_pct={garment_pixel_pct:.1%} → dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
+    mask_expanded = cv2.dilate(inpaint_mask, np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8), iterations=1)
     
     # SILHOUETTE LOCK: 
     silhouette = (parse_array > 0).astype(np.uint8) * 255
