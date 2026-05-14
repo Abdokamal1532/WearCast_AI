@@ -958,75 +958,57 @@ class WearCastHD:
         target_l_approx = target_median[0]  # already directional-percentile of garment
         source_all_l = source_pixels[:, 0]
         if target_l_approx < 128:   # dark shirt target → fabric is the DARKEST pixels in UNet output
-            fabric_pct = 25
-        else:                        # light shirt target → fabric is the BRIGHTEST pixels in UNet output
-            fabric_pct = 75
-        source_fabric_l = np.percentile(source_all_l, fabric_pct)
-        print(f"   [COLOR] Source fabric L (pct={fabric_pct}): {source_fabric_l:.1f}  (vs naive median {source_median[0]:.1f})")
+        print(f"   [COLOR] Source fabric L (median): {source_median[0]:.1f}  (Target: {target_median[0]:.1f})")
 
-        # [FIX A] Asymmetric L-shift cap:
-        # - Darkening (black shirt): increased to ±45 to allow reaching deep black.
-        # - Brightening (white shirt): allow up to ±60 to reach true white.
+        # [FIX] Overhauled LAB Shift Logic
+        # We pivot purely around the median, as logos rarely exceed 50% of the surface area.
+        source_fabric_l = source_median[0]
         raw_shift_l = target_median[0] - source_fabric_l
-        if raw_shift_l < 0:     # darkening
-            MAX_L_SHIFT = 45.0
-        else:                   # brightening
-            MAX_L_SHIFT = 60.0
+        
+        # Increase caps significantly to rescue bad UNet generations
+        MAX_L_SHIFT = 120.0
         shift_l = np.clip(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
         print(f"   [DEBUG COLOR] Shift Required: {raw_shift_l:.1f}, Shift Allowed: {shift_l:.1f} (Cap: ±{MAX_L_SHIFT})")
         
         if shift_l < 0:
-            # Darkening (e.g. Black shirt)
-            # Pivot around source_fabric_l — the true fabric tone.
-            multiplier_l = np.where(
-                source_l <= source_fabric_l,
-                source_l / (source_fabric_l + 1e-6),  # Proportional decay for shadows
-                1.0  # Full shift for pixels above fabric tone (before protection)
-            )
-            # [FIX B] Aggressive logo protection.
-            # Even slightly bright pixels must be protected from being crushed to black.
-            l_above_fabric = np.clip((source_l - source_fabric_l) / (255.0 - source_fabric_l + 1e-6), 0.0, 1.0)
-            logo_protect = 1.0 - l_above_fabric ** 0.2  # Very steep curve: bright = instantly protected
-            multiplier_l = multiplier_l * logo_protect
+            # Darkening (Target is dark)
+            # Protect bright pixels (white logos/graphics) from being darkened.
+            l_diff = np.clip(source_l - source_fabric_l, 0, 255)
             
-            # Debug math
-            protect_active = logo_protect[source_l > source_fabric_l]
+            # If pixel is < 15 units brighter than fabric: it's a normal highlight/wrinkle. (protect=1.0 -> full shift)
+            # If pixel is > 45 units brighter than fabric: it's a logo. (protect=0.0 -> zero shift)
+            multiplier_l = np.clip(1.0 - (l_diff - 15.0) / 30.0, 0.0, 1.0)
+            
+            # Debug
+            protect_active = multiplier_l[source_l > source_fabric_l + 15.0]
             if len(protect_active) > 0:
-                print(f"   [DEBUG COLOR] Logo Protect (Darkening) - Min: {protect_active.min():.2f}, Max: {protect_active.max():.2f}, Mean: {protect_active.mean():.2f}")
+                print(f"   [DEBUG COLOR] Logo Protect (Darkening) applied to {len(protect_active)} pixels. Mean Factor: {protect_active.mean():.2f}")
                 
         else:
-            # Brightening (e.g. White shirt)
-            multiplier_l = np.where(
-                source_l >= source_fabric_l,
-                (255.0 - source_l) / (255.0 - source_fabric_l + 1e-6),  # Decay near-white to avoid blowout
-                1.0  # Full shift for pixels below fabric tone (before protection)
-            )
-            # Protect logo pixels: anything significantly DARKER than fabric gets less brightening.
-            l_below_fabric = np.clip((source_fabric_l - source_l) / (source_fabric_l + 1e-6), 0.0, 1.0)
-            logo_protect = 1.0 - l_below_fabric ** 0.2  # Steep curve
-            multiplier_l = multiplier_l * logo_protect
-
-            # Debug math
-            protect_active = logo_protect[source_l < source_fabric_l]
+            # Brightening (Target is bright)
+            # Protect dark pixels (black logos/graphics) from being brightened.
+            l_diff = np.clip(source_fabric_l - source_l, 0, 255)
+            
+            # If pixel is < 20 units darker than fabric: it's a normal shadow. (protect=1.0 -> full shift)
+            # If pixel is > 50 units darker than fabric: it's a logo. (protect=0.0 -> zero shift)
+            multiplier_l = np.clip(1.0 - (l_diff - 20.0) / 30.0, 0.0, 1.0)
+            
+            # Debug
+            protect_active = multiplier_l[source_l < source_fabric_l - 20.0]
             if len(protect_active) > 0:
-                print(f"   [DEBUG COLOR] Logo Protect (Brightening) - Min: {protect_active.min():.2f}, Max: {protect_active.max():.2f}, Mean: {protect_active.mean():.2f}")
+                print(f"   [DEBUG COLOR] Logo Protect (Brightening) applied to {len(protect_active)} pixels. Mean Factor: {protect_active.mean():.2f}")
             
         shifted_l = source_l + shift_l * multiplier_l
         
-        # [FIX C] Post-Process Highlight Stretch (Restoring dim logos on dark shirts)
-        # If the target is a dark shirt, but the source image had white pixels, the UNet often 
-        # outputs them as dim grey (L=130-150). We need to stretch the highlights back to white.
-        if target_median[0] < 128:
-            # Check if source target actually had bright pixels (e.g., L > 200)
+        # [FIX C] Post-Process Highlight Stretch for Pure Black Garments
+        # If target is dark but source had white logos, UNet often generates them dim (L=130).
+        if target_median[0] < 100:
             target_brightest = np.percentile(target_l, 98)
             if target_brightest > 180:
-                # The shirt has white graphics. Find the brightest pixels in our current shifted output.
                 current_brightest = np.percentile(shifted_l[mask_bool], 98)
                 if current_brightest < 200:
-                    # The UNet lost the brights. Stretch them!
                     stretch_factor = 230.0 / (current_brightest + 1e-6)
                     print(f"   [DEBUG COLOR] Stretching Highlights! Target had L={target_brightest:.1f}, output only had L={current_brightest:.1f}. Factor={stretch_factor:.2f}")
-                    # Only stretch pixels that are significantly brighter than the fabric
                     stretch_mask = shifted_l > (source_fabric_l + 30)
                     shifted_l[stretch_mask] = shifted_l[stretch_mask] * stretch_factor
         
