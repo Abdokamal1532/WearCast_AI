@@ -734,7 +734,13 @@ class WearCastHD:
             input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
             dynamic_mask = input_mask_np
             
-            # Removed silhouette clipping to allow new garments to expand naturally
+            # Reintroduced silhouette protection but with a 15px buffer to allow baggy clothes
+            # while still blocking distant background artifacts.
+            if hasattr(self, '_cached_parse'):
+                sil = (self._cached_parse > 0).astype(np.uint8)
+                sil_dilated = cv2.dilate(sil, np.ones((15, 15), np.uint8), iterations=1)
+                sil_mask = cv2.resize(sil_dilated, raw_generated.size, interpolation=cv2.INTER_NEAREST)
+                dynamic_mask = dynamic_mask * sil_mask.astype(np.float32)
         else:
             # Fallback
             parse_new_pil, _ = self.parsing_model(raw_generated)
@@ -760,7 +766,7 @@ class WearCastHD:
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
-        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
+        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (dilated for full coverage)")
 
 
         # --- Pre-compositing diagnostics ---
@@ -948,8 +954,9 @@ class WearCastHD:
         source_fabric_l = source_median[0]
         raw_shift_l = target_median[0] - source_fabric_l
         
-        # Limit caps to preserve natural UNet shadows/highlights
-        MAX_L_SHIFT = 30.0
+        # Increased cap to 80.0 to allow white garments to reach target luminance,
+        # but the "Logo Protect" logic will prevent flat blowouts.
+        MAX_L_SHIFT = 80.0
         shift_l = np.clip(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
         print(f"   [DEBUG COLOR] Shift Required: {raw_shift_l:.1f}, Shift Allowed: {shift_l:.1f} (Cap: ±{MAX_L_SHIFT})")
         
