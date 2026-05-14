@@ -787,18 +787,17 @@ class WearCastHD:
         
         # Binarize
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
-        
         # FIX #4: Seamless Photographic Alpha Blend
         # 1. Very gentle erosion to avoid bleeds but keep boundary natural
         kernel_erode = np.ones((3, 3), np.uint8)
         eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
         
-        # 2. Wide, soft photographic feathering instead of jagged cutouts
-        feather_sigma = 15.0
+        # 2. Narrower photographic feathering instead of jagged cutouts (prevents background halo)
+        feather_sigma = 3.0
         alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
         
         # FIX: Restore the solid core so thin sleeves don't become translucent from the blur
-        core_mask = cv2.erode(binary_mask, np.ones((7, 7), np.uint8), iterations=1).astype(np.float32)
+        core_mask = cv2.erode(binary_mask, np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
         alpha = np.maximum(alpha, core_mask)
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
@@ -806,8 +805,6 @@ class WearCastHD:
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
         print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
-
-
         # --- Pre-compositing diagnostics ---
         mask_bool = binary_mask > 0.5
         gen_in_mask = gen_arr[mask_bool]
@@ -969,7 +966,7 @@ class WearCastHD:
             print("   [COLOR] Not enough valid garment pixels to calculate stats. Skipping transfer.")
             return gen_arr
             
-        mask_bool = alpha_mask > 0.5
+        mask_bool = alpha_mask > 0.05
         if mask_bool.sum() < 100:
             return gen_arr
             
