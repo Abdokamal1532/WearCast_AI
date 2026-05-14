@@ -720,37 +720,30 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- FIX #1: Dynamic Output Masking (The Cape Killer) ---
-        # Instead of using the input mask (which has a huge background "box"),
-        # we re-parse the generated image to find the ACTUAL shirt pixels.
-        print(" -> Running Dynamic Re-Parsing for clean mask...")
+        # --- FIX #1: Unified Dynamic Alpha Mask ---
+        # Previously we restricted the mask to ONLY the newly generated shirt pixels.
+        # This caused a huge bug: if the new shirt was smaller than the old shirt,
+        # the UNet generated bare arms or background, but they weren't pasted,
+        # leaving the OLD shirt sleeves sticking out like a ghost!
+        # Now we use the highly-optimized original inpaint mask, which safely
+        # replaces the entire old garment region with the UNet's output.
+        print(" -> Applying Unified Alpha Mask (to prevent ghost sleeves)...")
         t_reparse = time.time()
-        parse_new_pil, _ = self.parsing_model(raw_generated)
-        parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
-        
-        # Label 4 = upper_clothes, Label 7 = dress
-        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
-        
-        # --- FIX #20: Strict Dynamic Bounding ---
-        # Reduces relaxation kernel and ensures result is strictly inside the silhouette.
         if hasattr(self, '_cached_hard_mask'):
             input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-            # Reduced to 5x5 for tighter fit
-            kernel_relax = np.ones((5, 5), np.uint8)
-            relaxed_mask = cv2.dilate(input_mask_np, kernel_relax, iterations=1)
+            dynamic_mask = input_mask_np
             
-            # MUST stay within person silhouette
+            # MUST stay within person silhouette to prevent background bleeding (cape killer)
             if hasattr(self, '_cached_parse'):
                 sil = (self._cached_parse > 0).astype(np.float32)
                 sil = cv2.resize(sil, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-                relaxed_mask = relaxed_mask * sil
-                
-            dynamic_mask = dynamic_mask * relaxed_mask
-            print(" -> [STRICT] Applied tight silhouette boundary constraint.")
-
-        # Refine the dynamic mask slightly
-        dynamic_mask = cv2.dilate(dynamic_mask, np.ones((5, 5), np.uint8), iterations=1)
-        
+                dynamic_mask = dynamic_mask * sil
+        else:
+            # Fallback
+            parse_new_pil, _ = self.parsing_model(raw_generated)
+            parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
+            dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+            
         # Binarize
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
