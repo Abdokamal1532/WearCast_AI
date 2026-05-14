@@ -68,6 +68,7 @@ class WearCastHD:
             MODEL_PATH,
             subfolder="vae",
             torch_dtype=torch.float32,
+            use_safetensors=False,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -672,10 +673,10 @@ class WearCastHD:
                 mem_before = torch.cuda.memory_allocated(0) / 1e9
                 print(f" -> GPU VRAM before UNet call: {mem_before:.2f} GB")
 
-            # FIX #6 (Correction): Apply STRONGER sharpening to the actual garment passed to the pipeline
-            # to preserve fine details through the VAE bottleneck.
+            # FIX #6 (Correction): Apply mild sharpening to the actual garment passed to the pipeline
+            # to preserve fine details without creating crunchy edge artifacts in the VAE.
             from PIL import ImageFilter
-            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=2.0, percent=200, threshold=0))
+            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
 
             t_unet_start = time.time()
             images = self.pipe(
@@ -950,8 +951,8 @@ class WearCastHD:
         source_fabric_l = source_median[0]
         raw_shift_l = target_median[0] - source_fabric_l
         
-        # Increase caps significantly to rescue bad UNet generations
-        MAX_L_SHIFT = 120.0
+        # Limit caps to preserve natural UNet shadows/highlights
+        MAX_L_SHIFT = 30.0
         shift_l = np.clip(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
         print(f"   [DEBUG COLOR] Shift Required: {raw_shift_l:.1f}, Shift Allowed: {shift_l:.1f} (Cap: ±{MAX_L_SHIFT})")
         
