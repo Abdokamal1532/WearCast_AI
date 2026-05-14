@@ -566,6 +566,30 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # =====================================================================
+                # [FIX LATENT DRIFT] Adaptive Latent Rescaling
+                # Context Nullification (grey region) gives the UNet extra creative
+                # freedom, which can cause the masked-region latent std to rise above 1.0
+                # (observed: 1.0 → 1.044 across 30 steps). This drift causes:
+                #   1. Pattern/sleeve boundary artifacts in the final composite
+                #   2. Over-hallucinated textures in solid-color garment areas
+                # Fix: if std > 1.02, gently rescale ONLY the mask region back to 1.0.
+                # The background (non-mask) latents are left completely untouched.
+                # Threshold of 1.02 allows normal denoising variance while capping drift.
+                # =====================================================================
+                _lat_std = latents.float().std().item()
+                if _lat_std > 1.02:
+                    # Compute the mean and std of only the masked-region latents
+                    _mask_flat = mask_latents[:latents.shape[0]]  # align batch dim
+                    _mask_bool = (_mask_flat > 0.5)
+                    _masked_vals = latents[_mask_bool.expand_as(latents)]
+                    if _masked_vals.numel() > 0:
+                        _m_std = _masked_vals.float().std().item()
+                        if _m_std > 1.02:
+                            _scale = 1.0 / _m_std
+                            _mask_3d = _mask_bool.expand_as(latents)
+                            latents = torch.where(_mask_3d, latents * _scale, latents)
+
+                # =====================================================================
                 # RESTORED SDEdit latent blending (OOTDiffusion default)
                 # Mixing noisy original-image latents at every step ensures the output
                 # matches the person's original identity and background perfectly.
