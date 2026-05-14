@@ -734,11 +734,7 @@ class WearCastHD:
             input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
             dynamic_mask = input_mask_np
             
-            # MUST stay within person silhouette to prevent background bleeding (cape killer)
-            if hasattr(self, '_cached_parse'):
-                sil = (self._cached_parse > 0).astype(np.float32)
-                sil = cv2.resize(sil, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-                dynamic_mask = dynamic_mask * sil
+            # Removed silhouette clipping to allow new garments to expand naturally
         else:
             # Fallback
             parse_new_pil, _ = self.parsing_model(raw_generated)
@@ -749,15 +745,16 @@ class WearCastHD:
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
         # FIX #4: Seamless Photographic Alpha Blend
-        # 1. Very gentle erosion to avoid bleeds but keep boundary natural
-        kernel_erode = np.ones((3, 3), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
+        # 1. Dilate the mask slightly to GUARANTEE the old shirt is 100% swallowed.
+        kernel_dilate = np.ones((5, 5), np.uint8)
+        dilated_mask = cv2.dilate(binary_mask, kernel_dilate, iterations=1) 
         
-        # 2. Wide, soft photographic feathering instead of jagged cutouts
-        feather_sigma = 15.0
-        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        # 2. Small photographic feathering for smooth edges (no massive transparent bands)
+        feather_sigma = 3.0
+        alpha = cv2.GaussianBlur(dilated_mask.astype(np.float32), (0, 0), feather_sigma)
         
-        # No more forcing the core_mask to 1.0. The wide blur naturally transitions.
+        # Force the core mask to be opaque so old clothes NEVER show through
+        alpha = np.maximum(alpha, binary_mask.astype(np.float32))
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
