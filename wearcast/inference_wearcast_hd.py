@@ -788,14 +788,17 @@ class WearCastHD:
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
 
-        # --- STUDIO MASTER: AI-Native Rendering ---
-        # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
-        # This prevents "Double Logos" and allows the UNet to render graphics organically.
-        # if is_complex:
-        #    print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
-        #    blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-        #    blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
-        #    gen_arr = np.array(blended_pil).astype(np.float32)
+        # --- [FIX] Logo Rescue: Apply warping AFTER color transfer for graphic garments ---
+        # Re-enabled: when the UNet+VAE cannot faithfully reproduce fine graphic details
+        # (PSNR < 30 dB), the logo warping provides a direct pixel-transfer fallback.
+        # This runs AFTER apply_statistical_color_transfer so color is already corrected,
+        # which prevents the double-logo artifact that caused the previous disabling.
+        if is_complex and hasattr(self, '_cached_keypoints'):
+            print(" -> [LOGO] Patterned/Graphic garment detected. Applying Logo Rescue Warping...")
+            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
+            alpha_pil = Image.fromarray((alpha * 255).astype(np.uint8))
+            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha_pil)
+            gen_arr = np.array(blended_pil).astype(np.float32)
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
@@ -947,43 +950,50 @@ class WearCastHD:
         # 4. Asymmetric Gamut-Aware L-Channel Transfer
         corrected_lab = gen_lab.copy()
         source_l = gen_lab[:, :, 0]
-        shift_l = target_median[0] - source_median[0]
+        # [FIX] Cap the maximum L-shift to ±28 LAB units to prevent extreme
+        # darkening/brightening that destroys logo pixel values.
+        # Previously uncapped — could reach -51 units for black shirts,
+        # pulling white logos to bronze/sepia.
+        MAX_L_SHIFT = 28.0
+        shift_l = np.clip(target_median[0] - source_median[0], -MAX_L_SHIFT, MAX_L_SHIFT)
+        print(f"   [COLOR] L-shift (capped ±{MAX_L_SHIFT}): {shift_l:.1f} units")
         
         if shift_l < 0:
             # Darkening (e.g. Black shirt)
             # Shadows approach 0 — decay the shift to avoid full crush.
-            # Highlights are moving away from 255 — full shift preserves 3D fold depth.
             multiplier_l = np.where(
                 source_l <= source_median[0],
                 source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
                 1.0  # Full shift for highlights
             )
-            # Protect pure-white logo pixels (L > 200) — avoid turning them grey
-            logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            # [FIX] Protect logo pixels by L-DISTANCE FROM FABRIC TONE.
+            # Old method used L>200 absolute threshold — failed when UNet generates
+            # slightly-grey whites (L≈170-190) for logos on black shirts.
+            # New method: any pixel significantly brighter than the fabric median
+            # (e.g. white logo on black shirt) gets diminishing shift applied.
+            l_above_fabric = np.clip((source_l - source_median[0]) / (255.0 - source_median[0] + 1e-6), 0.0, 1.0)
+            # Pixels far above median brightness get a REDUCED darkening shift
+            logo_protect = 1.0 - l_above_fabric ** 0.5  # Gentle curve: brighter = more protected
+            multiplier_l = multiplier_l * logo_protect
         else:
             # Brightening (e.g. White shirt)
-            # Highlights approach 255 — decay to prevent blowout.
-            # Shadows are moving away from 0 — full shift preserves 3D fold depth.
             multiplier_l = np.where(
                 source_l >= source_median[0],
                 (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
                 1.0  # Full shift for shadows
             )
-            # Protect pure-black logo pixels (L < 50) — avoid brightening them
-            logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            # [FIX] For brightening: protect dark logo pixels (L far BELOW fabric)
+            l_below_fabric = np.clip((source_median[0] - source_l) / (source_median[0] + 1e-6), 0.0, 1.0)
+            logo_protect = 1.0 - l_below_fabric ** 0.5
+            multiplier_l = multiplier_l * logo_protect
             
         shifted_l = source_l + shift_l * multiplier_l
         
-        # FIX #1b: Reduced shadow soft-clip floor from L=30 → L=10
-        # OLD floor of 30 was preventing true black (L≈5-15) from ever being reached.
         high_mask = shifted_l > 220
         if high_mask.sum() > 0:
             excess = shifted_l[high_mask] - 220
             shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
             
-        # Shadows: compress below 10 (not 30), allowing near-black fabric
         low_mask = shifted_l < 10
         if low_mask.sum() > 0:
             deficit = 10 - shifted_l[low_mask]
@@ -992,9 +1002,18 @@ class WearCastHD:
         corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
         
         # A and B Channels (Color)
-        # Protect colorful graphics using pure A/B distance from the source neutral
+        # [FIX] Protect logos via L-channel contrast (not just A/B distance).
+        # White-on-black and black-on-white logos are both NEUTRAL in A/B space
+        # (A≈128, B≈128), so old ab_diff approach gave them zero protection.
+        # New approach: pixels with L far from the fabric median = logo → protect.
+        l_diff_from_fabric = np.abs(source_l - source_median[0])
+        # High L-diff (bright pixel on dark shirt, or dark pixel on light shirt) → logo → low weight (protected)
+        logo_weight = np.clip(1.0 - (l_diff_from_fabric / 80.0), 0.0, 1.0)
+        # Also keep original A/B protection for colorful graphics (unchanged)
         ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
-        color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        ab_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        # Combined: pixel must pass BOTH tests to receive full color transfer
+        color_transfer_weight = np.minimum(logo_weight, ab_weight)
         
         for i in [1, 2]:
             source_c = gen_lab[:, :, i]

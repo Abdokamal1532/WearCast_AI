@@ -123,8 +123,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                     e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
                     dx = e_pt[0] - s_pt[0]
                     dy = e_pt[1] - s_pt[1]
-                    # Only draw to 45% of the way to the elbow (tighter than before)
-                    mid_pt = (int(s_pt[0] + dx * 0.45), int(s_pt[1] + dy * 0.45))
+                    # [FIX] Draw to 75% of shoulder→elbow distance (was 45%).
+                    # 45% was too conservative: target garment sleeves were wider than
+                    # original, leaving shoulder gaps in the composite output.
+                    mid_pt = (int(s_pt[0] + dx * 0.75), int(s_pt[1] + dy * 0.75))
                     cv2.line(inpaint_mask, s_pt, mid_pt, 255, int(28 * scale_factor))
 
             # FIX #3: Protect the LOWER arm (elbow→wrist) but NOT the upper arm near the sleeve.
@@ -151,10 +153,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
     
     # 5. Dilation
-    # FIX #4: Increased kernel from 15x15 → 21x21 to bring mask coverage from ~15-18%
-    # up to the OOTD-HD training distribution of ~20-25%. Under-masking caused the original
-    # garment color to bleed through via SDEdit latent blending.
-    mask_expanded = cv2.dilate(inpaint_mask, np.ones((21, 21), np.uint8), iterations=1)
+    # [FIX] Increased kernel from 21x21 → 25x25 to bring mask coverage from ~13-18%
+    # up to the OOTD-HD training distribution of ~20-25%. Under-masking (caused by
+    # wider arm stub + forearm protection) left original garment color bleeding through.
+    mask_expanded = cv2.dilate(inpaint_mask, np.ones((25, 25), np.uint8), iterations=1)
     
     # SILHOUETTE LOCK: 
     silhouette = (parse_array > 0).astype(np.uint8) * 255
