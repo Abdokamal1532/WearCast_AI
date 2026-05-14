@@ -154,17 +154,19 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     
     # 5. Adaptive Dilation
     # [FIX B] Kernel size adapts to how much of the image is already labeled as garment.
-    # Large people (Gemini-style product models) often have UpperClothes = 20–30% of frame,
-    # so 25x25 causes 34%+ coverage \u2192 boundary seams. Small/real people at 10–15% need 25x25
-    # to meet the OOTD-HD training distribution of 20–25%.
+    # Large people (Gemini-style product models) often have UpperClothes = 25–35% of frame,
+    # Normal real-world subjects (like Abdo) have 15-22%.
+    # If the threshold is too low, we under-mask normal people, causing black boundary seams.
     garment_pixel_pct = np.sum(parse_array == 4) / max(1, parse_array.size)
-    if garment_pixel_pct > 0.15:
-        dilation_kernel_size = 15   # Already large parsed region — keep expansion conservative
-    elif garment_pixel_pct > 0.10:
-        dilation_kernel_size = 20   # Medium: balanced
+    if garment_pixel_pct > 0.28:
+        dilation_kernel_size = 15   # Massive parsed region (e.g. tight crop) — conservative
+    elif garment_pixel_pct > 0.22:
+        dilation_kernel_size = 20   # Medium-Large
     else:
-        dilation_kernel_size = 25   # Small parsed region — expand aggressively
-    print(f"   [MASK] garment_pct={garment_pixel_pct:.1%} → dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
+        dilation_kernel_size = 25   # Standard real human — expand aggressively to prevent seams
+    
+    # [DEBUG MASK] Precise print
+    print(f"   [DEBUG MASK] garment_pct={garment_pixel_pct:.2%} → selected dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
     mask_expanded = cv2.dilate(inpaint_mask, np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8), iterations=1)
     
     # SILHOUETTE LOCK: 
