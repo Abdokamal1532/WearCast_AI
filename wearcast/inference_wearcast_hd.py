@@ -690,10 +690,14 @@ class WearCastHD:
             _ori_lab[:, :, 2] = _ori_lab[:, :, 2] * (1.0 - _ctx_alpha[:,:,0]) + 128.0 * _ctx_alpha[:,:,0]
             
             # Shift luminance to 128 and reduce contrast by 50% to soften hard logos
+            # We apply a Gaussian Blur to the luminance to remove high-frequency hard edges (like text)
+            # so the UNet doesn't trace them and generate dark squares, but we keep the low-frequency
+            # wrinkles and the soft "blob" where the text was, giving the UNet a positional anchor.
             mask_bool_ctx = _ctx_alpha[:,:,0] > 0.5
             if mask_bool_ctx.sum() > 0:
                 current_l_median = np.median(_ori_lab[mask_bool_ctx, 0])
-                _new_l = 128.0 + (_ori_lab[:, :, 0] - current_l_median) * 0.5
+                _blurred_l = cv2.GaussianBlur(_ori_lab[:, :, 0], (21, 21), 0)
+                _new_l = 128.0 + (_blurred_l - current_l_median) * 0.5
                 _ori_lab[:, :, 0] = _ori_lab[:, :, 0] * (1.0 - _ctx_alpha[:,:,0]) + _new_l * _ctx_alpha[:,:,0]
                 
             _ori_lab = np.clip(_ori_lab, 0, 255).astype(np.uint8)
