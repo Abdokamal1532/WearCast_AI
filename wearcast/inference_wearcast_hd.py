@@ -1047,7 +1047,7 @@ class WearCastHD:
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
             shift_l = torch.clamp(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
-            print(f\"   [COLOR] L-shift: raw={raw_shift_l:.1f}, clamped={shift_l:.1f} (cap=±{MAX_L_SHIFT})\")
+            print(f"   [COLOR] L-shift: raw={raw_shift_l:.1f}, clamped={shift_l:.1f} (cap=+/-{MAX_L_SHIFT})")
             
             if shift_l < 0:
                 multiplier_l = torch.where(
