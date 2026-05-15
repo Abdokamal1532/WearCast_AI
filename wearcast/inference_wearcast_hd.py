@@ -697,7 +697,9 @@ class WearCastHD:
                     # Blur luminance (sigma=6.3 ~ 21px kernel in OpenCV)
                     blurred_l = kornia.filters.gaussian_blur2d(ori_lab[:, 0:1, :, :], (21, 21), (6.3, 6.3))
                     
-                    new_l = 50.0 + (blurred_l[:, 0, :, :] - current_l_median) * 0.5
+                    # Neutral target: L=55 (slightly above 50) to avoid over-darkening.
+                    # Contrast retained at 65% (was 50%) for stronger 3D fold structure prior.
+                    new_l = 55.0 + (blurred_l[:, 0, :, :] - current_l_median) * 0.65
                     ori_lab[:, 0, :, :] = ori_lab[:, 0, :, :] * (1.0 - ctx_alpha[:, 0, :, :]) + new_l * ctx_alpha[:, 0, :, :]
                     
                 ori_ctx_rgb = kornia.color.lab_to_rgb(ori_lab)
@@ -784,25 +786,35 @@ class WearCastHD:
             dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
         
         # --- FIX #20: Strict Dynamic Bounding (GPU Accelerated) ---
-        # Reduces relaxation kernel and ensures result is strictly inside the silhouette.
         with torch.no_grad():
             dyn_mask_t = torch.from_numpy(dynamic_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
             if hasattr(self, '_cached_hard_mask'):
                 input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
                 input_mask_t = torch.from_numpy(input_mask_np).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
                 
-                kernel_relax = torch.ones(5, 5, device=self.gpu_id)
+                # CRITICAL FIX: When arms are included (long/short sleeve), use a much
+                # larger dilation so generated sleeves (which may extend beyond the
+                # original mask boundary) are NOT clipped in the composite.
+                # Old: 5px dilation for all cases → sleeves cut off
+                # New: 45px for arm-inclusive, 7px for torso-only
+                dilation_px = 45 if _include_arms else 7
+                kernel_relax = torch.ones(dilation_px, dilation_px, device=self.gpu_id)
                 relaxed_mask_t = kornia.morphology.dilation(input_mask_t, kernel_relax)
                 
-                # MUST stay within person silhouette
-                if hasattr(self, '_cached_parse'):
+                # CRITICAL FIX: Do NOT clip by original person silhouette when arms
+                # are included — it cuts generated long-sleeve fabric that extends
+                # into areas that were background in the original parse.
+                # Only apply silhouette clipping for torso-only garments.
+                if not _include_arms and hasattr(self, '_cached_parse'):
                     sil = (self._cached_parse > 0).astype(np.float32)
                     sil_t = torch.from_numpy(sil).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
                     sil_t = F.interpolate(sil_t, size=(raw_generated.size[1], raw_generated.size[0]), mode='nearest')
                     relaxed_mask_t = relaxed_mask_t * sil_t
+                    print(" -> [STRICT] Applied tight silhouette boundary constraint (torso-only, GPU).")
+                else:
+                    print(" -> [STRICT] Skipped silhouette clipping (arm-inclusive mask — large dilation used instead).")
                     
                 dyn_mask_t = dyn_mask_t * relaxed_mask_t
-                print(" -> [STRICT] Applied tight silhouette boundary constraint (GPU).")
 
             # Refine the dynamic mask slightly
             dyn_mask_t = kornia.morphology.dilation(dyn_mask_t, torch.ones(5, 5, device=self.gpu_id))
@@ -840,7 +852,10 @@ class WearCastHD:
 
         # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
         # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
-        gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+        # IMPORTANT: Applied at 70% strength to avoid over-correction (washed-out whites / crushed blacks).
+        gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+        COLOR_BLEND = 0.7  # 70% correction, 30% original UNet output preserved
+        gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
 
         # --- Final Compositing ---
         # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
@@ -1023,9 +1038,16 @@ class WearCastHD:
             print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
             # 4. Asymmetric Gamut-Aware L-Channel Transfer
+            # CAP: Limit L-shift to ±12 L-units (Kornia 0-100 scale, ~±30 in 0-255 scale).
+            # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
+            # and black shirts get crushed to L<5 (all detail lost). The cap preserves
+            # the UNet's 3D wrinkle/shading structure while correcting the overall tone.
+            MAX_L_SHIFT = 12.0
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
-            shift_l = target_repr[0] - source_median[0]
+            raw_shift_l = target_repr[0] - source_median[0]
+            shift_l = torch.clamp(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
+            print(f\"   [COLOR] L-shift: raw={raw_shift_l:.1f}, clamped={shift_l:.1f} (cap=±{MAX_L_SHIFT})\")
             
             if shift_l < 0:
                 multiplier_l = torch.where(

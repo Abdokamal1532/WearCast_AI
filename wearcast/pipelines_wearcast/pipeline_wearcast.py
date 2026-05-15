@@ -567,23 +567,24 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
                 # =====================================================================
                 # [FIX LATENT DRIFT] Adaptive Masked-Region Latent Rescaling
-                # Context Nullification gives the UNet extra freedom in the garment
-                # region, causing masked-region std to drift above 1.0 (observed up to
-                # 1.05+). The garment mask covers only 15-25% of the image, so a
-                # *global* std check is diluted by the stable background (75-85%).
-                # Fix: ALWAYS compute std directly on the masked region and rescale
-                # only those latents if they drift above 1.02. Background untouched.
+                # Lower threshold 1.02 -> 1.01: case 2a drifted to 1.04 because the
+                # masked-region std was just below 1.02 each step, never triggering.
+                # Also add global std fallback for cases with a very sparse latent mask.
                 # =====================================================================
                 _mask_flat = mask_latents[:latents.shape[0]]  # align batch dim
                 _mask_bool = (_mask_flat > 0.5).expand_as(latents)
                 _masked_vals = latents[_mask_bool]
+                _global_std = latents.float().std().item()
                 if _masked_vals.numel() > 16:  # sanity: need enough samples
                     _m_std = _masked_vals.float().std().item()
-                    if _m_std > 1.02:
-                        _scale = 1.0 / _m_std
+                    # Use the higher of masked-region or global std to decide whether to rescale
+                    _drift_std = _m_std if _m_std > _global_std else (_global_std if _global_std > 1.02 else _m_std)
+                    if _drift_std > 1.01:
+                        _scale = 1.0 / _drift_std
                         latents = torch.where(_mask_bool, latents * _scale, latents)
                         if i % 5 == 0:
-                            print(f"   [RESCALE] Step {i}: masked_std={_m_std:.4f} → rescaled to 1.0")
+                            print(f"   [RESCALE] Step {i}: masked_std={_m_std:.4f} global_std={_global_std:.4f} → rescaled by {_scale:.4f}")
+
 
                 # =====================================================================
                 # RESTORED SDEdit latent blending (OOTDiffusion default)
