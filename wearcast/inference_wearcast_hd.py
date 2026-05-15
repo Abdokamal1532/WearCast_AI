@@ -9,6 +9,7 @@ import cv2
 import random
 import time
 from rembg import remove, new_session
+import kornia
 
 from wearcast.pipelines_wearcast.pipeline_wearcast import WearCastPipeline
 from wearcast.pipelines_wearcast.unet_garm_2d_condition import UNetGarm2DConditionModel
@@ -670,43 +671,45 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # [FIX: GHOSTING + COLOR CONTAMINATION]
+            # [FIX: GHOSTING + COLOR CONTAMINATION] (GPU Accelerated)
             # Neutralize original garment pixels inside the mask region before sending
             # to the UNet as context (image_ori). 
-            # We must KEEP the original luminance variations (wrinkles, folds, faint outlines)
-            # so the UNet has a 3D structural prior, but we NEUTRALIZE the color (greyscale)
-            # and shift the overall brightness to 128 (neutral).
-            _mask_np_ctx = np.array(mask.resize(image_ori.size, Image.NEAREST)).astype(np.float32) / 255.0
-            _ctx_alpha = cv2.GaussianBlur(_mask_np_ctx, (0, 0), 8.0)
-            _ctx_alpha = np.clip(_ctx_alpha, 0.0, 1.0)[:, :, np.newaxis]
-            
-            _ori_np_full = np.array(image_ori).astype(np.float32)
-            
-            # Convert to LAB for luminance manipulation
-            _ori_lab = cv2.cvtColor(np.clip(_ori_np_full, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-            
-            # Neutralize color (A and B channels to 128)
-            _ori_lab[:, :, 1] = _ori_lab[:, :, 1] * (1.0 - _ctx_alpha[:,:,0]) + 128.0 * _ctx_alpha[:,:,0]
-            _ori_lab[:, :, 2] = _ori_lab[:, :, 2] * (1.0 - _ctx_alpha[:,:,0]) + 128.0 * _ctx_alpha[:,:,0]
-            
-            # Shift luminance to 128 and reduce contrast by 50% to soften hard logos
-            # We apply a Gaussian Blur to the luminance to remove high-frequency hard edges (like text)
-            # so the UNet doesn't trace them and generate dark squares, but we keep the low-frequency
-            # wrinkles and the soft "blob" where the text was, giving the UNet a positional anchor.
-            mask_bool_ctx = _ctx_alpha[:,:,0] > 0.5
-            if mask_bool_ctx.sum() > 0:
-                current_l_median = np.median(_ori_lab[mask_bool_ctx, 0])
-                _blurred_l = cv2.GaussianBlur(_ori_lab[:, :, 0], (21, 21), 0)
-                _new_l = 128.0 + (_blurred_l - current_l_median) * 0.5
-                _ori_lab[:, :, 0] = _ori_lab[:, :, 0] * (1.0 - _ctx_alpha[:,:,0]) + _new_l * _ctx_alpha[:,:,0]
+            with torch.no_grad():
+                _mask_np_ctx = np.array(mask.resize(image_ori.size, Image.NEAREST)).astype(np.float32) / 255.0
+                mask_t = torch.from_numpy(_mask_np_ctx).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+                ori_t = torch.from_numpy(np.array(image_ori)).permute(2, 0, 1).unsqueeze(0).float().to(self.gpu_id) / 255.0
                 
-            _ori_lab = np.clip(_ori_lab, 0, 255).astype(np.uint8)
-            _ori_ctx_np = cv2.cvtColor(_ori_lab, cv2.COLOR_LAB2RGB)
+                # Gaussian Blur Mask (sigma=8.0 -> kernel=33)
+                ctx_alpha = kornia.filters.gaussian_blur2d(mask_t, (33, 33), (8.0, 8.0))
+                ctx_alpha = torch.clamp(ctx_alpha, 0.0, 1.0)
+                
+                # LAB Conversion
+                ori_lab = kornia.color.rgb_to_lab(ori_t)
+                
+                # Neutralize color (A and B channels to 0 in Kornia, since it's centered around 0)
+                ori_lab[:, 1, :, :] = ori_lab[:, 1, :, :] * (1.0 - ctx_alpha[:, 0, :, :])
+                ori_lab[:, 2, :, :] = ori_lab[:, 2, :, :] * (1.0 - ctx_alpha[:, 0, :, :])
+                
+                # Shift luminance to 50 (neutral) and reduce contrast by 50%
+                mask_bool_ctx = ctx_alpha[:, 0, :, :] > 0.5
+                if mask_bool_ctx.sum() > 0:
+                    current_l_median = ori_lab[:, 0, :, :][mask_bool_ctx].median()
+                    # Blur luminance (sigma=6.3 ~ 21px kernel in OpenCV)
+                    blurred_l = kornia.filters.gaussian_blur2d(ori_lab[:, 0:1, :, :], (21, 21), (6.3, 6.3))
+                    
+                    new_l = 50.0 + (blurred_l[:, 0, :, :] - current_l_median) * 0.5
+                    ori_lab[:, 0, :, :] = ori_lab[:, 0, :, :] * (1.0 - ctx_alpha[:, 0, :, :]) + new_l * ctx_alpha[:, 0, :, :]
+                    
+                ori_ctx_rgb = kornia.color.lab_to_rgb(ori_lab)
+                ori_ctx_rgb = torch.clamp(ori_ctx_rgb, 0.0, 1.0)
+                
+                _ori_ctx_np = (ori_ctx_rgb[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+                _ctx_alpha_mean = ctx_alpha.mean().item()
             
             image_ori_constrained = Image.fromarray(_ori_ctx_np)
             debug_save(image_ori_constrained, "debug_phase3_ori_context.jpg")
-            print(" -> [CONTEXT] Neutralized garment region in UNet context (Ghosting + Color Contamination fix).")
-            print(f" -> [CONTEXT] Mask coverage in context: {100.0*float(_ctx_alpha.mean()):.2f}% neutralized.")
+            print(" -> [CONTEXT] Neutralized garment region in UNet context (Ghosting + Color Contamination fix, GPU).")
+            print(f" -> [CONTEXT] Mask coverage in context: {100.0 * _ctx_alpha_mean:.2f}% neutralized.")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -780,41 +783,49 @@ class WearCastHD:
         else:
             dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
         
-        # --- FIX #20: Strict Dynamic Bounding ---
+        # --- FIX #20: Strict Dynamic Bounding (GPU Accelerated) ---
         # Reduces relaxation kernel and ensures result is strictly inside the silhouette.
-        if hasattr(self, '_cached_hard_mask'):
-            input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-            # Reduced to 5x5 for tighter fit
-            kernel_relax = np.ones((5, 5), np.uint8)
-            relaxed_mask = cv2.dilate(input_mask_np, kernel_relax, iterations=1)
-            
-            # MUST stay within person silhouette
-            if hasattr(self, '_cached_parse'):
-                sil = (self._cached_parse > 0).astype(np.float32)
-                sil = cv2.resize(sil, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-                relaxed_mask = relaxed_mask * sil
+        with torch.no_grad():
+            dyn_mask_t = torch.from_numpy(dynamic_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+            if hasattr(self, '_cached_hard_mask'):
+                input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
+                input_mask_t = torch.from_numpy(input_mask_np).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
                 
-            dynamic_mask = dynamic_mask * relaxed_mask
-            print(" -> [STRICT] Applied tight silhouette boundary constraint.")
+                kernel_relax = torch.ones(5, 5, device=self.gpu_id)
+                relaxed_mask_t = kornia.morphology.dilation(input_mask_t, kernel_relax)
+                
+                # MUST stay within person silhouette
+                if hasattr(self, '_cached_parse'):
+                    sil = (self._cached_parse > 0).astype(np.float32)
+                    sil_t = torch.from_numpy(sil).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+                    sil_t = F.interpolate(sil_t, size=(raw_generated.size[1], raw_generated.size[0]), mode='nearest')
+                    relaxed_mask_t = relaxed_mask_t * sil_t
+                    
+                dyn_mask_t = dyn_mask_t * relaxed_mask_t
+                print(" -> [STRICT] Applied tight silhouette boundary constraint (GPU).")
 
-        # Refine the dynamic mask slightly
-        dynamic_mask = cv2.dilate(dynamic_mask, np.ones((5, 5), np.uint8), iterations=1)
-        
-        # Binarize
-        binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
-        # FIX #4: Seamless Photographic Alpha Blend
-        # 1. Very gentle erosion to avoid bleeds but keep boundary natural
-        kernel_erode = np.ones((3, 3), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
-        
-        # 2. Narrower photographic feathering instead of jagged cutouts (prevents background halo)
-        feather_sigma = 3.0
-        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
-        
-        # FIX: Restore the solid core so thin sleeves don't become translucent from the blur
-        core_mask = cv2.erode(binary_mask, np.ones((5, 5), np.uint8), iterations=1).astype(np.float32)
-        alpha = np.maximum(alpha, core_mask)
-        alpha = np.clip(alpha, 0.0, 1.0)
+            # Refine the dynamic mask slightly
+            dyn_mask_t = kornia.morphology.dilation(dyn_mask_t, torch.ones(5, 5, device=self.gpu_id))
+            
+            # Binarize
+            binary_mask_t = (dyn_mask_t > 0.5).float()
+            
+            # FIX #4: Seamless Photographic Alpha Blend
+            # 1. Very gentle erosion to avoid bleeds but keep boundary natural
+            eroded_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
+            
+            # 2. Narrower photographic feathering instead of jagged cutouts (prevents background halo)
+            feather_sigma = 3.0
+            alpha_t = kornia.filters.gaussian_blur2d(eroded_mask_t, (13, 13), (feather_sigma, feather_sigma))
+            
+            # FIX: Restore the solid core so thin sleeves don't become translucent from the blur
+            core_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(5, 5, device=self.gpu_id))
+            alpha_t = torch.maximum(alpha_t, core_mask_t)
+            alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
+            
+            alpha = alpha_t[0, 0].cpu().numpy()
+            binary_mask = binary_mask_t[0, 0].cpu().numpy().astype(np.uint8)
+            
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
         # Save feather mask for debugging
@@ -957,17 +968,12 @@ class WearCastHD:
             # Simple solid garments: 30 steps, 2.0 scale (lower scale = smoother, natural drape)
             return {"num_steps": 30, "image_scale": 2.0}
 
-
     def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """
         Content-Aware Statistical Color Transfer in LAB space.
-        FIX #1: Uses directional percentiles (not median) to find the true fabric color,
-        so that logos/graphics don't contaminate the target measurement.
-        FIX #2: Returns corrected gen_arr WITHOUT doing an alpha blend — the caller
-        performs the single authoritative composite. Eliminates the double-blend bug
-        that caused garments to look transparent/pasted.
+        GPU-Accelerated via Kornia for maximum performance.
         """
-        print(" -> [COLOR] Applying Content-Aware LAB Color Transfer...")
+        print(" -> [COLOR] Applying Content-Aware LAB Color Transfer (GPU Accelerated)...")
         
         # 1. Prepare target garment pixels
         garm_arr = np.array(image_garm.resize((gen_arr.shape[1], gen_arr.shape[0]))).astype(np.float32)
@@ -985,108 +991,81 @@ class WearCastHD:
         if mask_bool.sum() < 100:
             return gen_arr
             
-        # 2. Convert to LAB color space
-        gen_lab = cv2.cvtColor(np.clip(gen_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        garm_lab = cv2.cvtColor(np.clip(garm_arr, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-        
-        # 3. FIX #1: Directional-Percentile Target Measurement
-        # -------------------------------------------------------
-        # OLD: np.median(target_pixels) — biased by white/dark logos on opposite-tone shirts.
-        # NEW: When darkening (target < source), use 20th-pct to get true dark-fabric tone.
-        #      When brightening (target > source), use 80th-pct to get true light-fabric tone.
-        # This removes the logo-contamination effect that was making black shirts appear grey.
-        target_pixels = garm_lab[valid_garm]
-        source_pixels = gen_lab[mask_bool]
-        source_median = np.median(source_pixels, axis=0)
+        # 2. Convert to Tensors and move to GPU
+        with torch.no_grad():
+            gen_tensor = torch.from_numpy(gen_arr).permute(2, 0, 1).unsqueeze(0).to(self.gpu_id) / 255.0
+            garm_tensor = torch.from_numpy(garm_arr).permute(2, 0, 1).unsqueeze(0).to(self.gpu_id) / 255.0
+            
+            # 3. Convert to LAB color space via Kornia (Note: Kornia L is 0-100)
+            gen_lab = kornia.color.rgb_to_lab(gen_tensor)
+            garm_lab = kornia.color.rgb_to_lab(garm_tensor)
+            
+            # Extract valid pixels
+            valid_garm_t = torch.from_numpy(valid_garm).to(self.gpu_id)
+            mask_bool_t = torch.from_numpy(mask_bool).to(self.gpu_id)
+            
+            target_pixels = garm_lab[0].permute(1, 2, 0)[valid_garm_t] # N x 3
+            source_pixels = gen_lab[0].permute(1, 2, 0)[mask_bool_t] # M x 3
+            
+            source_median = source_pixels.median(dim=0).values
+            rough_shift = target_pixels.median(dim=0).values - source_median
+            
+            target_repr = torch.zeros(3, device=self.gpu_id)
+            for ch in range(3):
+                if rough_shift[ch] < -2.0: # scaled for 0-100 L scale
+                    target_repr[ch] = torch.quantile(target_pixels[:, ch], 0.20)
+                elif rough_shift[ch] > 2.0:
+                    target_repr[ch] = torch.quantile(target_pixels[:, ch], 0.80)
+                else:
+                    target_repr[ch] = target_pixels[:, ch].median()
+                    
+            print(f"   [COLOR] Target Rep (directional pct): L={target_repr[0]:.1f}, a={target_repr[1]:.1f}, b={target_repr[2]:.1f}")
+            print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
-        # Determine shift direction per channel before choosing percentile
-        rough_shift = np.median(target_pixels, axis=0) - source_median
-        target_repr = np.zeros(3)
-        for ch in range(3):
-            if rough_shift[ch] < -5:      # Darkening: use lower percentile (true dark fabric)
-                target_repr[ch] = np.percentile(target_pixels[:, ch], 20)
-            elif rough_shift[ch] > 5:     # Brightening: use upper percentile (true light fabric)
-                target_repr[ch] = np.percentile(target_pixels[:, ch], 80)
-            else:                          # Neutral: use median (no strong shift needed)
-                target_repr[ch] = np.median(target_pixels[:, ch])
-
-        target_median = target_repr  # use the directional representative value
-        target_std = np.std(target_pixels, axis=0) + 1e-6
-        source_std = np.std(source_pixels, axis=0) + 1e-6
-        
-        print(f"   [COLOR] Target Rep (directional pct): L={target_median[0]:.1f}, a={target_median[1]:.1f}, b={target_median[2]:.1f}")
-        print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
-
-        # 4. Asymmetric Gamut-Aware L-Channel Transfer
-        corrected_lab = gen_lab.copy()
-        source_l = gen_lab[:, :, 0]
-        shift_l = target_median[0] - source_median[0]
-        
-        if shift_l < 0:
-            # Darkening (e.g. Black shirt)
-            # Shadows approach 0 — decay the shift to avoid full crush.
-            # Highlights are moving away from 255 — full shift preserves 3D fold depth.
-            multiplier_l = np.where(
-                source_l <= source_median[0],
-                source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
-                1.0  # Full shift for highlights
-            )
-            # Protect pure-white logo pixels (L > 180) — avoid turning them grey
-            logo_protect = np.clip((210.0 - source_l) / 50.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
-        else:
-            # Brightening (e.g. White shirt)
-            # Highlights approach 255 — decay to prevent blowout.
-            # Shadows are moving away from 0 — full shift preserves 3D fold depth.
-            multiplier_l = np.where(
-                source_l >= source_median[0],
-                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
-                1.0  # Full shift for shadows
-            )
-            # Protect pure-black logo pixels (L < 60) — avoid brightening them
-            logo_protect = np.clip((source_l - 30.0) / 50.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            # 4. Asymmetric Gamut-Aware L-Channel Transfer
+            corrected_lab = gen_lab.clone()
+            source_l = gen_lab[:, 0:1, :, :]
+            shift_l = target_repr[0] - source_median[0]
             
-        shifted_l = source_l + shift_l * multiplier_l
-        
-        # FIX #1b: Reduced shadow soft-clip floor from L=30 → L=10
-        # OLD floor of 30 was preventing true black (L≈5-15) from ever being reached.
-        high_mask = shifted_l > 220
-        if high_mask.sum() > 0:
-            excess = shifted_l[high_mask] - 220
-            shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
+            if shift_l < 0:
+                multiplier_l = torch.where(
+                    source_l <= source_median[0],
+                    source_l / (source_median[0] + 1e-6),
+                    torch.ones_like(source_l)
+                )
+                logo_protect = torch.clamp((82.0 - source_l) / 19.6, 0.0, 1.0) # 82 corresponds to ~210 in 0-255
+                multiplier_l = torch.min(multiplier_l, logo_protect)
+            else:
+                multiplier_l = torch.where(
+                    source_l >= source_median[0],
+                    (100.0 - source_l) / (100.0 - source_median[0] + 1e-6),
+                    torch.ones_like(source_l)
+                )
+                logo_protect = torch.clamp(source_l / 19.6, 0.0, 1.0) # 19.6 corresponds to ~50 in 0-255
+                multiplier_l = torch.min(multiplier_l, logo_protect)
+                
+            corrected_lab[:, 0:1, :, :] = source_l + shift_l * multiplier_l
             
-        # Shadows: compress below 10 (not 30), allowing near-black fabric
-        low_mask = shifted_l < 10
-        if low_mask.sum() > 0:
-            deficit = 10 - shifted_l[low_mask]
-            shifted_l[low_mask] = 10 - 10.0 * (1.0 - np.exp(-deficit / 10.0))
+            # A/B Channels Color Transfer with Logo Protection
+            ab_diff = torch.sqrt(torch.sum((gen_lab[:, 1:, :, :] - source_median[1:].view(1, 2, 1, 1))**2, dim=1, keepdim=True))
+            color_transfer_weight = torch.clamp((15.7 - ab_diff) / 7.8, 0.0, 1.0) # Scaled for Kornia LAB A/B scale (-128 to 127 vs OpenCV 0 to 255)
             
-        corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
-        
-        # A and B Channels (Color)
-        # Protect colorful graphics using pure A/B distance from the source neutral
-        ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
-        color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
-        
-        for i in [1, 2]:
-            source_c = gen_lab[:, :, i]
-            shift_c = target_median[i] - source_median[i]
-            shifted_c = source_c + shift_c * color_transfer_weight
-            corrected_lab[mask_bool, i] = shifted_c[mask_bool]
+            for ch in [1, 2]:
+                shift_c = target_repr[ch] - source_median[ch]
+                corrected_lab[:, ch:ch+1, :, :] += shift_c * color_transfer_weight
+                
+            # Convert back to RGB
+            corrected_rgb_t = kornia.color.lab_to_rgb(corrected_lab) * 255.0
+            corrected_rgb_t = torch.clamp(corrected_rgb_t, 0.0, 255.0)
             
-        corrected_lab = np.clip(corrected_lab, 0, 255)
-        
-        # FIX #2: Return corrected pixels WITHOUT an alpha blend.
-        # Previously this function blended internally AND the caller blended again,
-        # causing a double-composite that made garments look semi-transparent.
-        # Now: only pixels inside the mask region are updated; caller does the one blend.
-        corrected_rgb = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
-        result = gen_arr.copy()
-        result[mask_bool] = corrected_rgb[mask_bool]
-        
-        print("   [COLOR] Content-Aware LAB transfer complete.")
-        return result
+            corrected_rgb = corrected_rgb_t[0].permute(1, 2, 0).cpu().numpy()
+            
+            # Blend into original array based on mask
+            result = gen_arr.copy()
+            result[mask_bool] = corrected_rgb[mask_bool]
+            
+            print("   [COLOR] Content-Aware LAB transfer complete.")
+            return result
 
     def laplacian_pyramid_blend(self, generated, original, mask_soft, levels=5):
         """
