@@ -825,6 +825,12 @@ class WearCastHD:
             # Binarize
             binary_mask_t = (dyn_mask_t > 0.5).float()
             
+            # CRITICAL FIX: Erode the binarized mask by 3px BEFORE applying feathering.
+            # This shrinks the compositing mask slightly inward, fixing the "shoulder holes"
+            # caused when the heavily dilated original mask exposes background pixels
+            # that the re-parse didn't cover.
+            binary_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
+            
             # FIX #4: Seamless Photographic Alpha Blend
             # 1. Very gentle erosion to avoid bleeds but keep boundary natural
             eroded_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
@@ -1048,9 +1054,10 @@ class WearCastHD:
             # 4. Asymmetric Gamut-Aware L-Channel Transfer
             # CAP: Limit L-shift to ±12 L-units (Kornia 0-100 scale, ~±30 in 0-255 scale).
             # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
-            # and black shirts get crushed to L<5 (all detail lost). The cap preserves
-            # the UNet's 3D wrinkle/shading structure while correcting the overall tone.
-            MAX_L_SHIFT = 12.0
+            # and black shirts get crushed to L<5 (all detail lost). 
+            # ADAPTIVE: For very bright targets (L > 85), raise cap to 15.0 to ensure
+            # white garments don't look gray.
+            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else 12.0
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
