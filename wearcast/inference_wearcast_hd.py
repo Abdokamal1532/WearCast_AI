@@ -780,10 +780,13 @@ class WearCastHD:
             _orig_mask_coverage = np.mean(_hm > 0)
 
         _include_arms = _orig_mask_coverage > 0.03  # arms present if mask > 3% coverage above torso baseline ~15%
-        if _include_arms:
-            dynamic_mask = ((parse_new == 4) | (parse_new == 7) | (parse_new == 14) | (parse_new == 15)).astype(np.float32)
-        else:
-            dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+        
+        # CRITICAL FIX: Always use only the garment labels (4=upper_clothes, 7=dress) for
+        # the re-parse composite mask. Previously including arm labels (14/15) caused "skin
+        # hole" artifacts — bare arm pixels got color-transferred and appeared as blobs.
+        # The large 45px dilation of the original mask (applied below) already covers sleeve
+        # boundaries adequately without pulling in raw skin pixels.
+        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
         
         # --- FIX #20: Strict Dynamic Bounding (GPU Accelerated) ---
         with torch.no_grad():
@@ -852,9 +855,14 @@ class WearCastHD:
 
         # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
         # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
-        # IMPORTANT: Applied at 70% strength to avoid over-correction (washed-out whites / crushed blacks).
+        # Adaptive blend: push harder (85%) for very bright/dark garments where the UNet
+        # tends to under-correct, stay conservative (70%) for mid-tone garments.
         gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
-        COLOR_BLEND = 0.7  # 70% correction, 30% original UNet output preserved
+        # Get approximate target luminance from garment image center region
+        _garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
+        _garm_lum = float((_garm_np[:, :, 0]*0.299 + _garm_np[:, :, 1]*0.587 + _garm_np[:, :, 2]*0.114).mean())
+        COLOR_BLEND = 0.85 if (_garm_lum > 200 or _garm_lum < 50) else 0.70
+        print(f" -> [COLOR] Garment luminance={_garm_lum:.1f}, blend strength={COLOR_BLEND:.0%}")
         gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
 
         # --- Final Compositing ---
