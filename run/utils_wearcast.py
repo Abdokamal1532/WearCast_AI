@@ -57,47 +57,46 @@ def analyze_sleeve_length(garm_mask_np):
     import numpy as np
     
     if len(garm_mask_np.shape) == 3:
+        # Keep only the largest connected component if the background removal was messy.
         garm_mask_np = garm_mask_np[:, :, 0]
         
     y_indices, x_indices = np.where(garm_mask_np > 0)
     if len(y_indices) == 0:
         return False
 
-    height = np.max(y_indices) - np.min(y_indices)
-    width = np.max(x_indices) - np.min(x_indices)
+    y_min, y_max = np.min(y_indices), np.max(y_indices)
+    height = y_max - y_min
     
-    y_min = np.min(y_indices)
-    x_min, x_max = np.min(x_indices), np.max(x_indices)
+    # [FIX] Boxy T-shirts were falsely triggering the "Long Sleeve" detector because their 
+    # torsos are wide enough to fill the outer boundaries of the mask.
+    # Instead of checking the outer 25% of the X-axis, we calculate the width profile of the garment.
+    # A short-sleeve shirt is widest at the top (shoulders+sleeves) and much narrower at the bottom (torso).
+    # A long-sleeve shirt has arms extending down, so the bottom is equal to or wider than the top.
     
-    # Isolate the outer 25% of the garment (the sleeves)
-    left_x_end = x_min + int(0.25 * width)
-    right_x_start = x_max - int(0.25 * width)
+    cropped_mask = garm_mask_np[y_min:y_max+1, :]
+    widths = []
+    for row in cropped_mask:
+        xs = np.where(row > 0)[0]
+        if len(xs) > 0:
+            widths.append(xs[-1] - xs[0])
+        else:
+            widths.append(0)
+    widths = np.array(widths)
     
-    left_region = garm_mask_np[:, x_min:left_x_end]
-    right_region = garm_mask_np[:, right_x_start:x_max]
+    # Compare the top 30% width to the bottom 30% width
+    idx_30 = int(0.3 * height)
+    idx_70 = int(0.7 * height)
     
-    left_y_idx = np.where(left_region > 0)[0]
-    right_y_idx = np.where(right_region > 0)[0]
-    
-    left_reaches_bottom = False
-    right_reaches_bottom = False
-    
-    # A short sleeve typically ends before 65% of the total garment height.
-    # A long sleeve will reach past 80% of the garment height.
-    if len(left_y_idx) > 0:
-        left_max_y = np.max(left_y_idx) - y_min
-        if left_max_y > 0.75 * height:
-            left_reaches_bottom = True
-            
-    if len(right_y_idx) > 0:
-        right_max_y = np.max(right_y_idx) - y_min
-        if right_max_y > 0.75 * height:
-            right_reaches_bottom = True
-            
-    # If EITHER sleeve reaches the bottom 25% of the garment, it's a long sleeve.
-    if left_reaches_bottom or right_reaches_bottom:
-        return True
+    if idx_30 == 0 or idx_70 >= len(widths):
+        return False
         
+    max_top_width = np.max(widths[:idx_30])
+    max_bottom_width = np.max(widths[idx_70:])
+    
+    ratio = max_bottom_width / max_top_width if max_top_width > 0 else 1.0
+    
+    # If the bottom is at least 85% as wide as the top, it's a long sleeve.
+    return ratio > 0.85
     return False
 
 def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
