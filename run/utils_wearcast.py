@@ -52,6 +52,7 @@ def refine_mask(mask):
 def analyze_sleeve_length(garm_mask_np):
     """
     Classify garment as short_sleeve or long_sleeve based on mask.
+    Robustly handles wide t-shirts by checking how far DOWN the outer edges go.
     """
     import numpy as np
     
@@ -65,24 +66,36 @@ def analyze_sleeve_length(garm_mask_np):
     height = np.max(y_indices) - np.min(y_indices)
     width = np.max(x_indices) - np.min(x_indices)
     
-    y_min, y_max = np.min(y_indices), np.max(y_indices)
+    y_min = np.min(y_indices)
     x_min, x_max = np.min(x_indices), np.max(x_indices)
     
-    # Check bottom 25% of the image height
-    bottom_y_start = y_max - int(0.25 * height)
-    # Check outer 20% of the image width
-    left_x_end = x_min + int(0.20 * width)
-    right_x_start = x_max - int(0.20 * width)
+    # Isolate the outer 25% of the garment (the sleeves)
+    left_x_end = x_min + int(0.25 * width)
+    right_x_start = x_max - int(0.25 * width)
     
-    bottom_left_region = garm_mask_np[bottom_y_start:y_max, x_min:left_x_end]
-    bottom_right_region = garm_mask_np[bottom_y_start:y_max, right_x_start:x_max]
+    left_region = garm_mask_np[:, x_min:left_x_end]
+    right_region = garm_mask_np[:, right_x_start:x_max]
     
-    left_density = np.sum(bottom_left_region > 0) / max(1, bottom_left_region.size)
-    right_density = np.sum(bottom_right_region > 0) / max(1, bottom_right_region.size)
+    left_y_idx = np.where(left_region > 0)[0]
+    right_y_idx = np.where(right_region > 0)[0]
     
-    # Require BOTH sides to have >10% fabric density, or one side to have >30% fabric density
-    # This prevents wide t-shirts from being classified as long sleeve
-    if (left_density > 0.10 and right_density > 0.10) or (left_density > 0.30) or (right_density > 0.30):
+    left_reaches_bottom = False
+    right_reaches_bottom = False
+    
+    # A short sleeve typically ends before 65% of the total garment height.
+    # A long sleeve will reach past 80% of the garment height.
+    if len(left_y_idx) > 0:
+        left_max_y = np.max(left_y_idx) - y_min
+        if left_max_y > 0.75 * height:
+            left_reaches_bottom = True
+            
+    if len(right_y_idx) > 0:
+        right_max_y = np.max(right_y_idx) - y_min
+        if right_max_y > 0.75 * height:
+            right_reaches_bottom = True
+            
+    # If EITHER sleeve reaches the bottom 25% of the garment, it's a long sleeve.
+    if left_reaches_bottom or right_reaches_bottom:
         return True
         
     return False

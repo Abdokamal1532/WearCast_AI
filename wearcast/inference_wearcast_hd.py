@@ -839,11 +839,23 @@ class WearCastHD:
             alpha_t = torch.maximum(alpha_t, core_mask_t)
             alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
             
-            # Guarantee the alpha mask covers the original mask AT LEAST WHERE IT MATTERS (the torso).
-            # We don't want to blindly max with input_mask_t because that might paste UNet skin 
-            # over real arms. But for the core torso, we MUST cover the old shirt.
-            # The simplest fix is just to slightly dilate the binary mask before feathering if we want extra safety,
-            # but the 5x5 dilation above is usually enough. Let's see if removing the erosions fixes the black border.
+            # Guarantee the alpha mask covers the original shirt torso.
+            # If the new garment is tighter/smaller, the UNet filled the gap with fake background.
+            # We MUST paste that fake background to hide the old shirt.
+            if hasattr(self, '_cached_parse'):
+                old_torso = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.float32)
+                old_torso_t = torch.from_numpy(old_torso).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+                old_torso_t = F.interpolate(old_torso_t, size=(raw_generated.size[1], raw_generated.size[0]), mode='nearest')
+                
+                # Erode the old torso slightly by 1px so we don't accidentally paste UNet background
+                # slightly outside the old shirt if the parse was imprecise.
+                old_torso_t = kornia.morphology.erosion(old_torso_t, torch.ones(3, 3, device=self.gpu_id))
+                
+                # Soften the boundary of this forced mask so we don't get a sharp seam
+                old_torso_soft = kornia.filters.gaussian_blur2d(old_torso_t, (9, 9), (2.0, 2.0))
+                
+                alpha_t = torch.maximum(alpha_t, old_torso_soft)
+                alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
             
             alpha = alpha_t[0, 0].cpu().numpy()
             binary_mask = binary_mask_t[0, 0].cpu().numpy().astype(np.uint8)
@@ -877,14 +889,12 @@ class WearCastHD:
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
 
-        # --- STUDIO MASTER: AI-Native Rendering ---
-        # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
-        # This prevents "Double Logos" and allows the UNet to render graphics organically.
-        # if is_complex:
-        #    print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
-        #    blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-        #    blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
-        #    gen_arr = np.array(blended_pil).astype(np.float32)
+        # --- STUDIO MASTER: AI-Native Rendering & TPS Refinement ---
+        if is_complex:
+            print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
+            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
+            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
+            gen_arr = np.array(blended_pil).astype(np.float32)
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
@@ -1057,8 +1067,9 @@ class WearCastHD:
             # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
             # and black shirts get crushed to L<5 (all detail lost). 
             # ADAPTIVE: For very bright targets (L > 85), raise cap to 15.0 to ensure
-            # white garments don't look gray.
-            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else 12.0
+            # white garments don't look gray. For very dark targets (L < 20), raise cap to 25.0
+            # so black shirts aren't left dark gray.
+            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (25.0 if target_repr[0] < 20.0 else 12.0)
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
