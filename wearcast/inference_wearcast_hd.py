@@ -225,18 +225,53 @@ class WearCastHD:
         src_y_all, src_x_all = np.where(~bg_mask)
         src_bbox = [np.min(src_x_all), np.min(src_y_all), np.max(src_x_all), np.max(src_y_all)]
         
+        logo_bbox = [np.min(x_indices), np.min(y_indices), np.max(x_indices), np.max(y_indices)]
+        
         tgt_y_all, tgt_x_all = np.where(gen_fg_mask)
         tgt_bbox = [np.min(tgt_x_all), np.min(tgt_y_all), np.max(tgt_x_all), np.max(tgt_y_all)]
         
-        print(" -> [LOGO_WARP] Using global anatomical mapping to preserve original proportions.")
-        src_pts = np.float32([
-            [src_bbox[0], src_bbox[1]], [src_bbox[2], src_bbox[1]],
-            [src_bbox[2], src_bbox[3]], [src_bbox[0], src_bbox[3]]
-        ])
-        dst_pts = np.float32([
-            [tgt_bbox[0], tgt_bbox[1]], [tgt_bbox[2], tgt_bbox[1]],
-            [tgt_bbox[2], tgt_bbox[3]], [tgt_bbox[0], tgt_bbox[3]]
-        ])
+        # Dynamic Alignment: Use UNet's placement if robust, else fallback to global
+        if len(gy) > 200:
+            print(" -> [LOGO_WARP] AI-Guided placement detected. Aligning graphics to UNet features (Aspect-Ratio preserved).")
+            tx_min, tx_max = np.min(gx), np.max(gx)
+            ty_min, ty_max = np.min(gy), np.max(gy)
+            
+            # Enforce aspect ratio of original logo
+            logo_w = logo_bbox[2] - logo_bbox[0]
+            logo_h = logo_bbox[3] - logo_bbox[1]
+            
+            cx, cy = (tx_min + tx_max) / 2.0, (ty_min + ty_max) / 2.0
+            
+            # Use width scale as primary anchor (logos usually scale by chest width)
+            scale = (tx_max - tx_min) / float(logo_w) if logo_w > 0 else 1.0
+            
+            dst_w = logo_w * scale
+            dst_h = logo_h * scale
+            
+            # Center the new aspect-ratio-corrected bounding box over the UNet's placement
+            dtx_min = cx - dst_w / 2.0
+            dtx_max = cx + dst_w / 2.0
+            dty_min = cy - dst_h / 2.0
+            dty_max = cy + dst_h / 2.0
+            
+            dst_pts = np.float32([
+                [dtx_min, dty_min], [dtx_max, dty_min],
+                [dtx_max, dty_max], [dtx_min, dty_max]
+            ])
+            src_pts = np.float32([
+                [logo_bbox[0], logo_bbox[1]], [logo_bbox[2], logo_bbox[1]],
+                [logo_bbox[2], logo_bbox[3]], [logo_bbox[0], logo_bbox[3]]
+            ])
+        else:
+            print(" -> [LOGO_WARP] Using global anatomical mapping to preserve original proportions.")
+            src_pts = np.float32([
+                [src_bbox[0], src_bbox[1]], [src_bbox[2], src_bbox[1]],
+                [src_bbox[2], src_bbox[3]], [src_bbox[0], src_bbox[3]]
+            ])
+            dst_pts = np.float32([
+                [tgt_bbox[0], tgt_bbox[1]], [tgt_bbox[2], tgt_bbox[1]],
+                [tgt_bbox[2], tgt_bbox[3]], [tgt_bbox[0], tgt_bbox[3]]
+            ])
 
         # 4. WARP & BLEND
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -665,9 +700,18 @@ class WearCastHD:
             # erasing the person's real skin. This forced the UNet to generate fake skin,
             # causing severe "double neckline" and floating head artifacts.
             if hasattr(self, '_cached_parse'):
-                old_garment_mask = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.uint8) * 255
-                # Dilate slightly to ensure old shirt edges don't bleed into the inpaint
-                inpaint_mask = cv2.dilate(old_garment_mask, np.ones((5, 5), np.uint8), iterations=1)
+                parse = self._cached_parse
+                old_garment_mask = ((parse == 4) | (parse == 7)).astype(np.uint8) * 255
+                skin_mask = ((parse == 11) | (parse == 14) | (parse == 15) | (parse == 18)).astype(np.uint8) * 255
+                
+                # Dilate heavily (12px radius) to capture all protruding fabric/white edges
+                # that the parser missed, which otherwise bleed inward and cause "ghostly outlines".
+                inpaint_mask = cv2.dilate(old_garment_mask, np.ones((25, 25), np.uint8), iterations=1)
+                
+                # Protect the person's real skin from being inpainted (erased).
+                # We dilate the skin mask slightly (2px) to give a safety buffer, then subtract it.
+                safe_skin = cv2.dilate(skin_mask, np.ones((5, 5), np.uint8), iterations=1)
+                inpaint_mask[safe_skin > 0] = 0
                 
                 # Inpaint the original image using Telea algorithm
                 _ori_ctx_np = cv2.inpaint(ori_np, inpaint_mask, 5, cv2.INPAINT_TELEA)
