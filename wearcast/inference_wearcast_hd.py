@@ -224,37 +224,19 @@ class WearCastHD:
         # 3. COORDINATE MAPPING
         src_y_all, src_x_all = np.where(~bg_mask)
         src_bbox = [np.min(src_x_all), np.min(src_y_all), np.max(src_x_all), np.max(src_y_all)]
-        logo_bbox = [np.min(x_indices), np.min(y_indices), np.max(x_indices), np.max(y_indices)]
         
         tgt_y_all, tgt_x_all = np.where(gen_fg_mask)
         tgt_bbox = [np.min(tgt_x_all), np.min(tgt_y_all), np.max(tgt_x_all), np.max(tgt_y_all)]
         
-        # Dynamic Alignment: Use UNet's placement if robust, else fallback to global
-        if len(gy) > 200:
-            print(" -> [LOGO_WARP] AI-Guided placement detected. Aligning graphics to UNet features.")
-            tx_min, tx_max = np.min(gx), np.max(gx)
-            ty_min, ty_max = np.min(gy), np.max(gy)
-            
-            # Add small padding to prevent edge cropping
-            pw, ph = (tx_max - tx_min) * 0.05, (ty_max - ty_min) * 0.05
-            dst_pts = np.float32([
-                [tx_min - pw, ty_min - ph], [tx_max + pw, ty_min - ph],
-                [tx_max + pw, ty_max + ph], [tx_min - pw, ty_max + ph]
-            ])
-            src_pts = np.float32([
-                [logo_bbox[0], logo_bbox[1]], [logo_bbox[2], logo_bbox[1]],
-                [logo_bbox[2], logo_bbox[3]], [logo_bbox[0], logo_bbox[3]]
-            ])
-        else:
-            print(" -> [LOGO_WARP] Using global anatomical mapping.")
-            src_pts = np.float32([
-                [src_bbox[0], src_bbox[1]], [src_bbox[2], src_bbox[1]],
-                [src_bbox[2], src_bbox[3]], [src_bbox[0], src_bbox[3]]
-            ])
-            dst_pts = np.float32([
-                [tgt_bbox[0], tgt_bbox[1]], [tgt_bbox[2], tgt_bbox[1]],
-                [tgt_bbox[2], tgt_bbox[3]], [tgt_bbox[0], tgt_bbox[3]]
-            ])
+        print(" -> [LOGO_WARP] Using global anatomical mapping to preserve original proportions.")
+        src_pts = np.float32([
+            [src_bbox[0], src_bbox[1]], [src_bbox[2], src_bbox[1]],
+            [src_bbox[2], src_bbox[3]], [src_bbox[0], src_bbox[3]]
+        ])
+        dst_pts = np.float32([
+            [tgt_bbox[0], tgt_bbox[1]], [tgt_bbox[2], tgt_bbox[1]],
+            [tgt_bbox[2], tgt_bbox[3]], [tgt_bbox[0], tgt_bbox[3]]
+        ])
 
         # 4. WARP & BLEND
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
@@ -671,47 +653,33 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # [FIX: GHOSTING + COLOR CONTAMINATION] (GPU Accelerated)
-            # Neutralize original garment pixels inside the mask region before sending
-            # to the UNet as context (image_ori). 
-            with torch.no_grad():
-                _mask_np_ctx = np.array(mask.resize(image_ori.size, Image.NEAREST)).astype(np.float32) / 255.0
-                mask_t = torch.from_numpy(_mask_np_ctx).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
-                ori_t = torch.from_numpy(np.array(image_ori)).permute(2, 0, 1).unsqueeze(0).float().to(self.gpu_id) / 255.0
+            # [FIX: BACKGROUND INPAINTING FOR CLEAN CONTEXT]
+            # To prevent color contamination from the old shirt without creating ghostly smudges,
+            # we use cv2.inpaint to extrapolate the background colors across the torso mask.
+            # This allows the UNet to cleanly inpaint the background if the new shirt is smaller,
+            # rather than pasting ghostly grey blobs into the final image.
+            ori_np = np.array(image_ori).astype(np.uint8)
+            
+            # CRITICAL FIX: Only inpaint the old garment fabric!
+            # Previously, the entire generation mask (which includes neck and arms) was inpainted,
+            # erasing the person's real skin. This forced the UNet to generate fake skin,
+            # causing severe "double neckline" and floating head artifacts.
+            if hasattr(self, '_cached_parse'):
+                old_garment_mask = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.uint8) * 255
+                # Dilate slightly to ensure old shirt edges don't bleed into the inpaint
+                inpaint_mask = cv2.dilate(old_garment_mask, np.ones((5, 5), np.uint8), iterations=1)
                 
-                # Gaussian Blur Mask (sigma=8.0 -> kernel=33)
-                ctx_alpha = kornia.filters.gaussian_blur2d(mask_t, (33, 33), (8.0, 8.0))
-                ctx_alpha = torch.clamp(ctx_alpha, 0.0, 1.0)
-                
-                # LAB Conversion
-                ori_lab = kornia.color.rgb_to_lab(ori_t)
-                
-                # Neutralize color (A and B channels to 0 in Kornia, since it's centered around 0)
-                ori_lab[:, 1, :, :] = ori_lab[:, 1, :, :] * (1.0 - ctx_alpha[:, 0, :, :])
-                ori_lab[:, 2, :, :] = ori_lab[:, 2, :, :] * (1.0 - ctx_alpha[:, 0, :, :])
-                
-                # Shift luminance to 50 (neutral) and reduce contrast by 50%
-                mask_bool_ctx = ctx_alpha[:, 0, :, :] > 0.5
-                if mask_bool_ctx.sum() > 0:
-                    current_l_median = ori_lab[:, 0, :, :][mask_bool_ctx].median()
-                    # Blur luminance (sigma=6.3 ~ 21px kernel in OpenCV)
-                    blurred_l = kornia.filters.gaussian_blur2d(ori_lab[:, 0:1, :, :], (21, 21), (6.3, 6.3))
-                    
-                    # Neutral target: L=55 (slightly above 50) to avoid over-darkening.
-                    # Contrast retained at 65% (was 50%) for stronger 3D fold structure prior.
-                    new_l = 55.0 + (blurred_l[:, 0, :, :] - current_l_median) * 0.65
-                    ori_lab[:, 0, :, :] = ori_lab[:, 0, :, :] * (1.0 - ctx_alpha[:, 0, :, :]) + new_l * ctx_alpha[:, 0, :, :]
-                    
-                ori_ctx_rgb = kornia.color.lab_to_rgb(ori_lab)
-                ori_ctx_rgb = torch.clamp(ori_ctx_rgb, 0.0, 1.0)
-                
-                _ori_ctx_np = (ori_ctx_rgb[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-                _ctx_alpha_mean = ctx_alpha.mean().item()
+                # Inpaint the original image using Telea algorithm
+                _ori_ctx_np = cv2.inpaint(ori_np, inpaint_mask, 5, cv2.INPAINT_TELEA)
+                _ctx_alpha_mean = np.mean(inpaint_mask > 0)
+            else:
+                _ori_ctx_np = ori_np
+                _ctx_alpha_mean = 0.0
             
             image_ori_constrained = Image.fromarray(_ori_ctx_np)
             debug_save(image_ori_constrained, "debug_phase3_ori_context.jpg")
-            print(" -> [CONTEXT] Neutralized garment region in UNet context (Ghosting + Color Contamination fix, GPU).")
-            print(f" -> [CONTEXT] Mask coverage in context: {100.0 * _ctx_alpha_mean:.2f}% neutralized.")
+            print(" -> [CONTEXT] Applied Content-Aware Context Neutralization (cv2.inpaint) to prevent ghosting.")
+            print(f" -> [CONTEXT] Mask coverage in context: {100.0 * _ctx_alpha_mean:.2f}% inpainted.")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
