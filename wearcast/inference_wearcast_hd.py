@@ -825,24 +825,25 @@ class WearCastHD:
             # Binarize
             binary_mask_t = (dyn_mask_t > 0.5).float()
             
-            # CRITICAL FIX: Erode the binarized mask by 3px BEFORE applying feathering.
-            # This shrinks the compositing mask slightly inward, fixing the "shoulder holes"
-            # caused when the heavily dilated original mask exposes background pixels
-            # that the re-parse didn't cover.
-            binary_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
+            # We want to ensure the new garment FULLY covers the old garment boundaries.
+            # If we erode, we expose the old garment. So we will NOT erode here.
             
             # FIX #4: Seamless Photographic Alpha Blend
-            # 1. Very gentle erosion to avoid bleeds but keep boundary natural
-            eroded_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
-            
-            # 2. Narrower photographic feathering instead of jagged cutouts (prevents background halo)
+            # Apply a Gaussian blur to create a soft feathering effect.
             feather_sigma = 3.0
-            alpha_t = kornia.filters.gaussian_blur2d(eroded_mask_t, (13, 13), (feather_sigma, feather_sigma))
+            alpha_t = kornia.filters.gaussian_blur2d(binary_mask_t, (13, 13), (feather_sigma, feather_sigma))
             
-            # FIX: Restore the solid core so thin sleeves don't become translucent from the blur
-            core_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(5, 5, device=self.gpu_id))
+            # Restore the solid core so the main body doesn't become translucent from the blur.
+            # We use a small 3x3 erosion for the core to ensure the very edges stay feathered.
+            core_mask_t = kornia.morphology.erosion(binary_mask_t, torch.ones(3, 3, device=self.gpu_id))
             alpha_t = torch.maximum(alpha_t, core_mask_t)
             alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
+            
+            # Guarantee the alpha mask covers the original mask AT LEAST WHERE IT MATTERS (the torso).
+            # We don't want to blindly max with input_mask_t because that might paste UNet skin 
+            # over real arms. But for the core torso, we MUST cover the old shirt.
+            # The simplest fix is just to slightly dilate the binary mask before feathering if we want extra safety,
+            # but the 5x5 dilation above is usually enough. Let's see if removing the erosions fixes the black border.
             
             alpha = alpha_t[0, 0].cpu().numpy()
             binary_mask = binary_mask_t[0, 0].cpu().numpy().astype(np.uint8)
