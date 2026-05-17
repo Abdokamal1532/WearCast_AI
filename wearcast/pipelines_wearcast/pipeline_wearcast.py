@@ -565,7 +565,23 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
+                # Latent rescaling REMOVED — not present in original OOTDiffusion.
+                # The scheduler handles normalization. Manual rescaling creates
+                # discontinuities between masked/unmasked regions, causing muted colors.
 
+                # =====================================================================
+                # RESTORED SDEdit latent blending (OOTDiffusion default)
+                # Mixing noisy original-image latents at every step ensures the output
+                # matches the person's original identity and background perfectly.
+                # =====================================================================
+                init_latents_proper = image_ori_latents
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    step_noise = torch.randn_like(latents)
+                    init_latents_proper = self.scheduler.add_noise(
+                        image_ori_latents, step_noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
+                    )
+                latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -887,7 +903,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             else:
                 enc_output = self.vae.encode(image)
                 print(f"[DEBUG] prepare_garm_latents: VAE latent_dist mean={list(enc_output.latent_dist.mean.shape)} std_min={enc_output.latent_dist.std.min().item():.4f}")
-                image_latents = enc_output.latent_dist.mode() * self.vae.config.scaling_factor
+                image_latents = enc_output.latent_dist.mode()
 
             print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype} range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
 
@@ -929,29 +945,38 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
-            # The reference image `image` is already appropriately masked with 127-gray
-            # via PIL composite in inference_wearcast_hd.py (exactly like OOTDiffusion).
-            # So we can encode it directly.
-            if image.dtype != self.vae.dtype:
-                image = image.to(dtype=self.vae.dtype)
+            # Masking the reference image: We MUST zero out the area to be replaced 
+            # so the model knows what to fill in.
+            if mask.device != image.device:
+                mask = mask.to(image.device)
+            
+            mask_vae = torch.nn.functional.interpolate(mask, size=image.shape[-2:])
+            
+            # --- HIGH-ACCURACY FIX: BINARIZATION ---
+            # We must use a HARD (binary) mask for the input to zero out old clothes.
+            # Otherwise, soft edges in the mask leave "ghost" pixels of the old white tank top.
+            mask_vae_bin = (mask_vae > 0.5).to(dtype=image.dtype)
+            one_minus_mask = torch.ones_like(mask_vae_bin, device=image.device) - mask_vae_bin
+            image_masked = image * one_minus_mask
+            
+            if image_masked.dtype != self.vae.dtype:
+                image_masked = image_masked.to(dtype=self.vae.dtype)
 
-            if isinstance(generator, list):
-                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() * self.vae.config.scaling_factor for i in range(batch_size)]
-                image_latents = torch.cat(image_latents, dim=0)
-                
-                if image_ori.dtype != self.vae.dtype:
-                    image_ori = image_ori.to(dtype=self.vae.dtype)
-                image_ori_latents = [self.vae.encode(image_ori[i : i + 1]).latent_dist.mode() * self.vae.config.scaling_factor for i in range(batch_size)]
-                image_ori_latents = torch.cat(image_ori_latents, dim=0)
-            else:
-                image_latents = self.vae.encode(image).latent_dist.mode() * self.vae.config.scaling_factor
-                
-                if image_ori.dtype != self.vae.dtype:
-                    image_ori = image_ori.to(dtype=self.vae.dtype)
-                image_ori_latents = self.vae.encode(image_ori).latent_dist.mode() * self.vae.config.scaling_factor
-                
+            print(f"[DEBUG] prepare_vton_latents: image_masked range=[{image_masked.float().min().item():.4f},{image_masked.float().max().item():.4f}]  masked_region_zero={((image_masked==0).float().mean()*100):.1f}%")
+            enc_vton = self.vae.encode(image_masked)
+            image_latents = enc_vton.latent_dist.mode()
             print(f"[DEBUG] prepare_vton_latents: masked person latents shape={image_latents.shape}  range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
-            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
+
+            if image_ori.dtype != self.vae.dtype:
+                print(f"[DEBUG]  -> Casting original image from {image_ori.dtype} to {self.vae.dtype}")
+                image_ori = image_ori.to(dtype=self.vae.dtype)
+
+            enc_ori = self.vae.encode(image_ori)
+            image_ori_latents = enc_ori.latent_dist.mode()
+            # Scale ONLY the original latents used for background blending to prevent SDEdit explosion.
+            # DO NOT scale image_latents (vton conditioning) as OOTDiffusion UNet expects it unscaled.
+            image_ori_latents = image_ori_latents * self.vae.config.scaling_factor
+            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}] (after scaling)")
 
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))
