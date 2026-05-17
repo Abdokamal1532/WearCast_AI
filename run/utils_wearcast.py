@@ -115,23 +115,9 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     scale_factor = height / 512.0
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
-    # [FIX: COLLAR GENERATION]
-    # Source garments often have colored collars, V-necks, or ribbed collar bands
-    # (e.g., white tee with blue collar in Run 2/3). The old code fully protected
-    # label 18 (Neck) from masking, which prevented the model from rendering any
-    # collar detail from the source garment.
-    # Fix: dilate the neck label and ADD it to the inpaint mask FIRST, then
-    # protect only Face/Hair/Hat — NOT the neck itself.
-    # Phase 4 frequency blending still uses _skin_mask (which includes label 18)
-    # to restore exposed neck skin texture wherever the collar doesn't cover it.
-    neck_pixels = (parse_array == 18).astype(np.uint8) * 255
-    collar_zone = cv2.dilate(neck_pixels, np.ones((13, 13), np.uint8), iterations=1)
-    inpaint_mask = cv2.bitwise_or(inpaint_mask, collar_zone)
-    print(" -> [MASK] Collar zone added to mask (neck label 18 dilated 13px for collar rendering).")
-
-    # 3. Protect Identity & Skin (Face, Hair, Hat ONLY — not Neck)
-    # Neck (label 18) is now part of the generation zone, not the protection zone.
-    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
+    # 3. Protect Identity & Skin (Face, Hair, Hat, and Neck)
+    # Strictly protecting the neck prevents the "double neckline" and skin discoloration issues.
+    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
 
     if category == 'upperbody':
         if is_long_sleeve:
