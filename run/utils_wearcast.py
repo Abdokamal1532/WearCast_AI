@@ -115,9 +115,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     scale_factor = height / 512.0
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
-    # 3. Protect Identity & Skin (Face, Hair, Hat, and Neck)
-    # Strictly protecting the neck prevents the "double neckline" and skin discoloration issues.
-    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
+    # 3. Protect Identity (Face, Hair, Hat)
+    # We do NOT protect the neck (18) strictly here. The UNet must be free to generate a new neck
+    # that seamlessly fits the new collar type (e.g. V-neck).
+    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
 
     if category == 'upperbody':
         if is_long_sleeve:

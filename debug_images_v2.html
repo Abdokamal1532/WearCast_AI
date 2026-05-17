@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WearCast AI - Try-On Debug Visualizer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent: #3b82f6;
+            --accent-glow: rgba(59, 130, 246, 0.5);
+            --border-radius: 16px;
+            --transition: all 0.3s ease;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 2rem;
+            min-height: 100vh;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+            animation: fadeInDown 0.8s ease;
+        }
+
+        h1 {
+            font-weight: 800;
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(to right, #60a5fa, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        p.subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: 200px repeat(3, 1fr);
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .column-header {
+            font-weight: 600;
+            font-size: 1.1rem;
+            text-align: center;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: var(--border-radius);
+            backdrop-filter: blur(10px);
+            position: sticky;
+            top: 1rem;
+            z-index: 10;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .row-header {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            font-weight: 600;
+            color: var(--text-secondary);
+            padding-right: 1rem;
+            text-align: right;
+            font-size: 1.1rem;
+        }
+
+        .image-card {
+            background: var(--card-bg);
+            border-radius: var(--border-radius);
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: var(--transition);
+            border: 1px solid rgba(255,255,255,0.05);
+            cursor: pointer;
+        }
+
+        .image-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2), 0 0 15px var(--accent-glow);
+            border-color: rgba(255,255,255,0.2);
+        }
+
+        .image-card img {
+            width: 100%;
+            height: auto;
+            display: block;
+            object-fit: cover;
+            aspect-ratio: 3/4;
+            transition: transform 0.5s ease;
+        }
+
+        .image-card:hover img {
+            transform: scale(1.03);
+        }
+
+        .overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+            padding: 1rem;
+            opacity: 0;
+            transition: var(--transition);
+        }
+
+        .image-card:hover .overlay {
+            opacity: 1;
+        }
+
+        .tag {
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(4px);
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        /* Modal for full screen view */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(5px);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .modal.active {
+            display: flex;
+            opacity: 1;
+        }
+
+        .modal img {
+            max-width: 90%;
+            max-height: 90vh;
+            border-radius: 8px;
+            box-shadow: 0 0 30px rgba(0,0,0,0.5);
+            transform: scale(0.95);
+            transition: transform 0.3s ease;
+        }
+
+        .modal.active img {
+            transform: scale(1);
+        }
+
+        .close-modal {
+            position: absolute;
+            top: 20px;
+            right: 30px;
+            color: white;
+            font-size: 2rem;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+
+        .close-modal:hover {
+            color: var(--accent);
+        }
+
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 1024px) {
+            .comparison-grid {
+                grid-template-columns: 120px repeat(3, 1fr);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .comparison-grid {
+                grid-template-columns: 1fr;
+            }
+            .row-header {
+                justify-content: flex-start;
+                text-align: left;
+                padding-top: 1rem;
+                padding-bottom: 0.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>WearCast AI Fidelity Optimization</h1>
+        <p class="subtitle">A visual comparison of different generation runs</p>
+    </header>
+
+    <div class="container">
+        <div class="comparison-grid">
+            <!-- Headers -->
+            <div></div> <!-- Empty top-left cell -->
+            <div class="column-header">Run 1<br><span style="font-size: 0.75rem; color: #94a3b8; font-weight: 400;">9c9b9300-cbb4-43cd...</span></div>
+            <div class="column-header">Run 2<br><span style="font-size: 0.75rem; color: #94a3b8; font-weight: 400;">75b4bef1-6274-41b3...</span></div>
+            <div class="column-header">Run 3<br><span style="font-size: 0.75rem; color: #94a3b8; font-weight: 400;">c18442ae-ea30-45b8...</span></div>
+
+            <!-- Hard Mask -->
+            <div class="row-header">Phase 1: Hard Mask</div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_9c9b9300-cbb4-43cd-af46-a6fbeb682232/debug_phase1_hard_mask.jpg" alt="Run 1 Hard Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Hard Mask</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_75b4bef1-6274-41b3-bc9a-00b396e260ab/debug_phase1_hard_mask.jpg" alt="Run 2 Hard Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Hard Mask</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_c18442ae-ea30-45b8-ae79-49a73ca0412b/debug_phase1_hard_mask.jpg" alt="Run 3 Hard Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Hard Mask</span></div>
+            </div>
+
+            <!-- Soft Mask -->
+            <div class="row-header">Phase 1: Soft Mask</div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_9c9b9300-cbb4-43cd-af46-a6fbeb682232/debug_phase1_soft_mask.jpg" alt="Run 1 Soft Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Soft Mask</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_75b4bef1-6274-41b3-bc9a-00b396e260ab/debug_phase1_soft_mask.jpg" alt="Run 2 Soft Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Soft Mask</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_c18442ae-ea30-45b8-ae79-49a73ca0412b/debug_phase1_soft_mask.jpg" alt="Run 3 Soft Mask" loading="lazy">
+                <div class="overlay"><span class="tag">Soft Mask</span></div>
+            </div>
+
+            <!-- Masked Person -->
+            <div class="row-header">Phase 3: Masked Person</div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_9c9b9300-cbb4-43cd-af46-a6fbeb682232/debug_phase3_masked_person.jpg" alt="Run 1 Masked Person" loading="lazy">
+                <div class="overlay"><span class="tag">Masked Person</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_75b4bef1-6274-41b3-bc9a-00b396e260ab/debug_phase3_masked_person.jpg" alt="Run 2 Masked Person" loading="lazy">
+                <div class="overlay"><span class="tag">Masked Person</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_c18442ae-ea30-45b8-ae79-49a73ca0412b/debug_phase3_masked_person.jpg" alt="Run 3 Masked Person" loading="lazy">
+                <div class="overlay"><span class="tag">Masked Person</span></div>
+            </div>
+
+            <!-- Comparison -->
+            <div class="row-header">Phase 4: Comparison</div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_9c9b9300-cbb4-43cd-af46-a6fbeb682232/debug_phase4_comparison.jpg" alt="Run 1 Comparison" loading="lazy">
+                <div class="overlay"><span class="tag">Comparison</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_75b4bef1-6274-41b3-bc9a-00b396e260ab/debug_phase4_comparison.jpg" alt="Run 2 Comparison" loading="lazy">
+                <div class="overlay"><span class="tag">Comparison</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_c18442ae-ea30-45b8-ae79-49a73ca0412b/debug_phase4_comparison.jpg" alt="Run 3 Comparison" loading="lazy">
+                <div class="overlay"><span class="tag">Comparison</span></div>
+            </div>
+
+            <!-- Final Output -->
+            <div class="row-header" style="color: var(--text-primary); font-size: 1.3rem;">Final Output</div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_9c9b9300-cbb4-43cd-af46-a6fbeb682232/debug_final_output.jpg" alt="Run 1 Final Output" loading="lazy">
+                <div class="overlay"><span class="tag" style="background: #3b82f6;">Final Output</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_75b4bef1-6274-41b3-bc9a-00b396e260ab/debug_final_output.jpg" alt="Run 2 Final Output" loading="lazy">
+                <div class="overlay"><span class="tag" style="background: #3b82f6;">Final Output</span></div>
+            </div>
+            <div class="image-card" onclick="openModal(this)">
+                <img src="debug_c18442ae-ea30-45b8-ae79-49a73ca0412b/debug_final_output.jpg" alt="Run 3 Final Output" loading="lazy">
+                <div class="overlay"><span class="tag" style="background: #3b82f6;">Final Output</span></div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Modal -->
+    <div class="modal" id="imageModal" onclick="closeModal()">
+        <span class="close-modal">&times;</span>
+        <img id="modalImg" src="" alt="Full Screen Image">
+    </div>
+
+    <script>
+        function openModal(card) {
+            const img = card.querySelector('img');
+            const modal = document.getElementById('imageModal');
+            const modalImg = document.getElementById('modalImg');
+            
+            modalImg.src = img.src;
+            modal.style.display = 'flex';
+            // Slight delay to allow display: flex to apply before transitioning opacity
+            setTimeout(() => {
+                modal.classList.add('active');
+            }, 10);
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('imageModal');
+            modal.classList.remove('active');
+            setTimeout(() => {
+                modal.style.display = 'none';
+            }, 300);
+        }
+
+        // Close on ESC key
+        document.addEventListener('keydown', function(event) {
+            if (event.key === "Escape") {
+                closeModal();
+            }
+        });
+    </script>
+</body>
+</html>
