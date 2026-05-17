@@ -581,6 +581,13 @@ class WearCastHD:
             mask_np_clean = (mask_np_clean > 127).astype(np.uint8) * 255
             mask = Image.fromarray(mask_np_clean)
             print(f" -> Mask after bilinear resize and re-binarization: {mask.size}")
+            
+            # --- FIX: EXACT OOTD PREPROCESSING ---
+            # OOTD requires the person image to have the garment area replaced with 127-gray BEFORE encoding.
+            mask_gray_np = (mask_np_clean > 127).astype(np.uint8) * 127
+            mask_gray = Image.fromarray(mask_gray_np)
+            image_vton = Image.composite(mask_gray, image_vton, mask)
+            print(f" -> [PREPROCESS] Person image (image_vton) garment area replaced with 127-gray")
 
             # Save mask debug images
             debug_save(mask, "debug_phase1_hard_mask.jpg")
@@ -691,8 +698,8 @@ class WearCastHD:
             t_unet_start = time.time()
             images = self.pipe(
                 prompt_embeds=prompt_embeds,
-                image_garm=image_garm,   # RAW garment (not background-replaced garm_proc)
-                image_vton=image_vton,
+                image_garm=garm_proc,    # Garment with 128-gray background (OOTD requirement)
+                image_vton=image_vton,   # Masked person image (127-gray replacement)
                 mask=mask,
                 image_ori=image_ori,     # Original person image (no inpainting)
                 num_inference_steps=final_steps,

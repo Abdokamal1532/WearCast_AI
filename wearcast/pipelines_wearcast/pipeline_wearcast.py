@@ -961,38 +961,29 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                     f" size of {batch_size}. Make sure the batch size matches the length of the generators."
                 )
 
-            # Masking the reference image: We MUST zero out the area to be replaced 
-            # so the model knows what to fill in.
-            if mask.device != image.device:
-                mask = mask.to(image.device)
-            
-            mask_vae = torch.nn.functional.interpolate(mask, size=image.shape[-2:])
-            
-            # --- HIGH-ACCURACY FIX: BINARIZATION ---
-            # We must use a HARD (binary) mask for the input to zero out old clothes.
-            # Otherwise, soft edges in the mask leave "ghost" pixels of the old white tank top.
-            mask_vae_bin = (mask_vae > 0.5).to(dtype=image.dtype)
-            one_minus_mask = torch.ones_like(mask_vae_bin, device=image.device) - mask_vae_bin
-            image_masked = image * one_minus_mask
-            
-            if image_masked.dtype != self.vae.dtype:
-                image_masked = image_masked.to(dtype=self.vae.dtype)
+            # The reference image `image` is already appropriately masked with 127-gray
+            # via PIL composite in inference_wearcast_hd.py (exactly like OOTDiffusion).
+            # So we can encode it directly.
+            if image.dtype != self.vae.dtype:
+                image = image.to(dtype=self.vae.dtype)
 
-            print(f"[DEBUG] prepare_vton_latents: image_masked range=[{image_masked.float().min().item():.4f},{image_masked.float().max().item():.4f}]  masked_region_zero={((image_masked==0).float().mean()*100):.1f}%")
-            enc_vton = self.vae.encode(image_masked)
-            image_latents = enc_vton.latent_dist.mode()
+            if isinstance(generator, list):
+                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_latents = torch.cat(image_latents, dim=0)
+                
+                if image_ori.dtype != self.vae.dtype:
+                    image_ori = image_ori.to(dtype=self.vae.dtype)
+                image_ori_latents = [self.vae.encode(image_ori[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_ori_latents = torch.cat(image_ori_latents, dim=0)
+            else:
+                image_latents = self.vae.encode(image).latent_dist.mode()
+                
+                if image_ori.dtype != self.vae.dtype:
+                    image_ori = image_ori.to(dtype=self.vae.dtype)
+                image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
+                
             print(f"[DEBUG] prepare_vton_latents: masked person latents shape={image_latents.shape}  range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
-
-            if image_ori.dtype != self.vae.dtype:
-                print(f"[DEBUG]  -> Casting original image from {image_ori.dtype} to {self.vae.dtype}")
-                image_ori = image_ori.to(dtype=self.vae.dtype)
-
-            enc_ori = self.vae.encode(image_ori)
-            image_ori_latents = enc_ori.latent_dist.mode()
-            # Scale ONLY the original latents used for background blending to prevent SDEdit explosion.
-            # DO NOT scale image_latents (vton conditioning) as OOTDiffusion UNet expects it unscaled.
-            image_ori_latents = image_ori_latents * self.vae.config.scaling_factor
-            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}] (after scaling)")
+            print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
 
         mask = torch.nn.functional.interpolate(
             mask, size=(image_latents.size(-2), image_latents.size(-1))
