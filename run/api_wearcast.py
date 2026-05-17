@@ -4,7 +4,12 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # --- KAGGLE COMPATIBILITY PATCHES ---
 import huggingface_hub
-huggingface_hub.utils.logging.set_verbosity_error()
+try:
+    import huggingface_hub.utils.logging as hf_logging
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
+
 if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
