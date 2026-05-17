@@ -704,6 +704,13 @@ class WearCastHD:
                 old_garment_mask = ((parse == 4) | (parse == 7)).astype(np.uint8) * 255
                 skin_mask = ((parse == 11) | (parse == 14) | (parse == 15) | (parse == 18)).astype(np.uint8) * 255
                 
+                # [FIX]: Fill holes in the garment mask!
+                # The human parser often misclassifies large graphics/logos as "background".
+                # If we don't fill these holes, the old logo isn't erased and bleeds into the new image,
+                # causing double logos and confusing the AI placement tracker.
+                contours, _ = cv2.findContours(old_garment_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(old_garment_mask, contours, -1, 255, thickness=cv2.FILLED)
+                
                 # Dilate heavily (12px radius) to capture all protruding fabric/white edges
                 # that the parser missed, which otherwise bleed inward and cause "ghostly outlines".
                 inpaint_mask = cv2.dilate(old_garment_mask, np.ones((25, 25), np.uint8), iterations=1)
@@ -851,23 +858,9 @@ class WearCastHD:
             alpha_t = torch.maximum(alpha_t, core_mask_t)
             alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
             
-            # Guarantee the alpha mask covers the original shirt torso.
-            # If the new garment is tighter/smaller, the UNet filled the gap with fake background.
-            # We MUST paste that fake background to hide the old shirt.
-            if hasattr(self, '_cached_parse'):
-                old_torso = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.float32)
-                old_torso_t = torch.from_numpy(old_torso).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
-                old_torso_t = F.interpolate(old_torso_t, size=(raw_generated.size[1], raw_generated.size[0]), mode='nearest')
-                
-                # Erode the old torso slightly by 1px so we don't accidentally paste UNet background
-                # slightly outside the old shirt if the parse was imprecise.
-                old_torso_t = kornia.morphology.erosion(old_torso_t, torch.ones(3, 3, device=self.gpu_id))
-                
-                # Soften the boundary of this forced mask so we don't get a sharp seam
-                old_torso_soft = kornia.filters.gaussian_blur2d(old_torso_t, (9, 9), (2.0, 2.0))
-                
-                alpha_t = torch.maximum(alpha_t, old_torso_soft)
-                alpha_t = torch.clamp(alpha_t, 0.0, 1.0)
+            # Guarantee the alpha mask covers the new generated shirt.
+            # We no longer force it to cover the old shirt because ori_final
+            # (image_ori_constrained) already has the old shirt perfectly inpainted!
             
             alpha = alpha_t[0, 0].cpu().numpy()
             binary_mask = binary_mask_t[0, 0].cpu().numpy().astype(np.uint8)
