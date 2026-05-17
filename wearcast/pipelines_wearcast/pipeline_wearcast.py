@@ -566,6 +566,27 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # =====================================================================
+                # [FIX LATENT DRIFT] Adaptive Masked-Region Latent Rescaling
+                # Lower threshold 1.02 -> 1.01: case 2a drifted to 1.04 because the
+                # masked-region std was just below 1.02 each step, never triggering.
+                # Also add global std fallback for cases with a very sparse latent mask.
+                # =====================================================================
+                _mask_flat = mask_latents[:latents.shape[0]]  # align batch dim
+                _mask_bool = (_mask_flat > 0.5).expand_as(latents)
+                _masked_vals = latents[_mask_bool]
+                _global_std = latents.float().std().item()
+                if _masked_vals.numel() > 16:  # sanity: need enough samples
+                    _m_std = _masked_vals.float().std().item()
+                    # Use the higher of masked-region or global std to decide whether to rescale
+                    _drift_std = _m_std if _m_std > _global_std else (_global_std if _global_std > 1.02 else _m_std)
+                    if _drift_std > 1.01:
+                        _scale = 1.0 / _drift_std
+                        latents = torch.where(_mask_bool, latents * _scale, latents)
+                        if i % 5 == 0:
+                            print(f"   [RESCALE] Step {i}: masked_std={_m_std:.4f} global_std={_global_std:.4f} → rescaled by {_scale:.4f}")
+
+
+                # =====================================================================
                 # RESTORED SDEdit latent blending (OOTDiffusion default)
                 # Mixing noisy original-image latents at every step ensures the output
                 # matches the person's original identity and background perfectly.
