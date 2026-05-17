@@ -68,6 +68,7 @@ class WearCastHD:
             MODEL_PATH,
             subfolder="vae",
             torch_dtype=torch.float32,
+            use_safetensors=False,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -672,10 +673,15 @@ class WearCastHD:
                 mem_before = torch.cuda.memory_allocated(0) / 1e9
                 print(f" -> GPU VRAM before UNet call: {mem_before:.2f} GB")
 
+            # FIX #6 (Correction): Apply mild sharpening to the actual garment passed to the pipeline
+            # to preserve fine details without creating crunchy edge artifacts in the VAE.
+            from PIL import ImageFilter
+            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
+
             t_unet_start = time.time()
             images = self.pipe(
                 prompt_embeds=prompt_embeds,
-                image_garm=garm_proc,
+                image_garm=garm_proc_for_pipeline,
                 image_vton=image_vton,
                 mask=mask,
                 image_ori=image_ori_constrained, # USE CONSTRAINED SILHOUETTE
@@ -715,56 +721,52 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- FIX #1: Dynamic Output Masking (The Cape Killer) ---
-        # Instead of using the input mask (which has a huge background "box"),
-        # we re-parse the generated image to find the ACTUAL shirt pixels.
-        print(" -> Running Dynamic Re-Parsing for clean mask...")
+        # --- FIX #1: Unified Dynamic Alpha Mask ---
+        # Previously we restricted the mask to ONLY the newly generated shirt pixels.
+        # This caused a huge bug: if the new shirt was smaller than the old shirt,
+        # the UNet generated bare arms or background, but they weren't pasted,
+        # leaving the OLD shirt sleeves sticking out like a ghost!
+        # Now we use the highly-optimized original inpaint mask, which safely
+        # replaces the entire old garment region with the UNet's output.
+        print(" -> Applying Unified Alpha Mask (to prevent ghost sleeves)...")
         t_reparse = time.time()
-        parse_new_pil, _ = self.parsing_model(raw_generated)
-        parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
-        
-        # Label 4 = upper_clothes, Label 7 = dress
-        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
-        
-        # --- FIX #20: Strict Dynamic Bounding ---
-        # Reduces relaxation kernel and ensures result is strictly inside the silhouette.
         if hasattr(self, '_cached_hard_mask'):
             input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-            # Reduced to 5x5 for tighter fit
-            kernel_relax = np.ones((5, 5), np.uint8)
-            relaxed_mask = cv2.dilate(input_mask_np, kernel_relax, iterations=1)
+            dynamic_mask = input_mask_np
             
-            # MUST stay within person silhouette
+            # Reintroduced silhouette protection but with a 15px buffer to allow baggy clothes
+            # while still blocking distant background artifacts.
             if hasattr(self, '_cached_parse'):
-                sil = (self._cached_parse > 0).astype(np.float32)
-                sil = cv2.resize(sil, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-                relaxed_mask = relaxed_mask * sil
-                
-            dynamic_mask = dynamic_mask * relaxed_mask
-            print(" -> [STRICT] Applied tight silhouette boundary constraint.")
-
-        # Refine the dynamic mask slightly
-        dynamic_mask = cv2.dilate(dynamic_mask, np.ones((5, 5), np.uint8), iterations=1)
-        
+                sil = (self._cached_parse > 0).astype(np.uint8)
+                sil_dilated = cv2.dilate(sil, np.ones((15, 15), np.uint8), iterations=1)
+                sil_mask = cv2.resize(sil_dilated, raw_generated.size, interpolation=cv2.INTER_NEAREST)
+                dynamic_mask = dynamic_mask * sil_mask.astype(np.float32)
+        else:
+            # Fallback
+            parse_new_pil, _ = self.parsing_model(raw_generated)
+            parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
+            dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+            
         # Binarize
         binary_mask = (dynamic_mask > 0.5).astype(np.uint8)
         
         # FIX #4: Seamless Photographic Alpha Blend
-        # 1. Very gentle erosion to avoid bleeds but keep boundary natural
-        kernel_erode = np.ones((3, 3), np.uint8)
-        eroded_mask = cv2.erode(binary_mask, kernel_erode, iterations=1) 
+        # 1. Dilate the mask slightly to GUARANTEE the old shirt is 100% swallowed.
+        kernel_dilate = np.ones((5, 5), np.uint8)
+        dilated_mask = cv2.dilate(binary_mask, kernel_dilate, iterations=1) 
         
-        # 2. Wide, soft photographic feathering instead of jagged cutouts
-        feather_sigma = 15.0
-        alpha = cv2.GaussianBlur(eroded_mask.astype(np.float32), (0, 0), feather_sigma)
+        # 2. Small photographic feathering for smooth edges (no massive transparent bands)
+        feather_sigma = 3.0
+        alpha = cv2.GaussianBlur(dilated_mask.astype(np.float32), (0, 0), feather_sigma)
         
-        # No more forcing the core_mask to 1.0. The wide blur naturally transitions.
+        # Force the core mask to be opaque so old clothes NEVER show through
+        alpha = np.maximum(alpha, binary_mask.astype(np.float32))
         alpha = np.clip(alpha, 0.0, 1.0)
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
-        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
+        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (dilated for full coverage)")
 
 
         # --- Pre-compositing diagnostics ---
@@ -783,14 +785,16 @@ class WearCastHD:
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
 
-        # --- STUDIO MASTER: AI-Native Rendering ---
-        # [MASTER PLAN] We NO LONGER manually warp logos if we want AI-Native results.
-        # This prevents "Double Logos" and allows the UNet to render graphics organically.
-        # if is_complex:
-        #    print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
-        #    blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-        #    blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
-        #    gen_arr = np.array(blended_pil).astype(np.float32)
+        # --- Logo Warping: DISABLED ---
+        # The perspective transform maps the FULL product image bounding box onto the
+        # person at mismatched scale. This causes 500-1000% pattern coverage and
+        # creates psychedelic/glitch artifacts on top of the UNet's correct output.
+        # The LAB color transfer (±28 cap) is sufficient to fix color fidelity.
+        # Re-enable only after apply_logo_warping is rewritten with TPS/optical-flow
+        # warping guided by body keypoints rather than a naive perspective bounding box.
+        # if is_complex and hasattr(self, '_cached_keypoints'):
+        #     ...
+        print(" -> [LOGO] Logo warping disabled (bounding-box perspective causes glitch artifacts).")
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
         if hasattr(self, '_skin_mask'):
@@ -942,43 +946,68 @@ class WearCastHD:
         # 4. Asymmetric Gamut-Aware L-Channel Transfer
         corrected_lab = gen_lab.copy()
         source_l = gen_lab[:, :, 0]
-        shift_l = target_median[0] - source_median[0]
+
+        print(f"   [COLOR] Source fabric L (median): {source_median[0]:.1f}  (Target: {target_median[0]:.1f})")
+
+        # [FIX] Overhauled LAB Shift Logic
+        # We pivot purely around the median, as logos rarely exceed 50% of the surface area.
+        source_fabric_l = source_median[0]
+        raw_shift_l = target_median[0] - source_fabric_l
+        
+        # Increased cap to 80.0 to allow white garments to reach target luminance,
+        # but the "Logo Protect" logic will prevent flat blowouts.
+        MAX_L_SHIFT = 80.0
+        shift_l = np.clip(raw_shift_l, -MAX_L_SHIFT, MAX_L_SHIFT)
+        print(f"   [DEBUG COLOR] Shift Required: {raw_shift_l:.1f}, Shift Allowed: {shift_l:.1f} (Cap: ±{MAX_L_SHIFT})")
         
         if shift_l < 0:
-            # Darkening (e.g. Black shirt)
-            # Shadows approach 0 — decay the shift to avoid full crush.
-            # Highlights are moving away from 255 — full shift preserves 3D fold depth.
-            multiplier_l = np.where(
-                source_l <= source_median[0],
-                source_l / (source_median[0] + 1e-6),  # Proportional decay for shadows
-                1.0  # Full shift for highlights
-            )
-            # Protect pure-white logo pixels (L > 200) — avoid turning them grey
-            logo_protect = np.clip((240.0 - source_l) / 40.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            # Darkening (Target is dark)
+            # Protect bright pixels (white logos/graphics) from being darkened.
+            l_diff = np.clip(source_l - source_fabric_l, 0, 255)
+            
+            # If pixel is < 15 units brighter than fabric: it's a normal highlight/wrinkle. (protect=1.0 -> full shift)
+            # If pixel is > 45 units brighter than fabric: it's a logo. (protect=0.0 -> zero shift)
+            multiplier_l = np.clip(1.0 - (l_diff - 15.0) / 30.0, 0.0, 1.0)
+            
+            # Debug
+            protect_active = multiplier_l[source_l > source_fabric_l + 15.0]
+            if len(protect_active) > 0:
+                print(f"   [DEBUG COLOR] Logo Protect (Darkening) applied to {len(protect_active)} pixels. Mean Factor: {protect_active.mean():.2f}")
+                
         else:
-            # Brightening (e.g. White shirt)
-            # Highlights approach 255 — decay to prevent blowout.
-            # Shadows are moving away from 0 — full shift preserves 3D fold depth.
-            multiplier_l = np.where(
-                source_l >= source_median[0],
-                (255.0 - source_l) / (255.0 - source_median[0] + 1e-6),  # Decay highlights
-                1.0  # Full shift for shadows
-            )
-            # Protect pure-black logo pixels (L < 50) — avoid brightening them
-            logo_protect = np.clip((source_l - 10.0) / 40.0, 0.0, 1.0)
-            multiplier_l = np.minimum(multiplier_l, logo_protect)
+            # Brightening (Target is bright)
+            # Protect dark pixels (black logos/graphics) from being brightened.
+            l_diff = np.clip(source_fabric_l - source_l, 0, 255)
+            
+            # If pixel is < 20 units darker than fabric: it's a normal shadow. (protect=1.0 -> full shift)
+            # If pixel is > 50 units darker than fabric: it's a logo. (protect=0.0 -> zero shift)
+            multiplier_l = np.clip(1.0 - (l_diff - 20.0) / 30.0, 0.0, 1.0)
+            
+            # Debug
+            protect_active = multiplier_l[source_l < source_fabric_l - 20.0]
+            if len(protect_active) > 0:
+                print(f"   [DEBUG COLOR] Logo Protect (Brightening) applied to {len(protect_active)} pixels. Mean Factor: {protect_active.mean():.2f}")
             
         shifted_l = source_l + shift_l * multiplier_l
         
-        # FIX #1b: Reduced shadow soft-clip floor from L=30 → L=10
-        # OLD floor of 30 was preventing true black (L≈5-15) from ever being reached.
+        # [FIX C] Post-Process Highlight Stretch for Pure Black Garments
+        # If target is dark but source had white logos, UNet often generates them dim (L=130).
+        if target_median[0] < 100:
+            target_brightest = np.percentile(target_l, 98)
+            if target_brightest > 180:
+                current_brightest = np.percentile(shifted_l[mask_bool], 98)
+                if current_brightest < 200:
+                    stretch_factor = 230.0 / (current_brightest + 1e-6)
+                    print(f"   [DEBUG COLOR] Stretching Highlights! Target had L={target_brightest:.1f}, output only had L={current_brightest:.1f}. Factor={stretch_factor:.2f}")
+                    stretch_mask = shifted_l > (source_fabric_l + 30)
+                    shifted_l[stretch_mask] = shifted_l[stretch_mask] * stretch_factor
+        
+        # Gamut roll-off
         high_mask = shifted_l > 220
         if high_mask.sum() > 0:
             excess = shifted_l[high_mask] - 220
             shifted_l[high_mask] = 220 + 35.0 * (1.0 - np.exp(-excess / 35.0))
             
-        # Shadows: compress below 10 (not 30), allowing near-black fabric
         low_mask = shifted_l < 10
         if low_mask.sum() > 0:
             deficit = 10 - shifted_l[low_mask]
@@ -987,9 +1016,18 @@ class WearCastHD:
         corrected_lab[mask_bool, 0] = shifted_l[mask_bool]
         
         # A and B Channels (Color)
-        # Protect colorful graphics using pure A/B distance from the source neutral
+        # [FIX] Protect logos via L-channel contrast (not just A/B distance).
+        # White-on-black and black-on-white logos are both NEUTRAL in A/B space
+        # (A≈128, B≈128), so old ab_diff approach gave them zero protection.
+        # New approach: pixels with L far from the fabric median = logo → protect.
+        l_diff_from_fabric = np.abs(source_l - source_median[0])
+        # High L-diff (bright pixel on dark shirt, or dark pixel on light shirt) → logo → low weight (protected)
+        logo_weight = np.clip(1.0 - (l_diff_from_fabric / 80.0), 0.0, 1.0)
+        # Also keep original A/B protection for colorful graphics (unchanged)
         ab_diff = np.sqrt(np.sum((gen_lab[:, :, 1:] - source_median[1:])**2, axis=2))
-        color_transfer_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        ab_weight = np.clip((40.0 - ab_diff) / 20.0, 0.0, 1.0)
+        # Combined: pixel must pass BOTH tests to receive full color transfer
+        color_transfer_weight = np.minimum(logo_weight, ab_weight)
         
         for i in [1, 2]:
             source_c = gen_lab[:, :, i]
