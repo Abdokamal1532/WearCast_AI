@@ -1,3 +1,10 @@
+import warnings
+try:
+    from urllib3.exceptions import DependencyWarning
+    warnings.filterwarnings("ignore", category=DependencyWarning)
+except ImportError:
+    pass
+
 import requests
 import time
 import json
@@ -5,13 +12,6 @@ import urllib3
 import os
 import argparse
 import glob
-
-import warnings
-try:
-    from requests.packages.urllib3.exceptions import DependencyWarning
-    warnings.filterwarnings("ignore", category=DependencyWarning)
-except ImportError:
-    pass
 
 # Suppress insecure request warnings for testing
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

@@ -1,5 +1,10 @@
+import os
+# Suppress TF and cuDNN C++ factory registration warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 # --- KAGGLE COMPATIBILITY PATCHES ---
 import huggingface_hub
+huggingface_hub.utils.logging.set_verbosity_error()
 if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
@@ -11,7 +16,6 @@ try:
 except ImportError:
     pass
 
-import os
 import sys
 import time
 import warnings
