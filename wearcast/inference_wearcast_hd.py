@@ -878,21 +878,49 @@ class WearCastHD:
         # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
         # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
         # FIX: Use a GARMENT-ONLY mask for color transfer (parse label 4|7), NOT the full alpha mask.
-        # Previously, passing the full alpha (which bleeds into neck/shoulders) was darkening/lightening skin.
         if hasattr(self, '_cached_parse'):
             _garment_only_np = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
             _garment_only_np = cv2.resize(_garment_only_np, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-            color_transfer_mask = cv2.GaussianBlur(_garment_only_np, (5, 5), 0)  # soft 5px edge only
+            color_transfer_mask = cv2.GaussianBlur(_garment_only_np, (5, 5), 0)
         else:
             color_transfer_mask = alpha  # fallback
-        gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, color_transfer_mask)
-        # Get approximate target luminance from garment image center region
+
+        # --- INTELLIGENT LUMINANCE-AWARE COLOR BLEND ---
+        # Calculate the REAL foreground luminance (excluding the white background of garment image).
+        # Previously, _garm_lum included the white BG, making a black shirt appear as luminance=163 
+        # instead of its true value (~15-20). This caused the color transfer to be totally wrong.
         _garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
-        _garm_lum = float((_garm_np[:, :, 0]*0.299 + _garm_np[:, :, 1]*0.587 + _garm_np[:, :, 2]*0.114).mean())
-        COLOR_BLEND = 0.85 if (_garm_lum > 200 or _garm_lum < 50) else 0.70
-        print(f" -> [COLOR] Garment luminance={_garm_lum:.1f}, blend strength={COLOR_BLEND:.0%} (garment-only mask)")
-        # Apply color correction ONLY inside the garment region (mix corrected+original)
-        gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
+        _garm_full_lum = float((_garm_np[:, :, 0]*0.299 + _garm_np[:, :, 1]*0.587 + _garm_np[:, :, 2]*0.114).mean())
+        _fg_mask_garm = ~np.all(_garm_np >= 240, axis=-1)
+        _fg_pixels_garm = _garm_np[_fg_mask_garm]
+        if len(_fg_pixels_garm) > 500:
+            _garm_fg_lum = float((_fg_pixels_garm[:, 0]*0.299 + _fg_pixels_garm[:, 1]*0.587 + _fg_pixels_garm[:, 2]*0.114).mean())
+        else:
+            _garm_fg_lum = _garm_full_lum
+
+        # Decision logic based on TRUE foreground luminance:
+        # - Very dark garments (L < 70): The UNet already renders black/dark correctly.
+        #   Applying color transfer would destroy logo text contrast (LOVE text disappears).
+        #   → SKIP color transfer (COLOR_BLEND = 0.0).
+        # - Very bright/white garments (L > 190): gentle push only.
+        #   → COLOR_BLEND = 0.35 to fix slight grayness without washing out.
+        # - Mid-tone garments: moderate correction.
+        #   → COLOR_BLEND = 0.50
+        if _garm_fg_lum < 70:
+            COLOR_BLEND = 0.0  # Skip — trust UNet for dark/black garments
+        elif _garm_fg_lum > 190:
+            COLOR_BLEND = 0.35  # Gentle for whites
+        else:
+            COLOR_BLEND = 0.50  # Moderate for mid-tones
+
+        print(f" -> [COLOR] Garment FG lum={_garm_fg_lum:.1f} (full={_garm_full_lum:.1f}), blend strength={COLOR_BLEND:.0%}")
+        
+        if COLOR_BLEND > 0.0:
+            gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, color_transfer_mask)
+            gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
+            print(f" -> [COLOR] Color transfer applied.")
+        else:
+            print(f" -> [COLOR] Color transfer SKIPPED (dark garment — trusting UNet output).")
 
         # --- Final Compositing ---
         # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
