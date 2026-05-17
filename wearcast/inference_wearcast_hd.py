@@ -844,23 +844,26 @@ class WearCastHD:
             # Refine the dynamic mask slightly
             dyn_mask_t = kornia.morphology.dilation(dyn_mask_t, torch.ones(5, 5, device=self.gpu_id))
             
-            # --- SEMANTIC MASKING (NEW ARCHITECTURE) ---
-            # We abandon the noisy attention maps and build a pure semantic mask.
-            # We want to paste EXACTLY the new garment and any new skin (neck/arms) the UNet generated.
+            # --- STRICT SEMANTIC FILL (NEW ARCHITECTURE) ---
             if hasattr(self, '_cached_parse'):
-                # 1. New Garment (4,7) + New Neck (18) + New Arms (14,15)
-                new_elements = ((parse_new == 4) | (parse_new == 7) | (parse_new == 18) | (parse_new == 14) | (parse_new == 15)).astype(np.float32)
+                # 1. New Garment exactly as generated
+                new_garment = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
                 
-                # 2. We also must cover the old garment's area so we don't leave holes,
-                # but ONLY if the UNet actually generated something there (not background).
-                old_garment = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.float32)
-                unet_not_bg = (parse_new > 0).astype(np.float32)
+                # 2. Old Garment (dilated slightly to cover seams)
+                old_garment = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.uint8)
+                old_garment_dilated = cv2.dilate(old_garment, np.ones((7, 7), np.uint8), iterations=1).astype(np.float32)
                 
-                # Semantic mask = New Elements OR (Old Garment Area * UNet Foreground)
-                semantic_mask = np.maximum(new_elements, old_garment * unet_not_bg)
+                # 3. UNet Skin (Face, Neck, Arms)
+                unet_skin = ((parse_new == 11) | (parse_new == 14) | (parse_new == 15) | (parse_new == 18)).astype(np.float32)
+                
+                # 4. Fill Gaps: We only paste the UNet's skin where the OLD garment used to be!
+                fill_skin = unet_skin * old_garment_dilated
+                
+                # Final strict mask
+                semantic_mask = np.maximum(new_garment, fill_skin)
                 
                 # Soften the mask for a seamless edge
-                alpha = cv2.GaussianBlur((semantic_mask * 255).astype(np.uint8), (15, 15), 0) / 255.0
+                alpha = cv2.GaussianBlur((semantic_mask * 255).astype(np.uint8), (7, 7), 0) / 255.0
                 binary_mask = (alpha > 0.5).astype(np.uint8) * 255
             else:
                 alpha = dyn_mask_t[0, 0].cpu().numpy()
@@ -904,12 +907,8 @@ class WearCastHD:
             gen_arr = np.array(blended_pil).astype(np.float32)
 
         # --- FIX #12: Apply High-Frequency Skin Blending ---
-        if hasattr(self, '_skin_mask'):
-            skin_mask_final = cv2.resize(self._skin_mask, raw_generated.size, interpolation=cv2.INTER_LINEAR)
-            # Apply frequency blending on the skin areas to restore pores and lighting.
-            # We transfer the original skin texture onto the newly generated skin.
-            gen_arr = self.apply_frequency_blending(gen_arr, ori_final, skin_mask_final)
-            print(" -> [SKIN] Frequency separation complete (restored skin texture on generated skin).")
+        # Removed Frequency Blending because the Strict Semantic Fill now preserves the 
+        # original skin and only uses UNet skin as a patch. Blending again causes artifacts.
         
         # --- PURE SEMANTIC ALPHA BLENDING ---
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
