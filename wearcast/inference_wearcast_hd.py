@@ -848,6 +848,7 @@ class WearCastHD:
             
             # Binarize
             binary_mask_t = (dyn_mask_t > 0.5).float()
+            alpha_t = binary_mask_t.clone()
             
             # Guarantee the alpha mask covers the original shirt torso, BUT ONLY for pixels
             # where the UNet actually generated foreground (skin, hair, clothes).
