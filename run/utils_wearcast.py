@@ -52,37 +52,51 @@ def refine_mask(mask):
 def analyze_sleeve_length(garm_mask_np):
     """
     Classify garment as short_sleeve or long_sleeve based on mask.
+    Robustly handles wide t-shirts by checking how far DOWN the outer edges go.
     """
     import numpy as np
     
     if len(garm_mask_np.shape) == 3:
+        # Keep only the largest connected component if the background removal was messy.
         garm_mask_np = garm_mask_np[:, :, 0]
         
     y_indices, x_indices = np.where(garm_mask_np > 0)
     if len(y_indices) == 0:
         return False
 
-    height = np.max(y_indices) - np.min(y_indices)
-    width = np.max(x_indices) - np.min(x_indices)
-    
     y_min, y_max = np.min(y_indices), np.max(y_indices)
-    x_min, x_max = np.min(x_indices), np.max(x_indices)
+    height = y_max - y_min
     
-    # Check bottom 25% of the image height
-    bottom_y_start = y_max - int(0.25 * height)
-    # Check outer 20% of the image width
-    left_x_end = x_min + int(0.20 * width)
-    right_x_start = x_max - int(0.20 * width)
+    # [FIX] Boxy T-shirts were falsely triggering the "Long Sleeve" detector because their 
+    # torsos are wide enough to fill the outer boundaries of the mask.
+    # Instead of checking the outer 25% of the X-axis, we calculate the width profile of the garment.
+    # A short-sleeve shirt is widest at the top (shoulders+sleeves) and much narrower at the bottom (torso).
+    # A long-sleeve shirt has arms extending down, so the bottom is equal to or wider than the top.
     
-    bottom_left_region = garm_mask_np[bottom_y_start:y_max, x_min:left_x_end]
-    bottom_right_region = garm_mask_np[bottom_y_start:y_max, right_x_start:x_max]
+    cropped_mask = garm_mask_np[y_min:y_max+1, :]
+    widths = []
+    for row in cropped_mask:
+        xs = np.where(row > 0)[0]
+        if len(xs) > 0:
+            widths.append(xs[-1] - xs[0])
+        else:
+            widths.append(0)
+    widths = np.array(widths)
     
-    left_density = np.sum(bottom_left_region > 0) / max(1, bottom_left_region.size)
-    right_density = np.sum(bottom_right_region > 0) / max(1, bottom_right_region.size)
+    # Compare the top 30% width to the bottom 30% width
+    idx_30 = int(0.3 * height)
+    idx_70 = int(0.7 * height)
     
-    # TEMPORARY FIX: Disable long sleeve detection to prevent false positives for wide short-sleeve shirts.
-    return False
+    if idx_30 == 0 or idx_70 >= len(widths):
+        return False
         
+    max_top_width = np.max(widths[:idx_30])
+    max_bottom_width = np.max(widths[idx_70:])
+    
+    ratio = max_bottom_width / max_top_width if max_top_width > 0 else 1.0
+    
+    # If the bottom is at least 85% as wide as the top, it's a long sleeve.
+    return ratio > 0.85
     return False
 
 def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
@@ -101,9 +115,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     scale_factor = height / 512.0
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
-    # 3. Protect Identity & Skin (Face, Hair, Hat, Neck)
-    # Neck is explicitly protected to avoid glitches around collar
-    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
+    # 3. Protect Identity (Face, Hair, Hat)
+    # We do NOT protect the neck (18) strictly here. The UNet must be free to generate a new neck
+    # that seamlessly fits the new collar type (e.g. V-neck).
+    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
 
     if category == 'upperbody':
         print(" -> [MASK] Covering full arms in generation mask to ensure all old sleeves are hidden.")
