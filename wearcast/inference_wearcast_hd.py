@@ -844,27 +844,20 @@ class WearCastHD:
             # Refine the dynamic mask slightly
             dyn_mask_t = kornia.morphology.dilation(dyn_mask_t, torch.ones(5, 5, device=self.gpu_id))
             
-            # --- STRICT SEMANTIC FILL (NEW ARCHITECTURE) ---
-            if hasattr(self, '_cached_parse'):
-                # 1. New Garment exactly as generated
-                new_garment = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
-                
-                # 2. Old Garment (dilated slightly to cover seams)
-                old_garment = ((self._cached_parse == 4) | (self._cached_parse == 7)).astype(np.uint8)
-                old_garment_dilated = cv2.dilate(old_garment, np.ones((7, 7), np.uint8), iterations=1).astype(np.float32)
-                
-                # 3. UNet Skin (Face, Neck, Arms)
-                unet_skin = ((parse_new == 11) | (parse_new == 14) | (parse_new == 15) | (parse_new == 18)).astype(np.float32)
-                
-                # 4. Fill Gaps: We only paste the UNet's skin where the OLD garment used to be!
-                fill_skin = unet_skin * old_garment_dilated
-                
-                # Final strict mask
-                semantic_mask = np.maximum(new_garment, fill_skin)
-                
-                # Soften the mask for a seamless edge
-                alpha = cv2.GaussianBlur((semantic_mask * 255).astype(np.uint8), (7, 7), 0) / 255.0
+            # --- NATIVE MASK BLENDING (CANONICAL ARCHITECTURE) ---
+            # Use the exact same mask that was fed to the UNet during inpainting.
+            # This ensures the AI's output is composited over precisely the region
+            # it was asked to fill — no more, no less. This eliminates:
+            #   - Double sleeves (old garment bleeding through a too-small semantic mask)
+            #   - White border halos (TPS paste-back of original garment image)
+            if hasattr(self, '_cached_hard_mask'):
+                hard_mask_resized = self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)
+                hard_mask_np = np.array(hard_mask_resized).astype(np.float32) / 255.0
+                # Light feathering (7px) for seamless edge blending
+                alpha = cv2.GaussianBlur(hard_mask_np, (7, 7), 0)
+                alpha = np.clip(alpha, 0.0, 1.0)
                 binary_mask = (alpha > 0.5).astype(np.uint8) * 255
+                print(" -> [MASK] Native Mask Blending: using generation mask directly.")
             else:
                 alpha = dyn_mask_t[0, 0].cpu().numpy()
                 alpha = np.clip(alpha, 0, 1)
@@ -970,36 +963,14 @@ class WearCastHD:
 
     def detect_garment_complexity(self, image_garm):
         """
-        [UPDATED] Highly sensitive detection for logos, text, and patterns.
+        [DISABLED] TPS Logo Warping is permanently disabled.
+        Reason: The warping logic was pasting the raw garment image (with white background)
+        directly onto the AI output, creating white border halos and destroying
+        text/logos that the UNet had already rendered correctly.
+        The UNet (OOTDiffusion) handles patterned garments natively — trust it.
         """
-        import cv2
-        import numpy as np
-        garm_np = np.array(image_garm)
-        bg_mask = np.all(garm_np >= 240, axis=-1)
-        fg_pixels = garm_np[~bg_mask]
-
-        if len(fg_pixels) < 500:
-            return False
-
-        # 1. Color variance (Lowered threshold from 38.0 to 20.0)
-        color_std = np.std(fg_pixels, axis=0).mean()
-        is_patterned = color_std > 20.0
-
-        # 2. Interior Edge Density (For text and thin logos)
-        gray = cv2.cvtColor(garm_np, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 30, 100) # More sensitive edge detection
-        
-        # We only care about edges INSIDE the shirt (ignore the outer boundary)
-        fg_mask_img = (~bg_mask).astype(np.uint8) * 255
-        interior_mask = cv2.erode(fg_mask_img, np.ones((15, 15), np.uint8), iterations=1)
-        interior_edges = cv2.bitwise_and(edges, interior_mask)
-        
-        # Lowered threshold from 0.06 (6%) to 0.015 (1.5%)
-        edge_density = np.sum(interior_edges > 0) / max(1, np.sum(interior_mask > 0))
-        is_complex_shape = edge_density > 0.015 
-
-        print(f"   [COMPLEXITY] color_std={color_std:.2f} | interior_edge_density={edge_density:.4f} | TPS_WARPING_TRIGGERED={is_patterned or is_complex_shape}")
-        return is_patterned or is_complex_shape
+        print("   [COMPLEXITY] TPS Warping: DISABLED (returning False always)")
+        return False
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:
