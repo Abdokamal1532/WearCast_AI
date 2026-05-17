@@ -887,7 +887,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
             else:
                 enc_output = self.vae.encode(image)
                 print(f"[DEBUG] prepare_garm_latents: VAE latent_dist mean={list(enc_output.latent_dist.mean.shape)} std_min={enc_output.latent_dist.std.min().item():.4f}")
-                image_latents = enc_output.latent_dist.mode()
+                image_latents = enc_output.latent_dist.mode() * self.vae.config.scaling_factor
 
             print(f"[DEBUG] prepare_garm_latents: output latents shape={image_latents.shape}, dtype={image_latents.dtype} range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
 
@@ -936,19 +936,19 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 image = image.to(dtype=self.vae.dtype)
 
             if isinstance(generator, list):
-                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_latents = [self.vae.encode(image[i : i + 1]).latent_dist.mode() * self.vae.config.scaling_factor for i in range(batch_size)]
                 image_latents = torch.cat(image_latents, dim=0)
                 
                 if image_ori.dtype != self.vae.dtype:
                     image_ori = image_ori.to(dtype=self.vae.dtype)
-                image_ori_latents = [self.vae.encode(image_ori[i : i + 1]).latent_dist.mode() for i in range(batch_size)]
+                image_ori_latents = [self.vae.encode(image_ori[i : i + 1]).latent_dist.mode() * self.vae.config.scaling_factor for i in range(batch_size)]
                 image_ori_latents = torch.cat(image_ori_latents, dim=0)
             else:
-                image_latents = self.vae.encode(image).latent_dist.mode()
+                image_latents = self.vae.encode(image).latent_dist.mode() * self.vae.config.scaling_factor
                 
                 if image_ori.dtype != self.vae.dtype:
                     image_ori = image_ori.to(dtype=self.vae.dtype)
-                image_ori_latents = self.vae.encode(image_ori).latent_dist.mode()
+                image_ori_latents = self.vae.encode(image_ori).latent_dist.mode() * self.vae.config.scaling_factor
                 
             print(f"[DEBUG] prepare_vton_latents: masked person latents shape={image_latents.shape}  range=[{image_latents.float().min().item():.4f},{image_latents.float().max().item():.4f}]")
             print(f"[DEBUG] prepare_vton_latents: original latents shape={image_ori_latents.shape}  range=[{image_ori_latents.float().min().item():.4f},{image_ori_latents.float().max().item():.4f}]")
