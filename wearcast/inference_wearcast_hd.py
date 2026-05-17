@@ -883,7 +883,7 @@ class WearCastHD:
 
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
-        print(f" -> Pro-Feather mask: sigma={feather_sigma}px (eroded for tight fit)")
+        print(" -> Pro-Feather mask: (dynamic alpha generated)")
         # --- Pre-compositing diagnostics ---
         mask_bool = binary_mask > 0.5
         gen_in_mask = gen_arr[mask_bool]
