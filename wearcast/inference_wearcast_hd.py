@@ -899,17 +899,16 @@ class WearCastHD:
             _garm_fg_lum = _garm_full_lum
 
         # Decision logic based on TRUE foreground luminance:
-        # - Very dark garments (L < 70): The UNet already renders black/dark correctly.
-        #   Applying color transfer would destroy logo text contrast (LOVE text disappears).
-        #   → SKIP color transfer (COLOR_BLEND = 0.0).
-        # - Very bright/white garments (L > 190): gentle push only.
-        #   → COLOR_BLEND = 0.35 to fix slight grayness without washing out.
-        # - Mid-tone garments: moderate correction.
-        #   → COLOR_BLEND = 0.50
+        # - Very dark garments (FG < 70): UNet over-generates gray instead of black.
+        #   Use a very gentle 15% correction pass with MAX_L_SHIFT=20 to push toward black
+        #   WITHOUT destroying logo text contrast (which relies on relative pixel differences).
+        # - Very bright/white garments (FG > 190): UNet under-generates (gray instead of white).
+        #   Use 65% blend with MAX_L_SHIFT=25 to strongly push toward white.
+        # - Mid-tone garments: moderate 50% correction.
         if _garm_fg_lum < 70:
-            COLOR_BLEND = 0.0  # Skip — trust UNet for dark/black garments
+            COLOR_BLEND = 0.15  # Gentle push toward black — preserve logo contrast
         elif _garm_fg_lum > 190:
-            COLOR_BLEND = 0.35  # Gentle for whites
+            COLOR_BLEND = 0.65  # Strong push toward white
         else:
             COLOR_BLEND = 0.50  # Moderate for mid-tones
 
@@ -920,7 +919,7 @@ class WearCastHD:
             gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
             print(f" -> [COLOR] Color transfer applied.")
         else:
-            print(f" -> [COLOR] Color transfer SKIPPED (dark garment — trusting UNet output).")
+            print(f" -> [COLOR] Color transfer SKIPPED.")
 
         # --- Final Compositing ---
         # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
@@ -1090,13 +1089,14 @@ class WearCastHD:
             print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
             # 4. Asymmetric Gamut-Aware L-Channel Transfer
-            # CAP: Limit L-shift to ±12 L-units (Kornia 0-100 scale, ~±30 in 0-255 scale).
-            # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
-            # and black shirts get crushed to L<5 (all detail lost). 
-            # ADAPTIVE: For very bright targets (L > 85), raise cap to 15.0 to ensure
-            # white garments don't look gray. For very dark targets (L < 20), raise cap to 25.0
-            # so black shirts aren't left dark gray.
-            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (25.0 if target_repr[0] < 20.0 else 12.0)
+            # ADAPTIVE L-SHIFT CAP:
+            # - Bright targets (L > 85): cap=25.0 — white shirts generate as gray (L~70),
+            #   need a large shift (+26) to push them to near-white. Previously cap=15 was
+            #   insufficient and left white shirts looking gray.
+            # - Dark targets (L < 20): cap=20.0 — black shirts get a gentle nudge downward
+            #   while preserving logo/text contrast via the multiplier.
+            # - Mid-tones: cap=12.0 — conservative for color accuracy.
+            MAX_L_SHIFT = 25.0 if target_repr[0] > 85.0 else (20.0 if target_repr[0] < 20.0 else 12.0)
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
