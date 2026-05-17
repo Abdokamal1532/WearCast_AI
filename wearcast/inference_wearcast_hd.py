@@ -63,13 +63,12 @@ class WearCastHD:
 
         print(f"Loading components from {MODEL_PATH}...")
 
-        # 1. Load VAE
+        # 1. Load VAE (float16 — matches original OOTDiffusion training)
         print("[WearCastHD] Loading VAE...")
         vae = AutoencoderKL.from_pretrained(
             MODEL_PATH,
             subfolder="vae",
-            torch_dtype=torch.float32,
-            use_safetensors=False,
+            torch_dtype=torch.float16,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -107,7 +106,8 @@ class WearCastHD:
         print(f"[WearCastHD] AutoProcessor loaded.")
 
         print("[WearCastHD] Loading CLIPVisionModelWithProjection...")
-        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH).to(self.gpu_id).half()
+        # Keep CLIP in float32 — matches original OOTDiffusion. float16 loses embedding precision.
+        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(VIT_PATH).to(self.gpu_id)
         print(f"[WearCastHD] CLIPVisionModelWithProjection loaded.  hidden_size={self.image_encoder.config.hidden_size}  projection_dim={self.image_encoder.config.projection_dim}")
 
         # Load scheduler
@@ -626,41 +626,29 @@ class WearCastHD:
             debug_save(garm_enhanced, "debug_phase2_clip_input.jpg")
             print(f" -> [SAVED] CLIP input garment saved to: debug_phase2_clip_input.jpg")
 
-            # --- 2c. CLIP Encoding (Standard Global) ---
-            # Reverted to standard global embedding to prevent UNet out-of-distribution hallucinations
+            # --- 2c. CLIP Encoding (Standard Global — float32, matches original OOTD) ---
             clip_inputs = self.auto_processor(images=garm_enhanced, return_tensors="pt").to(device=self.gpu_id)
             with torch.no_grad():
-                clip_outputs = self.image_encoder(clip_inputs.data['pixel_values'].to(dtype=torch.float16))
+                # Original OOTD does NOT cast to float16 here — CLIP needs float32 precision
+                clip_outputs = self.image_encoder(clip_inputs.data['pixel_values'])
                 image_embeds = clip_outputs.image_embeds.unsqueeze(1) # [1, 1, 768]
             
-            # --- 2d. Advanced Prompt Construction ---
-            # CRITICAL FIX 1: OOTDiffusion strictly requires a 2-token sequence ["", Image_Embed].
-            # Feeding 77 tokens causes the UNet to hallucinate the "Gray Blob".
-            print(" -> [PROMPT] Bypassing text prompt to restore OOTDiffusion 2-token architecture.")
-            prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0].to(dtype=torch.float16) # [1, 2, 768]
+            # --- 2d. Prompt Construction (OOTDiffusion Standard 2-token format) ---
+            print(" -> [PROMPT] Using OOTDiffusion 2-token architecture.")
+            prompt_embeds = self.text_encoder(self.tokenize_captions([""], 2).to(self.gpu_id))[0]
             
             # Inject global image embedding into token index 1 (OOTDiffusion Standard)
-            prompt_embeds[:, 1:2, :] = image_embeds[:]
-            print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (Restored strict 2-token format)")
+            prompt_embeds[:, 1:] = image_embeds[:]
+            print(f" -> Prompt embeddings shape: {list(prompt_embeds.shape)} (Strict 2-token format)")
             _dbg_tensor("prompt_embeds", prompt_embeds)
 
             # --- 2d. VAE Garment Fidelity Check ---
-            # Encode garment through VAE and decode back to check reconstruction quality
+            # No pre-sharpening: the VAE was trained on natural images.
+            # Pre-sharpening pushes it out-of-distribution and creates ringing artifacts.
             print(f"\n   [VAE FIDELITY] Encoding garment through VAE and decoding back...")
-            # FIX #6: Adaptive sharpening before VAE encoding to preserve fine graphic/text details.
-            # Complex garments (prints, text, logos) get stronger sharpening to compensate
-            # for the VAE's natural blurring tendency (PSNR ~27 dB for this checkpoint).
-            # Simple garments stay gentle to avoid edge halos on fabric folds.
-            from PIL import ImageFilter
-            if is_complex:
-                # Strong sharpening for graphic/patterned garments
-                image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=2))
-            else:
-                # Gentle sharpening for solid-color garments
-                image_garm_for_vae = image_garm.filter(ImageFilter.UnsharpMask(radius=1.0, percent=120, threshold=3))
-            garm_tensor = self.pipe.image_processor.preprocess(image_garm_for_vae).to(device=self.gpu_id, dtype=torch.float32)
+            garm_tensor = self.pipe.image_processor.preprocess(image_garm).to(device=self.gpu_id, dtype=self.pipe.vae.dtype)
             garm_latent = self.pipe.vae.encode(garm_tensor).latent_dist.mode()
-            garm_roundtrip = self.pipe.vae.decode(garm_latent).sample  # mode() returns raw latents, decode directly
+            garm_roundtrip = self.pipe.vae.decode(garm_latent).sample
             # Undo: [-1,1] -> [0,255]
             garm_rt_np = ((garm_roundtrip[0].float().cpu().clamp(-1, 1) + 1) / 2 * 255).byte().permute(1, 2, 0).numpy()
             debug_save(Image.fromarray(garm_rt_np), "debug_phase2_vae_roundtrip.jpg")
@@ -689,70 +677,24 @@ class WearCastHD:
             debug_save(Image.fromarray(masked_person_vis), "debug_phase3_masked_person.jpg")
             print(f" -> [SAVED] Masked person input saved to: debug_phase3_masked_person.jpg")
 
-            # [FIX: BACKGROUND INPAINTING FOR CLEAN CONTEXT]
-            # To prevent color contamination from the old shirt without creating ghostly smudges,
-            # we use cv2.inpaint to extrapolate the background colors across the torso mask.
-            # This allows the UNet to cleanly inpaint the background if the new shirt is smaller,
-            # rather than pasting ghostly grey blobs into the final image.
-            ori_np = np.array(image_ori).astype(np.uint8)
-            
-            # CRITICAL FIX: Only inpaint the old garment fabric!
-            # Previously, the entire generation mask (which includes neck and arms) was inpainted,
-            # erasing the person's real skin. This forced the UNet to generate fake skin,
-            # causing severe "double neckline" and floating head artifacts.
-            if hasattr(self, '_cached_parse'):
-                parse = self._cached_parse
-                old_garment_mask = ((parse == 4) | (parse == 7)).astype(np.uint8) * 255
-                skin_mask = ((parse == 11) | (parse == 14) | (parse == 15) | (parse == 18)).astype(np.uint8) * 255
-                
-                # [FIX]: Fill holes in the garment mask!
-                # The human parser often misclassifies large graphics/logos as "background".
-                # If we don't fill these holes, the old logo isn't erased and bleeds into the new image,
-                # causing double logos and confusing the AI placement tracker.
-                contours, _ = cv2.findContours(old_garment_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(old_garment_mask, contours, -1, 255, thickness=cv2.FILLED)
-                
-                # Dilate heavily (12px radius) to capture all protruding fabric/white edges
-                # that the parser missed, which otherwise bleed inward and cause "ghostly outlines".
-                inpaint_mask = cv2.dilate(old_garment_mask, np.ones((25, 25), np.uint8), iterations=1)
-                
-                # Protect the person's real skin from being inpainted (erased).
-                # We dilate the skin mask slightly (2px) to give a safety buffer, then subtract it.
-                safe_skin = cv2.dilate(skin_mask, np.ones((5, 5), np.uint8), iterations=1)
-                inpaint_mask[safe_skin > 0] = 0
-                
-                # Inpaint the original image using Telea algorithm
-                _ori_ctx_np = cv2.inpaint(ori_np, inpaint_mask, 7, cv2.INPAINT_TELEA)
-                # Removed the heavy 51x51 GaussianBlur here. A clean cv2.inpaint is better
-                # so we don't create sharp blurred blocks that confuse the UNet.
-
-                _ctx_alpha_mean = np.mean(inpaint_mask > 0)
-            else:
-                _ori_ctx_np = ori_np
-                _ctx_alpha_mean = 0.0
-            
-            image_ori_constrained = Image.fromarray(_ori_ctx_np)
-            debug_save(image_ori_constrained, "debug_phase3_ori_context.jpg")
-            print(" -> [CONTEXT] Applied Content-Aware Context Neutralization (cv2.inpaint) to prevent ghosting.")
-            print(f" -> [CONTEXT] Mask coverage in context: {100.0 * _ctx_alpha_mean:.2f}% inpainted.")
+            # --- Pass original image directly (matching original OOTDiffusion) ---
+            # Context inpainting was removed: it distorted the image_ori reference and
+            # caused the SDEdit blending to produce smeared patches.
+            debug_save(image_ori, "debug_phase3_ori_context.jpg")
+            print(" -> [CONTEXT] Using original image directly (no inpainting — matches OOTD architecture).")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 mem_before = torch.cuda.memory_allocated(0) / 1e9
                 print(f" -> GPU VRAM before UNet call: {mem_before:.2f} GB")
 
-            # FIX #6 (Correction): Apply mild sharpening to the actual garment passed to the pipeline
-            # to preserve fine details without creating crunchy edge artifacts in the VAE.
-            from PIL import ImageFilter
-            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
-
             t_unet_start = time.time()
             images = self.pipe(
                 prompt_embeds=prompt_embeds,
-                image_garm=garm_proc_for_pipeline,
+                image_garm=image_garm,   # RAW garment (not background-replaced garm_proc)
                 image_vton=image_vton,
                 mask=mask,
-                image_ori=image_ori_constrained, # USE CONSTRAINED SILHOUETTE
+                image_ori=image_ori,     # Original person image (no inpainting)
                 num_inference_steps=final_steps,
                 image_guidance_scale=final_scale,
                 num_images_per_prompt=num_samples,
@@ -789,14 +731,10 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- FIX #1: Unified Dynamic Alpha Mask ---
-        # Previously we restricted the mask to ONLY the newly generated shirt pixels.
-        # This caused a huge bug: if the new shirt was smaller than the old shirt,
-        # the UNet generated bare arms or background, but they weren't pasted,
-        # leaving the OLD shirt sleeves sticking out like a ghost!
-        # Now we use the highly-optimized original inpaint mask, which safely
-        # replaces the entire old garment region with the UNet's output.
-        print(" -> Applying Unified Alpha Mask (to prevent ghost sleeves)...")
+        # --- FIX #1: Dynamic Output Masking (The Cape Killer) ---
+        # Instead of using the input mask (which has a huge background "box"),
+        # we re-parse the generated image to find the ACTUAL shirt pixels.
+        print(" -> Running Dynamic Re-Parsing for clean mask...")
         t_reparse = time.time()
         parse_new_pil, _ = self.parsing_model(raw_generated)
         parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))
@@ -885,117 +823,30 @@ class WearCastHD:
         
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
 
-        # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
-        # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
-        # FIX: Use a GARMENT-ONLY mask for color transfer (parse label 4|7), NOT the full alpha mask.
-        if hasattr(self, '_cached_parse'):
-            _garment_only_np = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
-            _garment_only_np = cv2.resize(_garment_only_np, raw_generated.size, interpolation=cv2.INTER_NEAREST)
-            color_transfer_mask = cv2.GaussianBlur(_garment_only_np, (5, 5), 0)
-        else:
-            color_transfer_mask = alpha  # fallback
-
-        # --- INTELLIGENT LUMINANCE-AWARE COLOR BLEND ---
-        # Calculate the REAL foreground luminance (excluding the white background of garment image).
-        # Previously, _garm_lum included the white BG, making a black shirt appear as luminance=163 
-        # instead of its true value (~15-20). This caused the color transfer to be totally wrong.
-        _garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
-        _garm_full_lum = float((_garm_np[:, :, 0]*0.299 + _garm_np[:, :, 1]*0.587 + _garm_np[:, :, 2]*0.114).mean())
-        _fg_mask_garm = ~np.all(_garm_np >= 240, axis=-1)
-        _fg_pixels_garm = _garm_np[_fg_mask_garm]
-        if len(_fg_pixels_garm) > 500:
-            _garm_fg_lum = float((_fg_pixels_garm[:, 0]*0.299 + _fg_pixels_garm[:, 1]*0.587 + _fg_pixels_garm[:, 2]*0.114).mean())
-        else:
-            _garm_fg_lum = _garm_full_lum
-
-        # Decision logic based on TRUE foreground luminance:
-        # - Very dark garments (FG < 70): UNet over-generates gray instead of black.
-        #   Use a very gentle 15% correction pass with MAX_L_SHIFT=20 to push toward black
-        #   WITHOUT destroying logo text contrast (which relies on relative pixel differences).
-        # - Very bright/white garments (FG > 190): UNet under-generates (gray instead of white).
-        #   Use 65% blend with MAX_L_SHIFT=25 to strongly push toward white.
-        # - Mid-tone garments: moderate 50% correction.
-        if _garm_fg_lum < 70:
-            COLOR_BLEND = 0.15  # Gentle push toward black — preserve logo contrast
-        elif _garm_fg_lum > 190:
-            COLOR_BLEND = 0.65  # Strong push toward white
-        else:
-            COLOR_BLEND = 0.50  # Moderate for mid-tones
-
-        print(f" -> [COLOR] Garment FG lum={_garm_fg_lum:.1f} (full={_garm_full_lum:.1f}), blend strength={COLOR_BLEND:.0%}")
-        
-        if COLOR_BLEND > 0.0:
-            gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, color_transfer_mask)
-            gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
-            print(f" -> [COLOR] Color transfer applied.")
-        else:
-            print(f" -> [COLOR] Color transfer SKIPPED.")
+        # --- Color Transfer REMOVED ---
+        # The original OOTDiffusion does NOT apply any color correction.
+        # With the upstream fixes (VAE float16, CLIP float32, raw garment input),
+        # the UNet now produces correct colors natively.
+        print(" -> [COLOR] Color transfer DISABLED (trusting UNet native output — matches OOTD).")
 
         # --- Final Compositing ---
-        # We gently paste the AI-generated garment onto the ORIGINAL background to preserve face/bg crispness.
         t_post = time.time()
         print(f" -> [COMPOSITE] Blending generated garment onto original background...")
 
-        # --- STUDIO MASTER: AI-Native Rendering & TPS Refinement ---
-        if is_complex:
-            print(" -> [LOGO] Patterned/Graphic garment detected. Applying TPS Warping...")
-            blended_pil = Image.fromarray(np.clip(gen_arr, 0, 255).astype(np.uint8))
-            blended_pil = self.apply_logo_warping(image_garm, self._cached_keypoints, blended_pil, alpha)
-            gen_arr = np.array(blended_pil).astype(np.float32)
-
-        # --- FIX #12: Apply High-Frequency Skin Blending ---
-        # Removed Frequency Blending because the Strict Semantic Fill now preserves the 
-        # original skin and only uses UNet skin as a patch. Blending again causes artifacts.
-        
         # --- PURE SEMANTIC ALPHA BLENDING ---
         # Expand alpha to 3 channels for broadcasting [H, W, 1] -> [H, W, 3]
         alpha_3d = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
         
         # Simple math: output = generated * alpha + original * (1 - alpha)
-        # This replaces the Laplacian blending which was causing halos around the collar.
-        print(" -> [COMPOSITE] Using Pure Semantic Alpha Blending...")
+        print(" -> [COMPOSITE] Using Pure Semantic Alpha Blending (clean paste-back)...")
         final_np = gen_arr * alpha_3d + ori_final * (1.0 - alpha_3d)
         
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
 
-        # --- BODY SILHOUETTE GUARD ---
-        # Problem: the generation mask is a rectangle that extends beyond the body's actual silhouette.
-        # The UNet fills the non-body part of that rectangle with dark background colors,
-        # which blend in as dark side bars/stripes alongside the torso.
-        # Fix: build a silhouette from _cached_parse (all non-background labels) and restore
-        # any pixel OUTSIDE the silhouette to the original image.
-        if hasattr(self, '_cached_parse'):
-            # All non-background semantic labels = body silhouette
-            body_sil = (self._cached_parse > 0).astype(np.uint8)
-            # Dilate slightly (15px) to avoid accidentally clipping fabric that touches the edge
-            body_sil = cv2.dilate(body_sil, np.ones((15, 15), np.uint8), iterations=1)
-            body_sil_resized = cv2.resize(body_sil, (final_np.shape[1], final_np.shape[0]), interpolation=cv2.INTER_NEAREST)
-            body_sil_3d = np.repeat(body_sil_resized[:, :, np.newaxis], 3, axis=2).astype(np.float32)
-            # Restore pixels outside the body silhouette to original
-            final_np = final_np * body_sil_3d + ori_final * (1.0 - body_sil_3d)
-            print(" -> [SILHOUETTE] Body silhouette guard applied: side artifacts restored to original.")
-
-        # --- [FIX PATTERN CLARITY] Post-Composite Adaptive Sharpening ---
-        # The VAE encode/decode cycle loses high-frequency detail (PSNR ~27 dB).
-        # We recover edge sharpness by applying an UnsharpMask ONLY on the garment region.
-        # Strength scales with garment complexity: stronger for prints/text, gentle for solids.
-        if is_complex:
-            _sharp_radius  = 1.2
-            _sharp_percent = 140
-            _sharp_thresh  = 2
-        else:
-            _sharp_radius  = 0.8
-            _sharp_percent = 110
-            _sharp_thresh  = 3
-        _final_pil    = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
-        _final_sharp  = _final_pil.filter(ImageFilter.UnsharpMask(
-            radius=_sharp_radius, percent=_sharp_percent, threshold=_sharp_thresh
-        ))
-        # Blend sharpened result ONLY within the garment mask (alpha_3d), preserve background as-is
-        _sharp_np  = np.array(_final_sharp).astype(np.float32)
-        final_np   = _sharp_np * alpha_3d + final_np * (1.0 - alpha_3d)
+        # Post-composite sharpening REMOVED.
+        # With the upstream fixes (VAE float16, CLIP float32, raw garment input),
+        # the UNet output should be sharp enough natively. Sharpening creates ringing artifacts.
         final_image = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
-        print(f" -> [SHARP] Post-composite sharpening applied (complex={is_complex}, r={_sharp_radius}, p={_sharp_percent}%).")
 
 
 
@@ -1099,14 +950,13 @@ class WearCastHD:
             print(f"   [COLOR] Source Median: L={source_median[0]:.1f}, a={source_median[1]:.1f}, b={source_median[2]:.1f}")
 
             # 4. Asymmetric Gamut-Aware L-Channel Transfer
-            # ADAPTIVE L-SHIFT CAP:
-            # - Bright targets (L > 85): cap=25.0 — white shirts generate as gray (L~70),
-            #   need a large shift (+26) to push them to near-white. Previously cap=15 was
-            #   insufficient and left white shirts looking gray.
-            # - Dark targets (L < 20): cap=20.0 — black shirts get a gentle nudge downward
-            #   while preserving logo/text contrast via the multiplier.
-            # - Mid-tones: cap=12.0 — conservative for color accuracy.
-            MAX_L_SHIFT = 25.0 if target_repr[0] > 85.0 else (20.0 if target_repr[0] < 20.0 else 12.0)
+            # CAP: Limit L-shift to ±12 L-units (Kornia 0-100 scale, ~±30 in 0-255 scale).
+            # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
+            # and black shirts get crushed to L<5 (all detail lost). 
+            # ADAPTIVE: For very bright targets (L > 85), raise cap to 15.0 to ensure
+            # white garments don't look gray. For very dark targets (L < 20), raise cap to 25.0
+            # so black shirts aren't left dark gray.
+            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (25.0 if target_repr[0] < 20.0 else 12.0)
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
