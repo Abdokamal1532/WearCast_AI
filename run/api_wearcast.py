@@ -14,6 +14,17 @@ except ImportError:
 import os
 import sys
 import time
+import warnings
+
+# Suppress annoying Diffusers deprecation warnings in the API log
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    from diffusers.utils import logging as diffusers_logging
+    diffusers_logging.set_verbosity_error()
+except ImportError:
+    pass
+
 import uuid
 import threading
 import asyncio
