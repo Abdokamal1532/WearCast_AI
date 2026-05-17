@@ -69,6 +69,7 @@ class WearCastHD:
             MODEL_PATH,
             subfolder="vae",
             torch_dtype=torch.float32,
+            use_safetensors=False,
         )
         print(f"[WearCastHD] VAE loaded. Scaling factor: {vae.config.scaling_factor}  |  latent_channels={vae.config.latent_channels}")
 
@@ -740,10 +741,15 @@ class WearCastHD:
                 mem_before = torch.cuda.memory_allocated(0) / 1e9
                 print(f" -> GPU VRAM before UNet call: {mem_before:.2f} GB")
 
+            # FIX #6 (Correction): Apply mild sharpening to the actual garment passed to the pipeline
+            # to preserve fine details without creating crunchy edge artifacts in the VAE.
+            from PIL import ImageFilter
+            garm_proc_for_pipeline = garm_proc.filter(ImageFilter.UnsharpMask(radius=1.0, percent=50, threshold=3))
+
             t_unet_start = time.time()
             images = self.pipe(
                 prompt_embeds=prompt_embeds,
-                image_garm=garm_proc,
+                image_garm=garm_proc_for_pipeline,
                 image_vton=image_vton,
                 mask=mask,
                 image_ori=image_ori_constrained, # USE CONSTRAINED SILHOUETTE
@@ -783,10 +789,14 @@ class WearCastHD:
         if ori_arr.shape[:2] != gen_arr.shape[:2]:
             ori_arr = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC)).astype(np.float32)
 
-        # --- FIX #1: Dynamic Output Masking (The Cape Killer) ---
-        # Instead of using the input mask (which has a huge background "box"),
-        # we re-parse the generated image to find the ACTUAL shirt pixels.
-        print(" -> Running Dynamic Re-Parsing for clean mask...")
+        # --- FIX #1: Unified Dynamic Alpha Mask ---
+        # Previously we restricted the mask to ONLY the newly generated shirt pixels.
+        # This caused a huge bug: if the new shirt was smaller than the old shirt,
+        # the UNet generated bare arms or background, but they weren't pasted,
+        # leaving the OLD shirt sleeves sticking out like a ghost!
+        # Now we use the highly-optimized original inpaint mask, which safely
+        # replaces the entire old garment region with the UNet's output.
+        print(" -> Applying Unified Alpha Mask (to prevent ghost sleeves)...")
         t_reparse = time.time()
         parse_new_pil, _ = self.parsing_model(raw_generated)
         parse_new = np.array(parse_new_pil.resize(raw_generated.size, Image.NEAREST))

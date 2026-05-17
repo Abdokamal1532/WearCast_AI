@@ -121,43 +121,10 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
 
     if category == 'upperbody':
-        if is_long_sleeve:
-            print(" -> [MASK] Long sleeve detected. Including full arms in generation mask.")
-            arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
-            inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
-            skin_protect = skin_protect_base
-        else:
-            # FIX #3: Short-sleeve — include only the UPPER half of each arm (shoulder→elbow).
-            # Previously the full arm to the wrist was sometimes included, creating phantom
-            # sleeve strips when the person wore a sleeveless garment originally.
-            print(" -> [MASK] Short sleeve detected. Including upper arm only (shoulder→elbow).")
-            # Draw thick line from shoulder keypoint to a point 50% down towards the elbow
-            for s_idx, e_idx in [(2, 3), (5, 6)]:
-                if pt(s_idx)[0] > 1 and pt(e_idx)[0] > 1:
-                    s_pt = (int(pt(s_idx)[0]), int(pt(s_idx)[1]))
-                    e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
-                    dx = e_pt[0] - s_pt[0]
-                    dy = e_pt[1] - s_pt[1]
-                    # Only draw to 45% of the way to the elbow (tighter than before)
-                    mid_pt = (int(s_pt[0] + dx * 0.45), int(s_pt[1] + dy * 0.45))
-                    cv2.line(inpaint_mask, s_pt, mid_pt, 255, int(28 * scale_factor))
-
-            # FIX #3: Protect the LOWER arm (elbow→wrist) but NOT the upper arm near the sleeve.
-            # Build a forearm-only mask using the elbow/wrist keypoints.
-            forearm_protect = np.zeros_like(parse_array, dtype=np.uint8)
-            for e_idx, w_idx in [(3, 4), (6, 7)]:   # (RElbow→RWrist), (LElbow→LWrist)
-                if pt(e_idx)[0] > 1 and pt(w_idx)[0] > 1:
-                    e_pt = (int(pt(e_idx)[0]), int(pt(e_idx)[1]))
-                    w_pt = (int(pt(w_idx)[0]), int(pt(w_idx)[1]))
-                    cv2.line(forearm_protect, e_pt, w_pt, 255, int(24 * scale_factor))
-            forearm_protect = cv2.dilate(forearm_protect, np.ones((9, 9), np.uint8), iterations=1)
-
-            # Combine: protect face/hair/neck + forearms (below elbow)
-            arms_protect = cv2.bitwise_or(
-                ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255,
-                forearm_protect
-            )
-            skin_protect = cv2.bitwise_or(skin_protect_base, forearm_protect)
+        print(" -> [MASK] Covering full arms in generation mask to ensure all old sleeves are hidden.")
+        arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+        inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
+        skin_protect = skin_protect_base
     else:
         arms_protect = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
         skin_protect = cv2.bitwise_or(skin_protect_base, arms_protect)
@@ -165,11 +132,22 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     # 4. Protect Bottoms (Pants, Skirts)
     bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
     
-    # 5. Dilation
-    # FIX #4: Increased kernel from 15x15 → 21x21 to bring mask coverage from ~15-18%
-    # up to the OOTD-HD training distribution of ~20-25%. Under-masking caused the original
-    # garment color to bleed through via SDEdit latent blending.
-    mask_expanded = cv2.dilate(inpaint_mask, np.ones((21, 21), np.uint8), iterations=1)
+    # 5. Adaptive Dilation
+    # [FIX B] Kernel size adapts to how much of the image is already labeled as garment.
+    # Large people (Gemini-style product models) often have UpperClothes = 25–35% of frame,
+    # Normal real-world subjects (like Abdo) have 15-22%.
+    # If the threshold is too low, we under-mask normal people, causing black boundary seams.
+    garment_pixel_pct = np.sum(parse_array == 4) / max(1, parse_array.size)
+    if garment_pixel_pct > 0.28:
+        dilation_kernel_size = 15   # Massive parsed region (e.g. tight crop) — conservative
+    elif garment_pixel_pct > 0.22:
+        dilation_kernel_size = 20   # Medium-Large
+    else:
+        dilation_kernel_size = 25   # Standard real human — expand aggressively to prevent seams
+    
+    # [DEBUG MASK] Precise print
+    print(f"   [DEBUG MASK] garment_pct={garment_pixel_pct:.2%} → selected dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
+    mask_expanded = cv2.dilate(inpaint_mask, np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8), iterations=1)
     
     # SILHOUETTE LOCK: 
     silhouette = (parse_array > 0).astype(np.uint8) * 255
