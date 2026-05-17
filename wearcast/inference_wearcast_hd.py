@@ -877,14 +877,21 @@ class WearCastHD:
 
         # We use Reinhard LAB Statistical Color Transfer to mathematically enforce the target color
         # without destroying the AI's 3D variance (wrinkles, shadows, highlights).
-        # Adaptive blend: push harder (85%) for very bright/dark garments where the UNet
-        # tends to under-correct, stay conservative (70%) for mid-tone garments.
-        gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+        # FIX: Use a GARMENT-ONLY mask for color transfer (parse label 4|7), NOT the full alpha mask.
+        # Previously, passing the full alpha (which bleeds into neck/shoulders) was darkening/lightening skin.
+        if hasattr(self, '_cached_parse'):
+            _garment_only_np = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+            _garment_only_np = cv2.resize(_garment_only_np, raw_generated.size, interpolation=cv2.INTER_NEAREST)
+            color_transfer_mask = cv2.GaussianBlur(_garment_only_np, (5, 5), 0)  # soft 5px edge only
+        else:
+            color_transfer_mask = alpha  # fallback
+        gen_arr_corrected = self.apply_statistical_color_transfer(gen_arr, image_garm, color_transfer_mask)
         # Get approximate target luminance from garment image center region
         _garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
         _garm_lum = float((_garm_np[:, :, 0]*0.299 + _garm_np[:, :, 1]*0.587 + _garm_np[:, :, 2]*0.114).mean())
         COLOR_BLEND = 0.85 if (_garm_lum > 200 or _garm_lum < 50) else 0.70
-        print(f" -> [COLOR] Garment luminance={_garm_lum:.1f}, blend strength={COLOR_BLEND:.0%}")
+        print(f" -> [COLOR] Garment luminance={_garm_lum:.1f}, blend strength={COLOR_BLEND:.0%} (garment-only mask)")
+        # Apply color correction ONLY inside the garment region (mix corrected+original)
         gen_arr = gen_arr_corrected * COLOR_BLEND + gen_arr * (1.0 - COLOR_BLEND)
 
         # --- Final Compositing ---
@@ -913,6 +920,23 @@ class WearCastHD:
         final_np = gen_arr * alpha_3d + ori_final * (1.0 - alpha_3d)
         
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
+
+        # --- BODY SILHOUETTE GUARD ---
+        # Problem: the generation mask is a rectangle that extends beyond the body's actual silhouette.
+        # The UNet fills the non-body part of that rectangle with dark background colors,
+        # which blend in as dark side bars/stripes alongside the torso.
+        # Fix: build a silhouette from _cached_parse (all non-background labels) and restore
+        # any pixel OUTSIDE the silhouette to the original image.
+        if hasattr(self, '_cached_parse'):
+            # All non-background semantic labels = body silhouette
+            body_sil = (self._cached_parse > 0).astype(np.uint8)
+            # Dilate slightly (15px) to avoid accidentally clipping fabric that touches the edge
+            body_sil = cv2.dilate(body_sil, np.ones((15, 15), np.uint8), iterations=1)
+            body_sil_resized = cv2.resize(body_sil, (final_np.shape[1], final_np.shape[0]), interpolation=cv2.INTER_NEAREST)
+            body_sil_3d = np.repeat(body_sil_resized[:, :, np.newaxis], 3, axis=2).astype(np.float32)
+            # Restore pixels outside the body silhouette to original
+            final_np = final_np * body_sil_3d + ori_final * (1.0 - body_sil_3d)
+            print(" -> [SILHOUETTE] Body silhouette guard applied: side artifacts restored to original.")
 
         # --- [FIX PATTERN CLARITY] Post-Composite Adaptive Sharpening ---
         # The VAE encode/decode cycle loses high-frequency detail (PSNR ~27 dB).
