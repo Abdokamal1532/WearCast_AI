@@ -570,11 +570,31 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 # discontinuities between masked/unmasked regions, causing muted colors.
 
                 # =====================================================================
-                # SDEdit latent blending REMOVED
-                # Hard blending at every step with a non-dilated mask creates severe
-                # noise and shoulder clipping artifacts. We let the UNet generate naturally
-                # and rely on the Phase 4 dynamic soft-mask alpha compositing to perfectly
-                # preserve the background and person's identity.
+                # SDEdit Latent Blending (RESTORED WITH BUFFER ZONE FIX)
+                # We MUST use SDEdit to prevent the UNet from hallucinating a fake
+                # background. However, to prevent shoulder clipping, we DILATE the mask 
+                # in latent space by 15 pixels (~120 image pixels) and blur the edge.
+                # This gives the UNet a massive "safe zone" to draw new shoulders and 
+                # inpaint the old garment seamlessly into the original background!
+                # =====================================================================
+                # 1. Dilate the mask (max_pool2d)
+                dilated_mask_latents = torch.nn.functional.max_pool2d(mask_latents_input, kernel_size=15, stride=1, padding=7)
+                # 2. Smooth the edge (avg_pool2d)
+                smooth_mask_latents = torch.nn.functional.avg_pool2d(dilated_mask_latents, kernel_size=5, stride=1, padding=2)
+                
+                init_latents_proper = image_ori_latents_input
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    # FIX: Karras schedulers have init_noise_sigma > 1.0 (e.g. 14.6).
+                    # `noise` is cloned from `latents`, so it is scaled by 14.6.
+                    # `add_noise` expects N(0,1) noise, so passing `noise` directly explodes the variance!
+                    pure_noise = noise / self.scheduler.init_noise_sigma
+                    init_latents_proper = self.scheduler.add_noise(
+                        image_ori_latents_input, pure_noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
+                    )
+                
+                # Blend using the soft, heavily dilated mask
+                latents = (1 - smooth_mask_latents) * init_latents_proper + smooth_mask_latents * latents
                 # =====================================================================
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
