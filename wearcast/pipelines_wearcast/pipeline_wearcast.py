@@ -574,14 +574,13 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 # Mixing noisy original-image latents at every step ensures the output
                 # matches the person's original identity and background perfectly.
                 # =====================================================================
-                init_latents_proper = image_ori_latents
+                init_latents_proper = image_ori_latents_input
                 if i < len(timesteps) - 1:
                     noise_timestep = timesteps[i + 1]
-                    step_noise = torch.randn_like(latents)
                     init_latents_proper = self.scheduler.add_noise(
-                        image_ori_latents, step_noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
+                        image_ori_latents_input, noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
                     )
-                latents = (1 - mask_latents) * init_latents_proper + mask_latents * latents
+                latents = (1 - mask_latents_input) * init_latents_proper + mask_latents_input * latents
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

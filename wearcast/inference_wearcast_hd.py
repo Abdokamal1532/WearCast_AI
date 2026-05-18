@@ -824,8 +824,11 @@ class WearCastHD:
         # --- Color Transfer ---
         print(" -> [COLOR] Evaluating selective color transfer...")
         garm_rgb = np.array(image_garm.convert('RGB'))
-        bg_mask_g = np.all(garm_rgb >= 240, axis=-1)
-        fg_g = garm_rgb[~bg_mask_g]
+        if hasattr(self, '_cached_garm_mask') and self._cached_garm_mask is not None:
+            fg_g = garm_rgb[self._cached_garm_mask > 0]
+        else:
+            bg_mask_g = np.all(garm_rgb >= 240, axis=-1)
+            fg_g = garm_rgb[~bg_mask_g]
         garm_lum = float((fg_g[:, 0]*0.299 + fg_g[:, 1]*0.587 + fg_g[:, 2]*0.114).mean()) if len(fg_g) > 0 else 255.0
         
         IS_DARK_GARMENT = garm_lum < 50.0
@@ -964,10 +967,10 @@ class WearCastHD:
             # CAP: Limit L-shift to ±12 L-units (Kornia 0-100 scale, ~±30 in 0-255 scale).
             # Without this cap, white shirts get shifted to L=96+ (washed-out / pure white),
             # and black shirts get crushed to L<5 (all detail lost). 
-            # ADAPTIVE: For very bright targets (L > 85), raise cap to 15.0 to ensure
-            # white garments don't look gray. For very dark targets (L < 20), raise cap to 25.0
+            # ADAPTIVE: For very bright targets (L > 80), raise cap to 35.0 to ensure
+            # white garments don't look gray. For very dark targets (L < 25), raise cap to 35.0
             # so black shirts aren't left dark gray.
-            MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (25.0 if target_repr[0] < 20.0 else 12.0)
+            MAX_L_SHIFT = 35.0 if target_repr[0] > 80.0 else (35.0 if target_repr[0] < 25.0 else 20.0)
             corrected_lab = gen_lab.clone()
             source_l = gen_lab[:, 0:1, :, :]
             raw_shift_l = target_repr[0] - source_median[0]
