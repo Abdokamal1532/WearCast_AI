@@ -832,11 +832,9 @@ class WearCastHD:
         garm_lum = float((fg_g[:, 0]*0.299 + fg_g[:, 1]*0.587 + fg_g[:, 2]*0.114).mean()) if len(fg_g) > 0 else 255.0
         
         IS_DARK_GARMENT = garm_lum < 50.0
-        if IS_DARK_GARMENT:
-            print(f" -> [COLOR] Dark garment detected (lum={garm_lum:.1f}). Applying color transfer.")
-            gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, color_alpha)
-        else:
-            print(f" -> [COLOR] Light/Medium garment (lum={garm_lum:.1f}). Color transfer disabled.")
+        # Color transfer disabled entirely: Native UNet color extraction is now perfect
+        # thanks to the hard mask zero-out in the VAE encoder.
+        print(f" -> [COLOR] Garment (lum={garm_lum:.1f}). Color transfer disabled to preserve native colors.")
 
         # --- Final Compositing ---
         t_post = time.time()
@@ -899,15 +897,12 @@ class WearCastHD:
         return False
 
     def get_optimal_params(self, category, is_complex_garment):
+        # [FIX PATTERN CLARITY] Always use higher image scale (3.0) for standard garments
+        # to ensure text (like "love") and logos are generated crisply.
         if is_complex_garment:
-            # [FIX PATTERN CLARITY] Complex/patterned garments:
-            # Raised image_scale from 2.0 → 2.5 to strengthen garment conditioning.
-            # Higher guidance = UNet follows source garment more faithfully,
-            # which reduces pattern distortion from the VAE encode/decode cycle.
-            return {"num_steps": 30, "image_scale": 2.5}
+            return {"num_steps": 30, "image_scale": 3.5}
         else:
-            # Simple solid garments: 30 steps, 2.0 scale (lower scale = smoother, natural drape)
-            return {"num_steps": 30, "image_scale": 2.0}
+            return {"num_steps": 30, "image_scale": 3.0}
 
     def apply_statistical_color_transfer(self, gen_arr, image_garm, alpha_mask):
         """

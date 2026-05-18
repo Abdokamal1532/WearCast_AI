@@ -570,18 +570,12 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 # discontinuities between masked/unmasked regions, causing muted colors.
 
                 # =====================================================================
-                # RESTORED SDEdit latent blending (OOTDiffusion default)
-                # Mixing noisy original-image latents at every step ensures the output
-                # matches the person's original identity and background perfectly.
+                # SDEdit latent blending REMOVED
+                # Hard blending at every step with a non-dilated mask creates severe
+                # noise and shoulder clipping artifacts. We let the UNet generate naturally
+                # and rely on the Phase 4 dynamic soft-mask alpha compositing to perfectly
+                # preserve the background and person's identity.
                 # =====================================================================
-                init_latents_proper = image_ori_latents_input
-                if i < len(timesteps) - 1:
-                    noise_timestep = timesteps[i + 1]
-                    init_latents_proper = self.scheduler.add_noise(
-                        image_ori_latents_input, noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
-                    )
-                latents = (1 - mask_latents_input) * init_latents_proper + mask_latents_input * latents
-
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
