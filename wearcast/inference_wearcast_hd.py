@@ -898,30 +898,11 @@ class WearCastHD:
 
     def detect_garment_complexity(self, image_garm):
         """
-        Detects if the garment has complex patterns or logos that require 
-        higher guidance scale or spatial logo warping.
+        [DISABLED] Logo warping is destructive for standard garments.
+        The UNet generates patterns and logos accurately natively.
         """
-        import numpy as np
-        garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
-        # Assuming white/light gray is background
-        bg_mask = np.all(garm_np >= 240, axis=-1)
-        fg_pixels = garm_np[~bg_mask]
-        
-        if len(fg_pixels) < 100:
-            return False
-            
-        base_color = np.median(fg_pixels, axis=0)
-        color_diff = np.linalg.norm(garm_np - base_color, axis=-1)
-        color_diff[bg_mask] = 0
-        
-        std_diff = np.std(color_diff[color_diff > 0])
-        thresh = max(12.0, std_diff * 0.5)
-        raw_logo_mask = (color_diff > thresh).astype(np.uint8)
-        
-        logo_coverage = np.sum(raw_logo_mask) / len(fg_pixels)
-        is_complex = logo_coverage > 0.02
-        print(f"   [COMPLEXITY] Logo coverage: {logo_coverage:.2%} -> Complex: {is_complex}")
-        return is_complex
+        print("   [COMPLEXITY] TPS Warping: DISABLED (returning False always)")
+        return False
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:

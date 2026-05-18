@@ -163,16 +163,7 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     if 0 < hip_y_scaled < height:
         mask_expanded[hip_y_scaled:, :] = 0
         
-    # [FIX E] Enforce aspect-ratio constraint:
-    shoulder_width = abs(pose_data[2][0] - pose_data[5][0]) * scale_factor
-    mask_cols = np.where(np.any(mask_expanded > 0, axis=0))[0]
-    if len(mask_cols) > 0 and shoulder_width > 0:
-        mask_actual_width = mask_cols[-1] - mask_cols[0]
-        if mask_actual_width > shoulder_width * 1.15:
-            trim = int((mask_actual_width - shoulder_width * 1.15) / 2)
-            if mask_cols[0] + trim < mask_cols[-1] - trim:
-                mask_expanded[:, :mask_cols[0] + trim] = 0
-                mask_expanded[:, mask_cols[-1] - trim:] = 0
+    # Removed aspect-ratio constraint as it was improperly cutting off sleeves.
 
     # [FIX F] Explicit bottom-protection step
     pants_protect = ((parse_array == 5) | (parse_array == 6)).astype(np.uint8) * 255
