@@ -764,27 +764,37 @@ class WearCastHD:
         
         # We need TWO masks:
         # 1. color_transfer_mask: strictly the garment (4, 7). We do NOT want to color-transfer skin pixels.
-        # 2. composite_mask: garment + generated skin (14, 15, 18). We MUST paste the newly generated
-        #    skin back over the original image, otherwise the new sleeves won't align with the old arms.
+        # 2. base_mask: garment + generated skin (14, 15, 18).
         color_transfer_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
-        composite_mask = ((parse_new == 4) | (parse_new == 7) | (parse_new == 14) | (parse_new == 15) | (parse_new == 18)).astype(np.float32)
+        base_mask = ((parse_new == 4) | (parse_new == 7) | (parse_new == 14) | (parse_new == 15) | (parse_new == 18)).astype(np.float32)
         
-        # --- FIX: Ensure the composite mask covers the OLD garment area ---
-        # If the new garment is smaller than the old one, we must use the UNet's 
-        # inpainted background to replace the old garment. Otherwise, the old garment
-        # sticks out from underneath the new one in the final composite.
+        composite_mask = base_mask
+        
+        # --- FIX: Eliminate T-Shirt Ghost via Semantic Protection ---
+        # Instead of pasting the UNet's background in the exact shape of the old t-shirt (which
+        # creates a visible t-shirt silhouette ghost), we paste the UNet's seamlessly inpainted
+        # background in a generic, massively dilated bubble. We then explicitly protect the
+        # original face, hair, and pants from being overwritten.
         if hasattr(self, '_cached_hard_mask'):
             old_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-            composite_mask = np.maximum(composite_mask, old_mask_np)
-
-        # --- FIX #20: Strict Dynamic Bounding (CPU OpenCV to prevent OOM) ---
-        if hasattr(self, '_cached_hard_mask'):
-            input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
             
-            # Dilate the hard mask massively to ensure we NEVER clip legitimately generated
-            # wider shoulders or longer sleeves. OpenCV is used to avoid 10GB VRAM spike in Kornia unfold.
-            kernel_relax = np.ones((61, 61), np.uint8)
-            relaxed_mask_np = cv2.dilate(input_mask_np, kernel_relax, iterations=1)
+            # 1. Create a generic bubble around the old t-shirt (61 pixels)
+            dilated_old = cv2.dilate(old_mask_np, np.ones((61, 61), np.uint8), iterations=1)
+            
+            # 2. Identify areas to STRICTLY PROTECT from the UNet's background
+            # Label 2=Hair, 6=Pants, 9=Skirt, 11=Face, 12=LeftLeg, 13=RightLeg
+            protect_mask = ((parse_new == 2) | (parse_new == 6) | (parse_new == 9) | 
+                            (parse_new == 11) | (parse_new == 12) | (parse_new == 13)).astype(np.float32)
+            protect_mask = cv2.dilate(protect_mask, np.ones((11, 11), np.uint8), iterations=1)
+            
+            # 3. The safe background paste area is the generic bubble MINUS the protected areas
+            bg_paste_area = np.maximum(0, dilated_old - protect_mask)
+            
+            # 4. Add the background paste area to the base mask
+            composite_mask = np.maximum(base_mask, bg_paste_area)
+            
+            # --- Strict Dynamic Bounding (Prevent far background hallucinations) ---
+            relaxed_mask_np = dilated_old
             
             # Only apply silhouette clipping for torso-only garments.
             if not _include_arms and hasattr(self, '_cached_parse'):
