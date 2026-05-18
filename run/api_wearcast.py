@@ -28,6 +28,10 @@ import warnings
 # Suppress annoying Diffusers deprecation warnings in the API log
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+import transformers.utils
+if not hasattr(transformers.utils, 'FLAX_WEIGHTS_NAME'):
+    transformers.utils.FLAX_WEIGHTS_NAME = 'flax_model.msgpack'
+
 try:
     from diffusers.utils import logging as diffusers_logging
     diffusers_logging.set_verbosity_error()

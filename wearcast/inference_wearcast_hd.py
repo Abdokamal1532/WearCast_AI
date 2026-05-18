@@ -11,6 +11,10 @@ import time
 from rembg import remove, new_session
 import kornia
 
+import transformers.utils
+if not hasattr(transformers.utils, 'FLAX_WEIGHTS_NAME'):
+    transformers.utils.FLAX_WEIGHTS_NAME = 'flax_model.msgpack'
+
 from wearcast.pipelines_wearcast.pipeline_wearcast import WearCastPipeline
 from wearcast.pipelines_wearcast.unet_garm_2d_condition import UNetGarm2DConditionModel
 from wearcast.pipelines_wearcast.unet_vton_2d_condition import UNetVton2DConditionModel
