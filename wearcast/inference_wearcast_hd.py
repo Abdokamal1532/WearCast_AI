@@ -762,32 +762,27 @@ class WearCastHD:
 
         _include_arms = _orig_mask_coverage > 0.03  # arms present if mask > 3% coverage above torso baseline ~15%
         
-        # CRITICAL FIX: Always use only the garment labels (4=upper_clothes, 7=dress) for
-        # the re-parse composite mask. Previously including arm labels (14/15) caused "skin
-        # hole" artifacts — bare arm pixels got color-transferred and appeared as blobs.
-        # The large 45px dilation of the original mask (applied below) already covers sleeve
-        # boundaries adequately without pulling in raw skin pixels.
-        dynamic_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+        # We need TWO masks:
+        # 1. color_transfer_mask: strictly the garment (4, 7). We do NOT want to color-transfer skin pixels.
+        # 2. composite_mask: garment + generated skin (14, 15, 18). We MUST paste the newly generated
+        #    skin back over the original image, otherwise the new sleeves won't align with the old arms.
+        color_transfer_mask = ((parse_new == 4) | (parse_new == 7)).astype(np.float32)
+        composite_mask = ((parse_new == 4) | (parse_new == 7) | (parse_new == 14) | (parse_new == 15) | (parse_new == 18)).astype(np.float32)
         
         # --- FIX #20: Strict Dynamic Bounding (GPU Accelerated) ---
         with torch.no_grad():
-            dyn_mask_t = torch.from_numpy(dynamic_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+            comp_mask_t = torch.from_numpy(composite_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+            color_mask_t = torch.from_numpy(color_transfer_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+            
             if hasattr(self, '_cached_hard_mask'):
                 input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
                 input_mask_t = torch.from_numpy(input_mask_np).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
                 
-                # CRITICAL FIX: When arms are included (long/short sleeve), use a much
-                # larger dilation so generated sleeves (which may extend beyond the
-                # original mask boundary) are NOT clipped in the composite.
-                # Old: 5px dilation for all cases → sleeves cut off
-                # New: 45px for arm-inclusive, 7px for torso-only
-                dilation_px = 45 if _include_arms else 7
+                # Dilate the hard mask to ensure we don't clip the generated sleeves
+                dilation_px = 15 if _include_arms else 7
                 kernel_relax = torch.ones(dilation_px, dilation_px, device=self.gpu_id)
                 relaxed_mask_t = kornia.morphology.dilation(input_mask_t, kernel_relax)
                 
-                # CRITICAL FIX: Do NOT clip by original person silhouette when arms
-                # are included — it cuts generated long-sleeve fabric that extends
-                # into areas that were background in the original parse.
                 # Only apply silhouette clipping for torso-only garments.
                 if not _include_arms and hasattr(self, '_cached_parse'):
                     sil = (self._cached_parse > 0).astype(np.float32)
@@ -798,32 +793,24 @@ class WearCastHD:
                 else:
                     print(" -> [STRICT] Skipped silhouette clipping (arm-inclusive mask — large dilation used instead).")
                     
-                dyn_mask_t = dyn_mask_t * relaxed_mask_t
+                comp_mask_t = comp_mask_t * relaxed_mask_t
 
-            # Refine the dynamic mask slightly
-            dyn_mask_t = kornia.morphology.dilation(dyn_mask_t, torch.ones(5, 5, device=self.gpu_id))
+            # Refine the composite mask slightly
+            comp_mask_t = kornia.morphology.dilation(comp_mask_t, torch.ones(5, 5, device=self.gpu_id))
             
-            # --- NATIVE MASK BLENDING (CANONICAL ARCHITECTURE) ---
-            # Use the exact same mask that was fed to the UNet during inpainting.
-            # This ensures the AI's output is composited over precisely the region
-            # it was asked to fill — no more, no less. This eliminates:
-            #   - Double sleeves (old garment bleeding through a too-small semantic mask)
-            #   - White border halos (TPS paste-back of original garment image)
-            if hasattr(self, '_cached_hard_mask'):
-                hard_mask_resized = self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)
-                hard_mask_np = np.array(hard_mask_resized).astype(np.float32) / 255.0
-                # Light feathering (7px) for seamless edge blending
-                alpha = cv2.GaussianBlur(hard_mask_np, (7, 7), 0)
-                alpha = np.clip(alpha, 0.0, 1.0)
-                binary_mask = (alpha > 0.5).astype(np.uint8) * 255
-                print(" -> [MASK] Native Mask Blending: using generation mask directly.")
-            else:
-                alpha = dyn_mask_t[0, 0].cpu().numpy()
-                alpha = np.clip(alpha, 0, 1)
-                binary_mask = (alpha > 0.5).astype(np.uint8) * 255
+            alpha = comp_mask_t[0, 0].cpu().numpy()
+            
+            # Feather the composite mask for smooth blending
+            alpha = cv2.GaussianBlur(alpha, (7, 7), 0)
+            alpha = np.clip(alpha, 0, 1)
+            binary_mask = (alpha > 0.5).astype(np.uint8) * 255
+            
+            color_alpha = color_mask_t[0, 0].cpu().numpy()
+            color_alpha = cv2.GaussianBlur(color_alpha, (7, 7), 0)
+            color_alpha = np.clip(color_alpha, 0, 1)
             
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
-
+        
         # Save feather mask for debugging
         debug_save(Image.fromarray((alpha * 255).astype(np.uint8)), "debug_phase4_feather_mask.jpg")
         print(" -> Pro-Feather mask: (dynamic alpha generated)")
@@ -844,7 +831,7 @@ class WearCastHD:
         IS_DARK_GARMENT = garm_lum < 50.0
         if IS_DARK_GARMENT:
             print(f" -> [COLOR] Dark garment detected (lum={garm_lum:.1f}). Applying color transfer.")
-            gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+            gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, color_alpha)
         else:
             print(f" -> [COLOR] Light/Medium garment (lum={garm_lum:.1f}). Color transfer disabled.")
 
@@ -865,7 +852,7 @@ class WearCastHD:
         # --- Logo Warping ---
         if is_complex:
             print(" -> [GRAPHICS] Applying Logo Warping to restore graphics...")
-            final_image = self.apply_logo_warping(image_garm, self._cached_keypoints, final_image, alpha)
+            final_image = self.apply_logo_warping(image_garm, self._cached_keypoints, final_image, color_alpha)
             final_np = np.array(final_image).astype(np.float32)
             
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
