@@ -570,24 +570,21 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 # discontinuities between masked/unmasked regions, causing muted colors.
 
                 # =====================================================================
-                # SDEdit Latent Blending (RESTORED WITH BUFFER ZONE FIX)
-                # We MUST use SDEdit to prevent the UNet from hallucinating a fake
-                # background. However, to prevent shoulder clipping, we DILATE the mask 
-                # in latent space by 15 pixels (~120 image pixels) and blur the edge.
-                # This gives the UNet a massive "safe zone" to draw new shoulders and 
-                # inpaint the old garment seamlessly into the original background!
+                # SDEdit Latent Blending (RESTORED WITH MASSIVE BUBBLE)
+                # We dilate the mask heavily (padding=10 -> 80 pixels) and smooth
+                # (padding=4 -> 32 pixels). Total fade distance = 112 image pixels.
+                # This gives the UNet room for baggy garments, while ensuring the
+                # background past 112 pixels is mathematically identical to the original!
                 # =====================================================================
                 # 1. Dilate the mask (max_pool2d)
-                dilated_mask_latents = torch.nn.functional.max_pool2d(mask_latents_input, kernel_size=15, stride=1, padding=7)
+                dilated_mask_latents = torch.nn.functional.max_pool2d(mask_latents_input, kernel_size=21, stride=1, padding=10)
                 # 2. Smooth the edge (avg_pool2d)
-                smooth_mask_latents = torch.nn.functional.avg_pool2d(dilated_mask_latents, kernel_size=5, stride=1, padding=2)
+                smooth_mask_latents = torch.nn.functional.avg_pool2d(dilated_mask_latents, kernel_size=9, stride=1, padding=4)
                 
                 init_latents_proper = image_ori_latents_input
                 if i < len(timesteps) - 1:
                     noise_timestep = timesteps[i + 1]
-                    # FIX: Karras schedulers have init_noise_sigma > 1.0 (e.g. 14.6).
-                    # `noise` is cloned from `latents`, so it is scaled by 14.6.
-                    # `add_noise` expects N(0,1) noise, so passing `noise` directly explodes the variance!
+                    # FIX: Normalize noise by init_noise_sigma to prevent variance explosion
                     pure_noise = noise / self.scheduler.init_noise_sigma
                     init_latents_proper = self.scheduler.add_noise(
                         image_ori_latents_input, pure_noise, torch.tensor([noise_timestep], dtype=torch.long, device=latents.device)
