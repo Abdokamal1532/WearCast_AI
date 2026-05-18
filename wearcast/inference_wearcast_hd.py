@@ -830,11 +830,19 @@ class WearCastHD:
         
         ori_final = np.array(image_ori.resize(raw_generated.size, Image.BICUBIC).convert('RGB')).astype(np.float32)
 
-        # --- Color Transfer REMOVED ---
-        # The original OOTDiffusion does NOT apply any color correction.
-        # With the upstream fixes (VAE float16, CLIP float32, raw garment input),
-        # the UNet now produces correct colors natively.
-        print(" -> [COLOR] Color transfer DISABLED (trusting UNet native output — matches OOTD).")
+        # --- Color Transfer ---
+        print(" -> [COLOR] Evaluating selective color transfer...")
+        garm_rgb = np.array(image_garm.convert('RGB'))
+        bg_mask_g = np.all(garm_rgb >= 240, axis=-1)
+        fg_g = garm_rgb[~bg_mask_g]
+        garm_lum = float((fg_g[:, 0]*0.299 + fg_g[:, 1]*0.587 + fg_g[:, 2]*0.114).mean()) if len(fg_g) > 0 else 255.0
+        
+        IS_DARK_GARMENT = garm_lum < 50.0
+        if IS_DARK_GARMENT:
+            print(f" -> [COLOR] Dark garment detected (lum={garm_lum:.1f}). Applying color transfer.")
+            gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+        else:
+            print(f" -> [COLOR] Light/Medium garment (lum={garm_lum:.1f}). Color transfer disabled.")
 
         # --- Final Compositing ---
         t_post = time.time()
@@ -848,6 +856,14 @@ class WearCastHD:
         print(" -> [COMPOSITE] Using Pure Semantic Alpha Blending (clean paste-back)...")
         final_np = gen_arr * alpha_3d + ori_final * (1.0 - alpha_3d)
         
+        final_image = Image.fromarray(np.clip(final_np, 0, 255).astype(np.uint8))
+        
+        # --- Logo Warping ---
+        if is_complex:
+            print(" -> [GRAPHICS] Applying Logo Warping to restore graphics...")
+            final_image = self.apply_logo_warping(image_garm, self._cached_keypoints, final_image, alpha)
+            final_np = np.array(final_image).astype(np.float32)
+            
         print(f" -> [COMPOSITE] Success. Elapsed: {time.time() - t_post:.2f}s")
 
         # Post-composite sharpening REMOVED.
@@ -882,14 +898,30 @@ class WearCastHD:
 
     def detect_garment_complexity(self, image_garm):
         """
-        [DISABLED] TPS Logo Warping is permanently disabled.
-        Reason: The warping logic was pasting the raw garment image (with white background)
-        directly onto the AI output, creating white border halos and destroying
-        text/logos that the UNet had already rendered correctly.
-        The UNet (OOTDiffusion) handles patterned garments natively — trust it.
+        Detects if the garment has complex patterns or logos that require 
+        higher guidance scale or spatial logo warping.
         """
-        print("   [COMPLEXITY] TPS Warping: DISABLED (returning False always)")
-        return False
+        import numpy as np
+        garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
+        # Assuming white/light gray is background
+        bg_mask = np.all(garm_np >= 240, axis=-1)
+        fg_pixels = garm_np[~bg_mask]
+        
+        if len(fg_pixels) < 100:
+            return False
+            
+        base_color = np.median(fg_pixels, axis=0)
+        color_diff = np.linalg.norm(garm_np - base_color, axis=-1)
+        color_diff[bg_mask] = 0
+        
+        std_diff = np.std(color_diff[color_diff > 0])
+        thresh = max(12.0, std_diff * 0.5)
+        raw_logo_mask = (color_diff > thresh).astype(np.uint8)
+        
+        logo_coverage = np.sum(raw_logo_mask) / len(fg_pixels)
+        is_complex = logo_coverage > 0.02
+        print(f"   [COMPLEXITY] Logo coverage: {logo_coverage:.2%} -> Complex: {is_complex}")
+        return is_complex
 
     def get_optimal_params(self, category, is_complex_garment):
         if is_complex_garment:

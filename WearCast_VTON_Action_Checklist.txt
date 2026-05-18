@@ -1,0 +1,118 @@
+================================================================================
+         WEARCAST VTON — QUICK-ACTION CHECKLIST  (companion to Audit Report)
+================================================================================
+Use this file as a day-to-day task tracker alongside the full audit report.
+Check off items as they are merged and verified.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 0 — BASELINE (Day 1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] 0.1  Lock random seeds for all 4 test subjects
+[ ] 0.2  Record baseline metrics: SSIM, LPIPS, LAB ΔE, Mask IoU
+[ ] 0.3  Add mask-overlay to debug 4-panel output
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — MASKING FIXES (Days 2–4)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] 1.1  FIX-06: Delete dead `return False` in analyze_sleeve_length()
+         File: utils_wearcast.py ~line 92
+
+[ ] 1.2  FIX-01: Add armpit junction bridging (Solution C fast-path)
+         File: utils_wearcast.py → get_mask_location()
+         Code:
+           junction_region = cv2.dilate(arms, np.ones((5,5), np.uint8), iterations=2)
+           junction_region = cv2.bitwise_and(junction_region, silhouette)
+           mask_expanded   = cv2.bitwise_or(mask_expanded, junction_region)
+
+[ ] 1.3  FIX-02: Add hip-keypoint lower boundary cap to mask
+         File: utils_wearcast.py → get_mask_location()
+         Also add explicit pants_protect dilation guard
+
+[ ] 1.4  FIX-04: Adaptive feather width based on original garment darkness
+         File: inference_wearcast_hd.py (compositing section ~line 812)
+         Code:
+           feather_ksize = 21 if old_garment_is_dark else 7
+           alpha = cv2.GaussianBlur(hard_mask_np, (feather_ksize, feather_ksize), 0)
+
+[ ] 1.5  Re-run all 4 subjects. Verify:
+           ✓ No armpit holes in phase3 and phase4 middle panels
+           ✓ Subject 2 mask stays above hip line
+           ✓ Dark fringe gone on Subject 1 (Abdo)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — COLOUR FIXES (Days 5–7)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] 2.1  Sub-Fix 3c: Replace zero-fill with grey-fill in prepare_vton_latents()
+         File: pipeline_wearcast.py ~line 960
+         Code:
+           grey_fill    = torch.full_like(image, 0.0)
+           image_masked = image * one_minus_mask + grey_fill * mask_vae_bin
+
+[ ] 2.2  Sub-Fix 3a: Re-enable colour transfer selectively for dark garments
+         File: inference_wearcast_hd.py → __call__()
+         Code:
+           garm_mean_l    = np.array(garm_proc).mean()
+           IS_DARK_GARMENT = garm_mean_l < 80
+           if IS_DARK_GARMENT:
+               gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+
+[ ] 2.3  Sub-Fix 3b: Tighten LAB L-shift cap and A/B clamp for near-black
+         File: inference_wearcast_hd.py → apply_statistical_color_transfer()
+         Change MAX_L_SHIFT dark branch: 25.0 → 10.0
+         Add: clamp A/B to [-5, 5] when target_repr[0] < 15.0
+
+[ ] 2.4  FIX-07: Add neck (label 18) to skin_protect_base
+         File: utils_wearcast.py → get_mask_location()
+         Add gradient fade at collar region in compositing step
+
+[ ] 2.5  Re-run all 4 subjects. Verify:
+           ✓ Subject 2 black shirt renders as black (not olive)
+           ✓ Subject 0 collar transition is smooth
+           ✓ Subjects 1 and 3 white shirt colour unchanged
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — GRAPHIC FIDELITY (Days 8–10)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] 3.1  FIX-05a: Restore detect_garment_complexity() with logo_coverage metric
+         File: inference_wearcast_hd.py
+         Threshold: logo_coverage > 0.08 → complex=True
+
+[ ] 3.2  FIX-05b: Patch apply_logo_warping() — use generated image as warp base
+         File: inference_wearcast_hd.py
+         Warp logo pixels only; do NOT paste raw garment over generated output
+
+[ ] 3.3  QA warping on all subjects. Tune logo_coverage threshold.
+         Add degenerate-point guard to cv2.getPerspectiveTransform()
+
+[ ] 3.4  (Optional) Integrate Florence-2/LLaVA as garment captioner
+         File: inference_wearcast_hd.py → generate_garment_caption()
+
+[ ] 3.5  (Optional) Plan LoRA fine-tuning dataset for graphic-tee garments
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — STABILISATION (Days 11–12)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] 4.1  Expand test suite to 12 subjects (diverse build + garment colour)
+[ ] 4.2  Lock acceptance thresholds: SSIM ≥ 0.82 / LPIPS ≤ 0.14 / ΔE ≤ 8
+[ ] 4.3  Set up CI gate on regression harness
+[ ] 4.4  Benchmark runtime: target ≤ 25s on A100-40GB
+[ ] 4.5  Update CHANGELOG.md and tag v1.1-stable
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPTIONAL ARCHITECTURAL IMPROVEMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ ] OBS-1  Load UniPCMultistepScheduler directly (remove DDPMScheduler preload)
+[ ] OBS-2  Compile unet_garm as well as unet_vton
+[ ] OBS-3  Make rembg session model name configurable (env var / config file)
+[ ] OBS-4  Make float32→float16 cast explicit at CLIP→UNet boundary
+[ ] OBS-5  Add parsing confidence check; fallback to bbox heuristic if
+           UpperClothes (label 4) < 5% of image area
+
+================================================================================
+END OF CHECKLIST
+================================================================================

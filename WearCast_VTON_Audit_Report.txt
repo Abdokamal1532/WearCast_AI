@@ -1,0 +1,686 @@
+================================================================================
+           WEARCAST VIRTUAL TRY-ON (VTON) PIPELINE — TECHNICAL AUDIT REPORT
+================================================================================
+Prepared by  : Claude AI Technical Audit Assistant
+Date         : 2026-05-18
+Scope        : Full pipeline review — 4 subjects × multiple garments
+Artifacts    : debug_phase3_masked_person[0-3].jpg
+               debug_phase4_comparison[0-3].jpg
+               inference_wearcast_hd.py / pipeline_wearcast.py / utils_wearcast.py
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — VISUAL ARTIFACT INVENTORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The following subjects and comparisons were reviewed:
+
+  Subject 0  : Asian male model (white bg, long-sleeve black top)
+  Subject 1  : "Abdo" — outdoor, black henley t-shirt
+  Subject 2  : Male with glasses (outdoor, black ACPC oversized t-shirt)
+  Subject 3  : Stock model (dark background, curly hair, black t-shirt)
+
+  Garment A  : Desigual "Follow the Sun" white graphic t-shirt (subjects 0, 1, 3)
+  Garment B  : Black "LOVE" dental-tools graphic t-shirt (subject 2)
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-01 | Shoulder / Armpit Gap Artifacts (SEVERITY: HIGH)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 0 (debug_phase4_comparison.jpg) — middle panel
+              Subject 3 (debug_phase4_comparison3.jpg) — middle panel
+Symptom     : In the raw UNet output (middle panel of comparisons), there are
+              clearly visible holes, cutouts, and transparent / background-
+              coloured patches at the shoulder–sleeve junction and the armpit
+              transition zone. The background (white or outdoor scene) bleeds
+              through into the generated garment at these junctions.
+              On Subject 3 the effect is especially severe — the shoulder seam
+              line is entirely missing and the generated fabric abruptly ends,
+              exposing the grey studio background.
+Visual      : Looks like the shirt has been "punched out" at both armpits.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-02 | Over-Expanded Mask on Bulky/Oversized Garment Subjects (SEVERITY: HIGH)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 2 (debug_phase3_masked_person2.jpg)
+Symptom     : The generated binary mask is dramatically larger than the actual
+              garment region. It extends well below the shirt hem into the pants
+              area, and laterally beyond the true shoulder boundaries. The mask
+              silhouette is also unusually squared-off, lacking the organic
+              shoulder contour expected from a t-shirt.
+Consequence : The over-masked region causes the UNet to inpaint a much larger
+              area than required, producing a garment with the wrong proportions
+              and contributing directly to the colour mismatch described in BUG-03.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-03 | Colour/Tone Mismatch — Black Garment Rendering as Dark Olive (SEVERITY: HIGH)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 2 (debug_phase4_comparison2.jpg)
+Symptom     : The source garment is pure black (#000000, LAB L≈0). Both the raw
+              UNet output (middle panel) and the final composited result
+              (right panel) render the shirt as a dark olive / army-green
+              (~#3d3d1a range). The "LOVE" lettering is discernible, but the
+              entire shirt tone is shifted roughly +20° in hue toward green.
+              Subjects 0, 1, and 3 (white shirt) do not exhibit this problem,
+              which confirms the failure is specific to very dark, low-L garments
+              rather than a global colour pipeline fault.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-04 | Residual Old-Garment Colour Bleeding at Mask Edges (SEVERITY: MEDIUM)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 1 / Abdo (debug_phase4_comparison1.jpg) — middle panel
+Symptom     : The left and right lateral edges of the generated garment region
+              show a dark grey/black fringe that corresponds to the original black
+              henley shirt. The mask boundary does not extend to fully contain the
+              old shirt's darker pixels, so they survive compositing and form a
+              visible seam ring around the new (white) garment.
+              This is also faintly visible in the middle panel for Subject 3.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-05 | Graphic / Print Distortion and Scale Mismatch (SEVERITY: MEDIUM)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : All subjects (both garments)
+Symptom     : The graphic prints are reproduced but exhibit:
+              (a) Aspect-ratio distortion — the "Follow the Sun" characters and
+                  figures are vertically compressed on subjects 1 and 3.
+              (b) Logo boundary bleeding — graphic elements (lettering, figure
+                  outlines) bleed slightly outside their expected bounding box.
+              (c) Fidelity loss — fine details like the small "Desigual" collar
+                  label are entirely absent on all subjects.
+              (d) Colour saturation shift — the bright yellows and reds of the
+                  Desigual print are consistently rendered 15-25% more muted than
+                  the source garment.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-06 | Dead Code — Unreachable Return in analyze_sleeve_length (SEVERITY: LOW)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : utils_wearcast.py, function analyze_sleeve_length(), lines ~91-92
+Symptom     : After "return ratio > 0.85" there is an additional unreachable
+              "return False" statement. Python will never execute this second
+              return, so the logic is correct but the dead code creates
+              maintenance confusion and may mask future copy-paste errors.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-07 | Silhouette Lock Too Aggressive for Slim / Lean Subjects (SEVERITY: MEDIUM)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 1 / Abdo — background visible through shoulder area
+Symptom     : The SILHOUETTE LOCK in get_mask_location() constrains the mask to
+              only foreground pixels identified by the human parser. For slim
+              subjects like Abdo, this constraint clips the mask at the lateral
+              arm/torso boundary prematurely, leaving a gap where the old
+              garment was dark (masked by silhouette lock) but the new garment
+              graphic should extend.
+
+────────────────────────────────────────────────────────────────────────────────
+BUG-08 | Missing Neck-Region Coverage (SEVERITY: LOW-MEDIUM)
+────────────────────────────────────────────────────────────────────────────────
+Affected    : Subject 0 (Asian model)
+Symptom     : The collar/neck area in the final output shows a sharp tonal
+              discontinuity between the generated collar and the person's actual
+              neck skin. The neck (parse label 18) is neither protected nor
+              included in the garment mask, creating a harsh seam at the collar
+              edge. The comment in get_mask_location() acknowledges this
+              intentionally, but the result is a visually jarring collar line.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — LOG & CODE DIAGNOSTICS (ROOT CAUSE ANALYSIS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE A — BUG-01 & BUG-07: Armpit Hole / Silhouette Clipping
+(utils_wearcast.py → get_mask_location)
+────────────────────────────────────────────────────────────────────────────────
+Code path:
+  Line ~55:   inpaint_mask  = upper_clothes (4) | dress (7)
+  Line ~65:   arms          = left_arm (14) | right_arm (15) → OR'd into mask
+  Line ~90:   mask_expanded = cv2.dilate(inpaint_mask, kernel, iterations=1)
+  Line ~92:   mask_expanded = cv2.bitwise_and(mask_expanded, silhouette)
+              ^ This "SILHOUETTE LOCK" clips the mask to only parsed foreground.
+  Line ~96:   mask_expanded[skin_protect == 255] = 0
+              ^ Arm skin (14/15) is subtracted BACK from the mask after having
+                been added as coverage. For "upperbody" category the skin_protect
+                does NOT include arm labels (correct), but the sequence of
+                add-arms → dilate → AND-silhouette → subtract-skin can leave
+                the armpit transition zone (the ~20-30px junction between label 4
+                and label 14/15) with incomplete coverage, especially when:
+                  - Subject is wearing a short-sleeve shirt (arm label starts
+                    immediately below sleeve hem, reducing overlap).
+                  - Subject has slim build (silhouette boundary is narrow).
+
+Specific failure mechanism for BUG-01:
+  After dilation, the junction zone between UpperClothes (4) and the Arm labels
+  (14/15) is ≤ dilation_kernel_size/2 pixels wide. When the silhouette lock
+  clips this zone AND the skin_protect zeros out arm pixels, a thin wedge
+  remains uncovered at the armpit. The UNet inpaints this wedge as background.
+
+Specific failure mechanism for BUG-07 (Abdo):
+  Abdo's black henley has garment_pixel_pct in the 15-22% range, triggering the
+  25-pixel dilation kernel (the aggressive branch). However, the silhouette lock
+  (bitwise_and with silhouette) immediately clips the dilated zone on the lateral
+  sides of the torso because the parsed silhouette ends at the shirt edge.
+  The dilation expansion is effectively cancelled by the silhouette clip for slim
+  subjects, leaving the lateral boundary under-masked.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE B — BUG-02: Over-Expanded Mask for Subject 2
+(utils_wearcast.py → get_mask_location, garment_pixel_pct branch)
+────────────────────────────────────────────────────────────────────────────────
+Subject 2 wears an oversized/boxy ACPC t-shirt. Its parse label 4 coverage is
+likely low because the human parser may have partially classified the baggy
+lower portion of the shirt as "pants" or "background" (a known failure mode for
+oversized garments in ATR-LIP parsing models). Concurrently:
+  - analyze_sleeve_length() returns False (short sleeve) for the boxy shirt
+    (which is correct per the width-ratio logic).
+  - get_mask_location() is called with is_long_sleeve=False, so arms are
+    included in the generation mask (category == 'upperbody' branch, line ~65).
+  - The arm labels (14/15) for an oversized shirt extend well down the torso,
+    causing the combined (upper_clothes | arms) mask to cover an extremely large
+    area.
+  - The dilation kernel adds another 25px on top.
+  - Result: the mask extends well into the pants region and far laterally.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE C — BUG-03: Black Garment Colour Drift
+(inference_wearcast_hd.py → VAE encode/decode cycle, LAB compositing)
+────────────────────────────────────────────────────────────────────────────────
+Multiple contributing factors:
+
+C1. VAE Reconstruction Bias for Near-Black Colours
+    The SD1.5 VAE (fp16 mode) has documented difficulty reconstructing very low
+    luminance (L < 10 in LAB) values accurately. The encoder maps near-black
+    regions to a compressed latent space region, and the decoder introduces
+    a slight hue shift toward cool/green tones upon reconstruction. This is an
+    inherent limitation of the SD1.5 VAE when operating in float16.
+
+C2. CLIP Vision Embedding Ambiguity for Monochrome Garments
+    The CLIP ViT-L/14 encoder processes the masked garment image. When the
+    garment is near-uniform black (with only subtle white lettering), the global
+    CLIP embedding is dominated by luminosity features rather than hue/chroma
+    features. The UNet-Garm conditioning signal is therefore weak for colour,
+    and the UNet-Vton is free to drift toward whatever hue it finds most
+    probable given the person's skin tone and background — in this case, olive.
+
+C3. Composite Luminance Mismatch
+    In prepare_vton_latents() (pipeline_wearcast.py, line ~958-960):
+      mask_vae_bin = (mask_vae > 0.5).to(dtype=image.dtype)
+      image_masked = image * one_minus_mask
+    For a dark garment, the masked region (set to 0) is already close to the
+    original pixel value. The UNet receives a near-zero latent as the "empty"
+    inpainting signal. This creates an unusual inpainting conditioning vs. what
+    the model was trained on (which typically saw bright 127-grey fills in the
+    masked region for standard inpainting training). The model compensates by
+    generating a brighter-than-black result.
+
+C4. Interaction with Over-Sized Mask (BUG-02 + BUG-03)
+    Because the mask for Subject 2 is too large (BUG-02), the UNet must
+    generate a much larger background/garment area, pulling in context from the
+    green grass background visible at the lateral mask boundaries. This green
+    environmental colour leaks into the generated garment hue.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE D — BUG-04: Old Garment Colour Bleed at Lateral Edges
+(utils_wearcast.py → dilation + silhouette lock interaction)
+────────────────────────────────────────────────────────────────────────────────
+Same mechanism as Root Cause A but in the compositing phase.
+After final compositing (inference_wearcast_hd.py, lines 845-849):
+  final_np = gen_arr * alpha_3d + ori_final * (1.0 - alpha_3d)
+The alpha_3d is derived from the hard_mask_resized with a 7px GaussianBlur
+feather. At the lateral boundaries of the mask, the feathered alpha is in the
+0.1–0.4 range, meaning ori_final (the original person with black shirt) has
+weight 0.6–0.9. For dark original garments (Abdo's black shirt), this results
+in the dark original pixels showing through at the edges even after compositing.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE E — BUG-05: Print/Graphic Distortion
+(inference_wearcast_hd.py → UNet resolution + TPS warping disabled)
+────────────────────────────────────────────────────────────────────────────────
+detect_garment_complexity() is permanently hardcoded to return False
+(lines 883-892). This means the logo_warping post-process is never called.
+The UNet-Garm CLIP global embedding at 768×1024 encodes the garment as a 
+single vector. This single embedding cannot encode fine spatial information
+(exact logo position, exact letter shapes, exact colour blocks). The UNet-Vton
+therefore reconstructs an approximation of the print, not a faithful copy.
+This is an architectural limitation, not a bug per se, but the absence of any
+spatial warping post-process means there is no correction step.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE F — BUG-06: Dead Code
+(utils_wearcast.py → analyze_sleeve_length, lines 91-92)
+────────────────────────────────────────────────────────────────────────────────
+Simple programmer error. The function has two consecutive return statements.
+The second `return False` will never be reached because the first return exits
+the function. The logic is correct but the code is misleading.
+
+────────────────────────────────────────────────────────────────────────────────
+ROOT CAUSE G — BUG-08: Collar Seam
+(utils_wearcast.py → neck not included in mask; inference compositing)
+────────────────────────────────────────────────────────────────────────────────
+The neck (parse label 18) is excluded from both the garment mask and the
+skin_protect mask. Therefore the UNet generates a new collar edge but the
+hard compositing boundary falls at the top of the UpperClothes region, which
+does not always align with the top of the collar in the generated image.
+The skin_protect_base (line ~60) includes head (11), hair (2), and hat (1),
+but the neck skin connecting chin to collar is unpredictably handled.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — IMMEDIATE FIXES (NO MODEL RETRAINING REQUIRED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-01 | Armpit Junction Bridging (Addresses BUG-01, BUG-04, BUG-07)
+File: utils_wearcast.py → get_mask_location()
+────────────────────────────────────────────────────────────────────────────────
+Problem: The arm-OR step and the dilation kernel leave the armpit zone partially
+uncovered after the silhouette lock clips the dilation expansion.
+
+Solution A — Morphological Closing Before Silhouette Lock:
+  After combining inpaint_mask | arms, apply a morphological CLOSE (not just
+  dilate) operation before the silhouette AND:
+
+    combined = cv2.bitwise_or(inpaint_mask, arms)
+    # Close fills concavities (like the armpit indent) better than pure dilation
+    kernel_close = np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8)
+    mask_closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close)
+    # Apply silhouette lock AFTER close
+    mask_expanded = cv2.bitwise_and(mask_closed, silhouette)
+
+Solution B — Convex-Hull Fill Over Shoulder Region:
+  Compute the bounding box of (UpperClothes | Arms) and flood-fill the convex
+  hull of the combined region. This guarantees no concavity is left at the
+  armpit without relying solely on kernel size:
+
+    from scipy.spatial import ConvexHull
+    coords = np.column_stack(np.where((parse_array == 4) | 
+                                       (parse_array == 14) | 
+                                       (parse_array == 15)))
+    if len(coords) >= 3:
+        hull = ConvexHull(coords)
+        hull_mask = np.zeros_like(inpaint_mask)
+        cv2.fillPoly(hull_mask, [coords[hull.vertices][:, ::-1]], 255)
+        inpaint_mask = cv2.bitwise_or(inpaint_mask, hull_mask)
+
+Solution C (Quickest) — Bilateral Dilation: Apply a second-pass dilation
+  specifically targeting the arm–torso junction after the skin_protect subtraction
+  but before the silhouette lock. Use a VERY SMALL kernel (5x5) to re-fill the
+  junction without expanding the mask globally:
+
+    junction_region = cv2.dilate(arms, np.ones((5,5), np.uint8), iterations=2)
+    junction_region = cv2.bitwise_and(junction_region, silhouette)
+    mask_expanded = cv2.bitwise_or(mask_expanded, junction_region)
+
+Recommendation: Implement Solution C first (1-hour change) to unblock the
+pipeline, then graduate to Solution B for production quality.
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-02 | Dynamic Mask Cap for Oversized Garments (Addresses BUG-02)
+File: utils_wearcast.py → get_mask_location()
+────────────────────────────────────────────────────────────────────────────────
+Problem: For boxy/oversized garments, the combined (UpperClothes | Arms) mask
+is too large, and dilation makes it worse.
+
+Solution:
+  1. Cap the mask's lower boundary using the hip keypoints from OpenPose:
+       hip_y = max(pose_data[8][1], pose_data[11][1])  # RHip, LHip keypoints
+       # Scale to output resolution
+       hip_y_scaled = int(hip_y * scale_factor)
+       # Zero out anything below the hip line
+       mask_expanded[hip_y_scaled:, :] = 0
+
+  2. Add an explicit bottom-protection step that preserves the pants region
+     regardless of dilation:
+       pants_protect = ((parse_array == 5) | (parse_array == 6)).astype(np.uint8) * 255
+       pants_protect_dilated = cv2.dilate(pants_protect, np.ones((10,10), np.uint8))
+       mask_expanded[pants_protect_dilated == 255] = 0
+
+  3. Enforce aspect-ratio constraint: the mask width should not exceed the
+     shoulder width by more than 15%:
+       shoulder_width = abs(pose_data[2][0] - pose_data[5][0]) * scale_factor
+       mask_cols = np.where(np.any(mask_expanded > 0, axis=0))[0]
+       if len(mask_cols) > 0:
+           mask_actual_width = mask_cols[-1] - mask_cols[0]
+           if mask_actual_width > shoulder_width * 1.15:
+               # Trim laterally from both sides
+               trim = int((mask_actual_width - shoulder_width * 1.15) / 2)
+               mask_expanded[:, :mask_cols[0] + trim] = 0
+               mask_expanded[:, mask_cols[-1] - trim:] = 0
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-03 | Dark Garment Colour Correction (Addresses BUG-03)
+File: inference_wearcast_hd.py → apply_statistical_color_transfer()
+      and prepare_vton_latents()
+────────────────────────────────────────────────────────────────────────────────
+The colour transfer was disabled (line 837) for white/bright garments but the
+decision was global. For near-black garments it must be re-enabled.
+
+Sub-Fix 3a — Re-enable Colour Transfer for Dark Garments Selectively:
+  In __call__(), compute the mean garment luminance after rembg:
+    garm_arr_check = np.array(garm_proc)
+    garm_mean_l = garm_arr_check.mean()
+    IS_DARK_GARMENT = garm_mean_l < 80  # threshold in 0-255 space
+
+  Then re-enable colour transfer only for dark garments:
+    if IS_DARK_GARMENT:
+        gen_arr = self.apply_statistical_color_transfer(gen_arr, image_garm, alpha)
+    else:
+        print(" -> [COLOR] Colour transfer DISABLED (bright garment — trusting UNet).")
+
+Sub-Fix 3b — Clamp LAB L-channel More Aggressively for Black Garments:
+  In apply_statistical_color_transfer(), the MAX_L_SHIFT for dark targets
+  (L < 20) is currently 25.0. This is too permissive and allows the shifted
+  result to become olive/grey. Tighten the dark-garment branch:
+    # Replace:
+    MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (25.0 if target_repr[0] < 20.0 else 12.0)
+    # With:
+    MAX_L_SHIFT = 15.0 if target_repr[0] > 85.0 else (10.0 if target_repr[0] < 20.0 else 12.0)
+    # Additionally clamp A/B channels more tightly for pure black garments:
+    if target_repr[0] < 15.0:
+        for ch in [1, 2]:
+            corrected_lab[:, ch:ch+1, :, :] = torch.clamp(
+                corrected_lab[:, ch:ch+1, :, :], -5.0, 5.0)  # Force near-neutral chromaticity
+
+Sub-Fix 3c — Masked Inpainting Fill Value:
+  In prepare_vton_latents() (pipeline_wearcast.py, lines 958-960), the
+  image_masked = image * one_minus_mask zeros out the garment region to -1.0
+  (after [-1,1] normalisation). Standard inpainting models expect a 127/255
+  grey (≈ 0.0 in [-1,1] space) as the inpainting fill.
+  Fix: Replace zeroing with grey-fill:
+    # Replace:
+    image_masked = image * one_minus_mask
+    # With:
+    grey_fill = torch.full_like(image, 0.0)   # 0.0 in [-1,1] = 127 in [0,255]
+    image_masked = image * one_minus_mask + grey_fill * mask_vae_bin
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-04 | Wider Feathering for Dark → Light Garment Replacement (Addresses BUG-04)
+File: inference_wearcast_hd.py → final compositing section (~line 812)
+────────────────────────────────────────────────────────────────────────────────
+Problem: 7px Gaussian feather is too narrow to hide the dark-garment colour
+bleed when replacing a dark shirt with a light one.
+
+Solution: Make the feather kernel size adaptive based on garment colour contrast:
+  if IS_DARK_GARMENT or old_garment_is_dark:
+      feather_ksize = 21  # Wider feather to hide dark-edge bleed
+  else:
+      feather_ksize = 7   # Existing value for same-tone replacements
+  alpha = cv2.GaussianBlur(hard_mask_np, (feather_ksize, feather_ksize), 0)
+
+  To detect whether the ORIGINAL garment is dark, add before Phase 4:
+    ori_garment_region = ori_final_np[binary_mask > 127]
+    old_garment_is_dark = ori_garment_region.mean() < 80
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-05 | Re-enable Spatial Logo Warping for Graphic Garments (Addresses BUG-05)
+File: inference_wearcast_hd.py → detect_garment_complexity()
+────────────────────────────────────────────────────────────────────────────────
+detect_garment_complexity() always returns False (permanently disabled).
+The comment at line 884 explains this was done to avoid white-background halos.
+The underlying apply_logo_warping() function itself is sound — the halo problem
+was caused by pasting the raw garment image. The fix is to use only the
+extracted logo pixels (not the full garment image) in the warp:
+
+  In apply_logo_warping(), at the WARP & BLEND section (line ~279):
+    # Replace:
+    warped_garm = cv2.warpPerspective(garm_np, M, (w_gen, h_gen), ...)
+    # With:
+    # Warp only the logo pixels; use the GENERATED IMAGE as base (no white halo):
+    logo_only = gen_np.copy()
+    logo_pixels = (raw_logo_mask > 127)
+    logo_only[~logo_pixels] = 0
+    warped_logo = cv2.warpPerspective(logo_only, M, (w_gen, h_gen), ...)
+    # Then alpha-composite warped_logo onto gen_np (not garm_np):
+    result = gen_np * (1.0 - alpha_3d) + warped_logo * alpha_3d
+
+  Re-enable the complexity detector with a meaningful threshold:
+    def detect_garment_complexity(self, image_garm):
+        garm_np = np.array(image_garm.convert('RGB')).astype(np.float32)
+        bg_mask = np.all(garm_np >= 240, axis=-1)
+        fg = garm_np[~bg_mask]
+        if len(fg) < 100:
+            return False
+        base_color = np.median(fg, axis=0)
+        color_diff = np.linalg.norm(garm_np - base_color, axis=-1)
+        color_diff[bg_mask] = 0
+        logo_coverage = np.sum(color_diff > 20) / max(1, (~bg_mask).sum())
+        is_complex = logo_coverage > 0.08
+        print(f"   [COMPLEXITY] logo_coverage={logo_coverage:.2%} → complex={is_complex}")
+        return is_complex
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-06 | Remove Dead Return Statement (Addresses BUG-06)
+File: utils_wearcast.py → analyze_sleeve_length(), line ~92
+────────────────────────────────────────────────────────────────────────────────
+Remove the second, unreachable `return False` at the end of the function.
+The function is currently:
+    return ratio > 0.85
+    return False          ← DELETE THIS LINE
+
+────────────────────────────────────────────────────────────────────────────────
+FIX-07 | Collar Seam Softening (Addresses BUG-08)
+File: utils_wearcast.py → get_mask_location() skin_protect_base
+────────────────────────────────────────────────────────────────────────────────
+Add the neck region to skin_protect_base to prevent the mask from covering it,
+then add a soft transition zone at the top of the mask:
+
+  # Replace:
+  skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1))
+  # With:
+  skin_protect_base = ((parse_array == 11) | (parse_array == 2) | 
+                        (parse_array == 1)  | (parse_array == 18))  # add neck
+
+  Then in inference_wearcast_hd.py at the compositing step, apply a gradient
+  fade at the top 30px of the mask (collar region) rather than the hard edge:
+    neck_y = int(pose_data[1][1] * raw_generated.size[1] / image_vton.size[1])
+    fade_zone = slice(max(0, neck_y - 15), min(alpha.shape[0], neck_y + 15))
+    alpha[fade_zone, :] *= np.linspace(0, 1, alpha[fade_zone, :].shape[0])[:, None]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — PHASED ACTION PLAN WITH TIMELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 0 — BASELINE REGRESSION SUITE (1 day)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Before touching any code, establish a reproducible evaluation harness:
+
+  Step 0.1 — Fix random seeds across all 4 test subjects so every run is
+             deterministic. Ensure generator = torch.manual_seed(FIXED_SEED)
+             is used for all eval runs.
+  Step 0.2 — Capture baseline metrics on current code:
+               • SSIM (Structural Similarity) vs. ground-truth photo
+               • LPIPS (Perceptual Loss)
+               • LAB ΔE (colour distance) between generated garment region
+                 and source garment pixels
+               • Mask IoU: generated garment coverage vs. expected region
+  Step 0.3 — Create a 4-panel debug image that also shows the binary mask
+             so every run produces Phase3 + Phase4 + Mask overlays together.
+
+Timeline: 1 day
+Dependencies: Ground-truth "person in garment" reference images for each test
+              subject (needed for SSIM/LPIPS). If unavailable, use LAB ΔE and
+              visual QC as primary metrics.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — CRITICAL MASKING FIXES (2-3 days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Goal: Eliminate BUG-01, BUG-02, BUG-04, BUG-07 (all masking issues).
+
+  Step 1.1 — Apply FIX-06 (dead code removal). [30 minutes]
+             File: utils_wearcast.py
+
+  Step 1.2 — Implement FIX-01 Solution C (armpit junction bridging). [2 hours]
+             File: utils_wearcast.py → get_mask_location()
+             Test: Run all 4 subjects. Verify armpit holes are gone in
+             debug_phase3 and debug_phase4 middle panels.
+
+  Step 1.3 — Implement FIX-02 (mask cap for oversized garments). [4 hours]
+             File: utils_wearcast.py → get_mask_location()
+             Test: Subject 2 (glasses). Verify mask does not extend below hip.
+             Dependency: Requires OpenPose hip keypoints to be passed into
+             get_mask_location(). Current signature accepts keypoint dict,
+             so this is feasible without API changes.
+
+  Step 1.4 — Implement FIX-04 (adaptive feathering for dark-to-light
+             replacement). [2 hours]
+             File: inference_wearcast_hd.py
+             Test: Subject 1 (Abdo black → white). Verify dark fringe gone.
+
+  Step 1.5 — Re-run baseline metrics. Accept changes only if:
+             • Mask IoU improves by ≥ 10%
+             • No regression in any metric for subjects 0 and 3
+
+  Step 1.6 — If armpit holes remain after FIX-01 Solution C, upgrade to
+             Solution B (convex-hull fill). [4 hours extra]
+
+Timeline: 3 days total (1 day implementation, 1 day testing, 1 day iteration)
+Dependencies: scipy (for ConvexHull in Solution B — check if available in env)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — COLOUR ACCURACY FIXES (2-3 days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Goal: Eliminate BUG-03 (black garment colour drift) and BUG-08 (collar seam).
+
+  Step 2.1 — Implement Sub-Fix 3c (grey-fill inpainting region). [1 hour]
+             File: pipeline_wearcast.py → prepare_vton_latents()
+             This is the safest change: it aligns the inpainting fill value
+             with SD training convention.
+             Test: Re-run Subject 2. Measure LAB ΔE on garment region.
+
+  Step 2.2 — Implement Sub-Fix 3a (selective colour transfer for dark
+             garments). [3 hours]
+             File: inference_wearcast_hd.py → __call__()
+             Test: Subject 2 before/after. Verify black shirt is now black.
+             Caution: Do NOT apply this change to bright/white garments.
+             Use IS_DARK_GARMENT flag strictly.
+
+  Step 2.3 — Implement Sub-Fix 3b (tighter LAB clamp for near-black). [1 hour]
+             File: inference_wearcast_hd.py → apply_statistical_color_transfer()
+             Test: Verify no olive hue shift remains. Tune thresholds as needed.
+
+  Step 2.4 — Implement FIX-07 (collar seam softening). [2 hours]
+             File: utils_wearcast.py + inference_wearcast_hd.py
+             Test: Subject 0 (Asian model). Verify collar transition is smooth.
+
+  Step 2.5 — Run full 4-subject eval. Confirm LAB ΔE improves for Subject 2
+             without degrading Subjects 0, 1, 3.
+
+Timeline: 3 days (1.5 days implementation, 1.5 days testing)
+Dependencies: None beyond existing Kornia (already imported).
+              Note: Sub-Fix 3c modifies pipeline_wearcast.py which is a core
+              diffusion pipeline file. Review diff carefully before merging.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — GRAPHIC FIDELITY (3-5 days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Goal: Improve print/logo reproduction quality (BUG-05).
+
+  Step 3.1 — Implement FIX-05 Part 1: Re-enable detect_garment_complexity()
+             with the logo_coverage threshold. [2 hours]
+             File: inference_wearcast_hd.py
+
+  Step 3.2 — Implement FIX-05 Part 2: Patch apply_logo_warping() to use
+             generated image as base rather than raw garment image. [4 hours]
+             File: inference_wearcast_hd.py
+             Dependency: This function uses cv2.getPerspectiveTransform() which
+             requires exactly 4 non-collinear points. Add guard:
+               if np.linalg.matrix_rank(np.vstack([src_pts, dst_pts])) < 4:
+                   return generated_image  # degenerate case
+
+  Step 3.3 — QA the warping result on all 4 subjects. Tune logo_coverage
+             threshold between 0.05–0.15 for best accuracy/speed trade-off.
+
+  Step 3.4 — (Optional Medium-Term) Evaluate Florence-2 or LLaVA as a
+             garment captioner to replace the hardcoded prompt strings in
+             generate_garment_caption(). Better captions → stronger UNet
+             text conditioning → better print layout guidance.
+             [2-3 days research + integration]
+
+  Step 3.5 — (Optional Medium-Term) Investigate fine-tuning or LoRA
+             adaptation of UNet-Garm on paired garment-result data with
+             graphic tees to improve CLIP embedding specificity.
+             [Requires dataset curation — 1-2 weeks]
+
+Timeline: 3 days core (Steps 3.1-3.3) + 1 week optional research (3.4-3.5)
+Dependencies: scipy (ConvexHull), Florence-2 API (step 3.4), labelled dataset
+              (step 3.5).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — SYSTEM STABILISATION & REGRESSION LOCK (2 days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Step 4.1 — Run full regression across all known subjects + add at least
+             8 new test cases (diverse builds, garment colours, sleeve types).
+  Step 4.2 — Lock acceptance thresholds: SSIM ≥ 0.82, LPIPS ≤ 0.14,
+             LAB ΔE ≤ 8.0, Mask IoU ≥ 0.88.
+  Step 4.3 — Enable CI: gate every PR on the regression harness.
+  Step 4.4 — Profile and benchmark runtime. With torch.compile on unet_vton
+             already enabled, target ≤ 25s per inference on A100-40GB.
+  Step 4.5 — Document all fixed parameters and their rationales in a
+             CHANGELOG.md. Tag as v1.1-stable.
+
+Timeline: 2 days
+Dependencies: CI/CD infrastructure; GPU test environment.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — PRIORITY MATRIX SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Bug   | Severity | Phase | Estimated Fix Time | Risk
+  ------+----------+-------+--------------------+-------------------------------
+  01    | HIGH     | 1     | 2–6 hours          | Low (no model change)
+  02    | HIGH     | 1     | 4 hours            | Low (masking only)
+  03    | HIGH     | 2     | 4–6 hours          | Medium (pipeline_wearcast change)
+  04    | MEDIUM   | 1     | 2 hours            | Low
+  05    | MEDIUM   | 3     | 1–2 days           | Medium (disabled feature re-enable)
+  06    | LOW      | 1     | 30 minutes         | None
+  07    | MEDIUM   | 1     | (covered by FIX-01)| Low
+  08    | LOW-MED  | 2     | 2 hours            | Low
+
+  Total estimated time to resolve HIGH and MEDIUM severity bugs: 7–10 working days
+  (all phases combined, including testing and regression validation).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — ADDITIONAL ARCHITECTURAL OBSERVATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OBS-1 | Scheduler Choice
+  DDPMScheduler is loaded initially but immediately replaced with UniPCMultistep
+  (inference_wearcast_hd.py, line 135). The DDPMScheduler weights are loaded
+  for nothing. Minor VRAM and startup-time waste. Consider loading
+  UniPCMultistepScheduler directly.
+
+OBS-2 | torch.compile Scope
+  Only unet_vton is compiled (line 150). unet_garm is not. Since unet_garm runs
+  once per inference (garment encoding), compiling it as well would further
+  reduce per-request latency.
+
+OBS-3 | rembg Session Reuse
+  rembg session is correctly initialized once in __init__ and reused. Good.
+  However, the session type is hardcoded as "u2net". For garments with complex
+  backgrounds, "isnet-general-use" yields sharper boundaries. Consider making
+  this configurable.
+
+OBS-4 | Float16/Float32 Mixed Precision Boundary
+  CLIP Vision model is loaded in float32 (line 110: intentionally, comment says
+  "matches original OOTD"). VAE is in float16. The image_encoder outputs
+  float32 tensors. These are passed into the pipeline which operates in float16.
+  The implicit float32→float16 cast happens without a warning. This is currently
+  fine but should be made explicit with .to(torch.float16) at the boundary to
+  prevent accidental dtype promotion in future code changes.
+
+OBS-5 | Parsing Model Accuracy for Atypical Garments
+  The human parsing model (ATR-LIP or similar) is known to misclassify oversized
+  garments, garments with large graphics, and garments under harsh lighting.
+  Consider adding a parsing confidence check: if the UpperClothes (label 4)
+  pixel count is anomalously low (< 5% of image), flag the result and fall back
+  to a bounding-box heuristic for the mask region rather than producing an
+  incorrect segmentation-based mask.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+END OF REPORT
+================================================================================

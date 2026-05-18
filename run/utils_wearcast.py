@@ -97,7 +97,6 @@ def analyze_sleeve_length(garm_mask_np):
     
     # If the bottom is at least 85% as wide as the top, it's a long sleeve.
     return ratio > 0.85
-    return False
 
 def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
     import cv2
@@ -116,9 +115,8 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
 
     # 3. Protect Identity (Face, Hair, Hat)
-    # We do NOT protect the neck (18) strictly here. The UNet must be free to generate a new neck
-    # that seamlessly fits the new collar type (e.g. V-neck).
-    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1)).astype(np.uint8) * 255
+    # We protect the neck (18) to ensure smooth collar seams.
+    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
 
     if category == 'upperbody':
         print(" -> [MASK] Covering full arms in generation mask to ensure all old sleeves are hidden.")
@@ -149,10 +147,38 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     print(f"   [DEBUG MASK] garment_pct={garment_pixel_pct:.2%} → selected dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
     mask_expanded = cv2.dilate(inpaint_mask, np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8), iterations=1)
     
-    # SILHOUETTE LOCK: 
+    # [FIX C] Armpit Bridging
+    arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
+    junction_region = cv2.dilate(arms, np.ones((5,5), np.uint8), iterations=2)
     silhouette = (parse_array > 0).astype(np.uint8) * 255
+    junction_region = cv2.bitwise_and(junction_region, silhouette)
+    mask_expanded = cv2.bitwise_or(mask_expanded, junction_region)
+    
+    # SILHOUETTE LOCK: 
     mask_expanded = cv2.bitwise_and(mask_expanded, silhouette)
     
+    # [FIX D] Cap the mask's lower boundary using the hip keypoints
+    hip_y = max(pose_data[8][1], pose_data[11][1])  # RHip, LHip keypoints
+    hip_y_scaled = int(hip_y * scale_factor)
+    if 0 < hip_y_scaled < height:
+        mask_expanded[hip_y_scaled:, :] = 0
+        
+    # [FIX E] Enforce aspect-ratio constraint:
+    shoulder_width = abs(pose_data[2][0] - pose_data[5][0]) * scale_factor
+    mask_cols = np.where(np.any(mask_expanded > 0, axis=0))[0]
+    if len(mask_cols) > 0 and shoulder_width > 0:
+        mask_actual_width = mask_cols[-1] - mask_cols[0]
+        if mask_actual_width > shoulder_width * 1.15:
+            trim = int((mask_actual_width - shoulder_width * 1.15) / 2)
+            if mask_cols[0] + trim < mask_cols[-1] - trim:
+                mask_expanded[:, :mask_cols[0] + trim] = 0
+                mask_expanded[:, mask_cols[-1] - trim:] = 0
+
+    # [FIX F] Explicit bottom-protection step
+    pants_protect = ((parse_array == 5) | (parse_array == 6)).astype(np.uint8) * 255
+    pants_protect_dilated = cv2.dilate(pants_protect, np.ones((10,10), np.uint8))
+    mask_expanded[pants_protect_dilated == 255] = 0
+
     # Apply protections
     mask_expanded[skin_protect == 255] = 0
     mask_expanded[bottoms == 255] = 0
