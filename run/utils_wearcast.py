@@ -98,105 +98,121 @@ def analyze_sleeve_length(garm_mask_np):
     # If the bottom is at least 85% as wide as the top, it's a long sleeve.
     return ratio > 0.85
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
-    import cv2
-    import numpy as np
-    
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384,height=512, is_long_sleeve=False):
     im_parse = model_parse.resize((width, height), Image.NEAREST)
     parse_array = np.array(im_parse)
 
-    print(" -> Constructing High-Precision Mask (Strict Clothing Boundaries)...")
-
-    # 1. Base Mask: ONLY Upper clothes (4) and Dress (7)
-    inpaint_mask = ((parse_array == 4) | (parse_array == 7)).astype(np.uint8) * 255
-
-    pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape((-1, 2))
-    scale_factor = height / 512.0
-    pt = lambda idx: np.multiply(tuple(pose_data[idx][:2]), scale_factor)
-
-    # 3. Protect Identity (Face, Hair, Hat)
-    # We protect the neck (18) to ensure smooth collar seams.
-    skin_protect_base = ((parse_array == 11) | (parse_array == 2) | (parse_array == 1) | (parse_array == 18)).astype(np.uint8) * 255
-
-    if category == 'upperbody':
-        print(" -> [MASK] Covering full arms in generation mask to ensure all old sleeves are hidden.")
-        arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
-        inpaint_mask = cv2.bitwise_or(inpaint_mask, arms)
-        skin_protect = skin_protect_base
+    if model_type == 'hd':
+        arm_width = 60
+    elif model_type == 'dc':
+        arm_width = 45
     else:
-        arms_protect = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
-        skin_protect = cv2.bitwise_or(skin_protect_base, arms_protect)
-    
-    # 4. Protect Bottoms (Pants, Skirts)
-    bottoms = ((parse_array == 5) | (parse_array == 6) | (parse_array == 9) | (parse_array == 10) | (parse_array == 12) | (parse_array == 13)).astype(np.uint8) * 255
-    
-    # 5. Adaptive Dilation
-    # [FIX B] Kernel size adapts to how much of the image is already labeled as garment.
-    # Large people (Gemini-style product models) often have UpperClothes = 25–35% of frame,
-    # Normal real-world subjects (like Abdo) have 15-22%.
-    # If the threshold is too low, we under-mask normal people, causing black boundary seams.
-    garment_pixel_pct = np.sum(parse_array == 4) / max(1, parse_array.size)
-    if garment_pixel_pct > 0.28:
-        dilation_kernel_size = 15   # Massive parsed region (e.g. tight crop) — conservative
-    elif garment_pixel_pct > 0.22:
-        dilation_kernel_size = 20   # Medium-Large
+        raise ValueError("model_type must be \'hd\' or \'dc\'!")
+
+    parse_head = (parse_array == 1).astype(np.float32) + \
+                 (parse_array == 3).astype(np.float32) + \
+                 (parse_array == 11).astype(np.float32)
+
+    parser_mask_fixed = (parse_array == label_map["left_shoe"]).astype(np.float32) + \
+                        (parse_array == label_map["right_shoe"]).astype(np.float32) + \
+                        (parse_array == label_map["hat"]).astype(np.float32) + \
+                        (parse_array == label_map["sunglasses"]).astype(np.float32) + \
+                        (parse_array == label_map["bag"]).astype(np.float32)
+
+    parser_mask_changeable = (parse_array == label_map["background"]).astype(np.float32)
+
+    arms_left = (parse_array == 14).astype(np.float32)
+    arms_right = (parse_array == 15).astype(np.float32)
+    arms = arms_left + arms_right
+
+    if category == 'dresses':
+        parse_mask = (parse_array == 7).astype(np.float32) + \
+                     (parse_array == 4).astype(np.float32) + \
+                     (parse_array == 5).astype(np.float32) + \
+                     (parse_array == 6).astype(np.float32)
+
+        parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+
+    elif category == 'upper_body' or category == 'upperbody':
+        parse_mask = (parse_array == 4).astype(np.float32) + (parse_array == 7).astype(np.float32)
+        parser_mask_fixed_lower_cloth = (parse_array == label_map["skirt"]).astype(np.float32) + \
+                                        (parse_array == label_map["pants"]).astype(np.float32)
+        parser_mask_fixed += parser_mask_fixed_lower_cloth
+        parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
+    elif category == 'lower_body':
+        parse_mask = (parse_array == 6).astype(np.float32) + \
+                     (parse_array == 12).astype(np.float32) + \
+                     (parse_array == 13).astype(np.float32) + \
+                     (parse_array == 5).astype(np.float32)
+        parser_mask_fixed += (parse_array == label_map["upper_clothes"]).astype(np.float32) + \
+                             (parse_array == 14).astype(np.float32) + \
+                             (parse_array == 15).astype(np.float32)
+        parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
     else:
-        dilation_kernel_size = 25   # Standard real human — expand aggressively to prevent seams
-    
-    # [DEBUG MASK] Precise print
-    print(f"   [DEBUG MASK] garment_pct={garment_pixel_pct:.2%} → selected dilation kernel={dilation_kernel_size}x{dilation_kernel_size}")
-    mask_expanded = cv2.dilate(inpaint_mask, np.ones((dilation_kernel_size, dilation_kernel_size), np.uint8), iterations=1)
-    
-    # [FIX C] Armpit Bridging
-    arms = ((parse_array == 14) | (parse_array == 15)).astype(np.uint8) * 255
-    junction_region = cv2.dilate(arms, np.ones((5,5), np.uint8), iterations=2)
-    silhouette = (parse_array > 0).astype(np.uint8) * 255
-    junction_region = cv2.bitwise_and(junction_region, silhouette)
-    mask_expanded = cv2.bitwise_or(mask_expanded, junction_region)
-    
-    # SILHOUETTE LOCK: 
-    mask_expanded = cv2.bitwise_and(mask_expanded, silhouette)
-    
-    # [FIX D] Cap the mask's lower boundary using the hip keypoints
-    hip_y = max(pose_data[8][1], pose_data[11][1])  # RHip, LHip keypoints
-    hip_y_scaled = int(hip_y * scale_factor)
-    if 0 < hip_y_scaled < height:
-        mask_expanded[hip_y_scaled:, :] = 0
+        raise NotImplementedError
+
+    # Load pose points
+    pose_data = keypoint["pose_keypoints_2d"]
+    pose_data = np.array(pose_data)
+    pose_data = pose_data.reshape((-1, 2))
+
+    im_arms_left = Image.new('L', (width, height))
+    im_arms_right = Image.new('L', (width, height))
+    arms_draw_left = ImageDraw.Draw(im_arms_left)
+    arms_draw_right = ImageDraw.Draw(im_arms_right)
+    if category == 'dresses' or category == 'upper_body' or category == 'upperbody':
+        shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
+        shoulder_left = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
+        elbow_right = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
+        elbow_left = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
+        wrist_right = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
+        wrist_left = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+        ARM_LINE_WIDTH = int(arm_width / 512 * height)
+        size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
+        size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
+                      shoulder_right[1] + ARM_LINE_WIDTH // 2]
         
-    # Removed aspect-ratio constraint as it was improperly cutting off sleeves.
 
-    # [FIX F] Explicit bottom-protection step
-    pants_protect = ((parse_array == 5) | (parse_array == 6)).astype(np.uint8) * 255
-    pants_protect_dilated = cv2.dilate(pants_protect, np.ones((10,10), np.uint8))
-    mask_expanded[pants_protect_dilated == 255] = 0
+        if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
+            im_arms_right = arms_right
+        else:
+            wrist_right = extend_arm_mask(wrist_right, elbow_right, 1.2)
+            arms_draw_right.line(np.concatenate((shoulder_right, elbow_right, wrist_right)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            arms_draw_right.arc(size_right, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-    # Apply protections
-    mask_expanded[skin_protect == 255] = 0
-    mask_expanded[bottoms == 255] = 0
+        if wrist_left[0] <= 1. and wrist_left[1] <= 1.:
+            im_arms_left = arms_left
+        else:
+            wrist_left = extend_arm_mask(wrist_left, elbow_left, 1.2)
+            arms_draw_left.line(np.concatenate((wrist_left, elbow_left, shoulder_left)).astype(np.uint16).tolist(), 'white', ARM_LINE_WIDTH, 'curve')
+            arms_draw_left.arc(size_left, 0, 360, 'white', ARM_LINE_WIDTH // 2)
 
-    # 6. Fill internal holes
-    def hole_fill_local(img):
-        img = np.pad(img[1:-1, 1:-1], pad_width=1, mode='constant', constant_values=0)
-        img_copy = img.copy()
-        mask_fill = np.zeros((img.shape[0] + 2, img.shape[1] + 2), dtype=np.uint8)
-        cv2.floodFill(img, mask_fill, (0, 0), 255)
-        img_inverse = cv2.bitwise_not(img)
-        return cv2.bitwise_or(img_copy, img_inverse)
+        hands_left = np.logical_and(np.logical_not(im_arms_left), arms_left)
+        hands_right = np.logical_and(np.logical_not(im_arms_right), arms_right)
+        parser_mask_fixed += hands_left + hands_right
 
-    mask_hard = hole_fill_local(mask_expanded)
+    parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
+    parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
+    if category == 'dresses' or category == 'upper_body' or category == 'upperbody':
+        neck_mask = (parse_array == 18).astype(np.float32)
+        neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
+        neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
+        parse_mask = np.logical_or(parse_mask, neck_mask)
+        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
+        parse_mask += np.logical_or(parse_mask, arm_mask)
 
-    # Organic Smoothing
-    mask_hard = cv2.GaussianBlur(mask_hard, (11, 11), 0)
-    mask_hard = (mask_hard > 127).astype(np.uint8) * 255
+    parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
 
-    # Feathered Soft Mask
-    mask_soft = cv2.GaussianBlur(mask_hard.astype(np.float32), (9, 9), 0)
-    inpaint_mask_soft = np.clip(mask_soft / 255.0, 0, 1)
+    parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
+    inpaint_mask = 1 - parse_mask_total
+    img = np.where(inpaint_mask, 255, 0)
+    dst = hole_fill(img.astype(np.uint8))
+    dst = refine_mask(dst)
+    inpaint_mask = dst / 255 * 1
+    mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
+    mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
 
-    percentage = 100 * np.sum(mask_hard > 0) / (width * height)
-    print(f" -> Optimized Mask: {percentage:.1f}% coverage.")
-
-    return Image.fromarray(mask_hard), Image.fromarray((inpaint_mask_soft * 255).astype(np.uint8))
+    return mask, mask_gray
 
 
 def smart_resize(img: Image.Image, target_size=(768, 1024), fill_color=(255, 255, 255)):
