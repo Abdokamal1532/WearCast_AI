@@ -98,9 +98,16 @@ def analyze_sleeve_length(garm_mask_np):
     # If the bottom is at least 85% as wide as the top, it's a long sleeve.
     return ratio > 0.85
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512, is_long_sleeve=False):
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384,height=512, is_long_sleeve=False):
     im_parse = model_parse.resize((width, height), Image.NEAREST)
     parse_array = np.array(im_parse)
+
+    if model_type == 'hd':
+        arm_width = 60
+    elif model_type == 'dc':
+        arm_width = 45
+    else:
+        raise ValueError("model_type must be \'hd\' or \'dc\'!")
 
     parse_head = (parse_array == 1).astype(np.float32) + \
                  (parse_array == 3).astype(np.float32) + \
@@ -116,12 +123,14 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
 
     arms_left = (parse_array == 14).astype(np.float32)
     arms_right = (parse_array == 15).astype(np.float32)
+    arms = arms_left + arms_right
 
     if category == 'dresses':
         parse_mask = (parse_array == 7).astype(np.float32) + \
                      (parse_array == 4).astype(np.float32) + \
                      (parse_array == 5).astype(np.float32) + \
                      (parse_array == 6).astype(np.float32)
+
         parser_mask_changeable += np.logical_and(parse_array, np.logical_not(parser_mask_fixed))
 
     elif category == 'upper_body' or category == 'upperbody':
@@ -142,12 +151,27 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     else:
         raise NotImplementedError
 
-    # Tight organic semantic masking to prevent background blurring and grey box artifacts
+    # Load pose points
+    pose_data = keypoint["pose_keypoints_2d"]
+    pose_data = np.array(pose_data)
+    pose_data = pose_data.reshape((-1, 2))
+
+    im_arms_left = Image.new('L', (width, height))
+    im_arms_right = Image.new('L', (width, height))
+    arms_draw_left = ImageDraw.Draw(im_arms_left)
+    arms_draw_right = ImageDraw.Draw(im_arms_right)
     if category == 'dresses' or category == 'upper_body' or category == 'upperbody':
-        # Snug 1-iteration dilation for the clothing region to prevent edge gaps
-        parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=1)
+        shoulder_right = np.multiply(tuple(pose_data[2][:2]), height / 512.0)
+        shoulder_left = np.multiply(tuple(pose_data[5][:2]), height / 512.0)
+        elbow_right = np.multiply(tuple(pose_data[3][:2]), height / 512.0)
+        elbow_left = np.multiply(tuple(pose_data[6][:2]), height / 512.0)
+        wrist_right = np.multiply(tuple(pose_data[4][:2]), height / 512.0)
+        wrist_left = np.multiply(tuple(pose_data[7][:2]), height / 512.0)
+        ARM_LINE_WIDTH = int(arm_width / 512 * height)
+        size_left = [shoulder_left[0] - ARM_LINE_WIDTH // 2, shoulder_left[1] - ARM_LINE_WIDTH // 2, shoulder_left[0] + ARM_LINE_WIDTH // 2, shoulder_left[1] + ARM_LINE_WIDTH // 2]
+        size_right = [shoulder_right[0] - ARM_LINE_WIDTH // 2, shoulder_right[1] - ARM_LINE_WIDTH // 2, shoulder_right[0] + ARM_LINE_WIDTH // 2,
+                      shoulder_right[1] + ARM_LINE_WIDTH // 2]
         
-<<<<<<< HEAD
 
         if wrist_right[0] <= 1. and wrist_right[1] <= 1.:
             im_arms_right = arms_right
@@ -173,15 +197,11 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     # parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
     
     if category == 'dresses' or category == 'upper_body' or category == 'upperbody':
-=======
-        # Neck protection/mask
->>>>>>> b076da8e4021f4d082bed9944ed09a1082b4a818
         neck_mask = (parse_array == 18).astype(np.float32)
         # [FIX] Do not dilate neck mask to prevent background edge artifacts
         # neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
         neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
         parse_mask = np.logical_or(parse_mask, neck_mask)
-<<<<<<< HEAD
         
         # [FIX] Only mask arms for long-sleeved garments, and keep it typical/exact to arm boundaries (no background leakage)
         if is_long_sleeve:
@@ -192,28 +212,6 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                 np.logical_and(im_arms_right_np, arms_right)
             ).astype(np.float32)
             parse_mask = np.logical_or(parse_mask, arm_mask)
-=======
-
-        # Snug semantic arms (No giant straight drawn tube lines!)
-        im_arms_left = arms_left
-        im_arms_right = arms_right
-        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=1)
-        parse_mask = np.logical_or(parse_mask, arm_mask)
-
-    parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-    parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
-
-    parse_mask_total = np.logical_or(parse_mask, parser_mask_fixed)
-    inpaint_mask = 1 - parse_mask_total
-    img = np.where(inpaint_mask, 255, 0)
-    dst = hole_fill(img.astype(np.uint8))
-    dst = refine_mask(dst)
-    inpaint_mask = dst / 255 * 1
-    mask = Image.fromarray(inpaint_mask.astype(np.uint8) * 255)
-    mask_gray = Image.fromarray(inpaint_mask.astype(np.uint8) * 127)
-
-    return mask, mask_gray
->>>>>>> b076da8e4021f4d082bed9944ed09a1082b4a818
 
     parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
 
