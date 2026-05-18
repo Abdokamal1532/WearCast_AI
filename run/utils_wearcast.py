@@ -151,6 +151,7 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
     else:
         raise NotImplementedError
 
+
     # Load pose points
     pose_data = keypoint["pose_keypoints_2d"]
     pose_data = np.array(pose_data)

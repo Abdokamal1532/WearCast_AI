@@ -398,10 +398,10 @@ class WearCastHD:
         # 4. Morphological cleaning
         mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         
-        # 5. Apply mask and fill background with neutral gray [128, 128, 128]
-        # Neutral gray is best for CLIP Vision encoder to ignore the background.
+        # 5. Apply mask and fill background with solid white [255, 255, 255]
+        # Solid white background perfectly matches OOTDiffusion's training distribution (VITON-HD).
         res = img.copy()
-        res[mask_bin == 0] = [128, 128, 128]
+        res[mask_bin == 0] = [255, 255, 255]
         
         return Image.fromarray(res), mask_bin
 
@@ -430,9 +430,9 @@ class WearCastHD:
                 print(" -> [MATTING] Warning: rembg did not return alpha channel. Falling back.")
                 return self.remove_garment_background_pro(image_pil)
             
-            # 3. Fill background with neutral gray for CLIP
+            # 3. Fill background with solid white for VAE and CLIP Vision
             img_rgb = np.array(res_pil.convert("RGB"))
-            bg_color = np.array([128, 128, 128], dtype=np.uint8)
+            bg_color = np.array([255, 255, 255], dtype=np.uint8)
             res_final = np.where(mask_bin[:, :, np.newaxis] == 0, bg_color, img_rgb)
             
             return Image.fromarray(res_final), mask_bin
