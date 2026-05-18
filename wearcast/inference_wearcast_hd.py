@@ -777,50 +777,42 @@ class WearCastHD:
             old_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
             composite_mask = np.maximum(composite_mask, old_mask_np)
 
-        # --- FIX #20: Strict Dynamic Bounding (GPU Accelerated) ---
-        with torch.no_grad():
-            comp_mask_t = torch.from_numpy(composite_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
-            color_mask_t = torch.from_numpy(color_transfer_mask).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+        # --- FIX #20: Strict Dynamic Bounding (CPU OpenCV to prevent OOM) ---
+        if hasattr(self, '_cached_hard_mask'):
+            input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
             
-            if hasattr(self, '_cached_hard_mask'):
-                input_mask_np = np.array(self._cached_hard_mask.resize(raw_generated.size, Image.NEAREST)).astype(np.float32) / 255.0
-                input_mask_t = torch.from_numpy(input_mask_np).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
+            # Dilate the hard mask massively to ensure we NEVER clip legitimately generated
+            # wider shoulders or longer sleeves. OpenCV is used to avoid 10GB VRAM spike in Kornia unfold.
+            kernel_relax = np.ones((61, 61), np.uint8)
+            relaxed_mask_np = cv2.dilate(input_mask_np, kernel_relax, iterations=1)
+            
+            # Only apply silhouette clipping for torso-only garments.
+            if not _include_arms and hasattr(self, '_cached_parse'):
+                sil = (self._cached_parse > 0).astype(np.float32)
+                sil = cv2.resize(sil, (raw_generated.size[0], raw_generated.size[1]), interpolation=cv2.INTER_NEAREST)
+                # Relax the silhouette as well to prevent shoulder clipping
+                sil = cv2.dilate(sil, np.ones((21, 21), np.uint8), iterations=1)
+                relaxed_mask_np = relaxed_mask_np * sil
+                print(" -> [STRICT] Applied relaxed silhouette boundary constraint (torso-only, CPU).")
+            else:
+                print(" -> [STRICT] Skipped silhouette clipping (arm-inclusive mask).")
                 
-                # Dilate the hard mask massively to ensure we NEVER clip legitimately generated
-                # wider shoulders or longer sleeves. This acts as a loose bounding box to filter
-                # out background hallucinations, not a strict clip.
-                dilation_px = 61
-                kernel_relax = torch.ones(dilation_px, dilation_px, device=self.gpu_id)
-                relaxed_mask_t = kornia.morphology.dilation(input_mask_t, kernel_relax)
-                
-                # Only apply silhouette clipping for torso-only garments.
-                if not _include_arms and hasattr(self, '_cached_parse'):
-                    sil = (self._cached_parse > 0).astype(np.float32)
-                    sil_t = torch.from_numpy(sil).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
-                    sil_t = F.interpolate(sil_t, size=(raw_generated.size[1], raw_generated.size[0]), mode='nearest')
-                    # Relax the silhouette as well to prevent shoulder clipping
-                    sil_t = kornia.morphology.dilation(sil_t, torch.ones(21, 21, device=self.gpu_id))
-                    relaxed_mask_t = relaxed_mask_t * sil_t
-                    print(" -> [STRICT] Applied relaxed silhouette boundary constraint (torso-only, GPU).")
-                else:
-                    print(" -> [STRICT] Skipped silhouette clipping (arm-inclusive mask).")
-                    
-                comp_mask_t = comp_mask_t * relaxed_mask_t
+            composite_mask = composite_mask * relaxed_mask_np
 
-            # Refine the composite mask slightly
-            comp_mask_t = kornia.morphology.dilation(comp_mask_t, torch.ones(5, 5, device=self.gpu_id))
-            
-            alpha = comp_mask_t[0, 0].cpu().numpy()
-            
-            # Feather the composite mask heavily for a seamless blend between UNet's 
-            # inpainted background and the original high-res background.
-            alpha = cv2.GaussianBlur(alpha, (21, 21), 0)
-            alpha = np.clip(alpha, 0, 1)
-            binary_mask = (alpha > 0.5).astype(np.uint8) * 255
-            
-            color_alpha = color_mask_t[0, 0].cpu().numpy()
-            color_alpha = cv2.GaussianBlur(color_alpha, (7, 7), 0)
-            color_alpha = np.clip(color_alpha, 0, 1)
+        # Refine the composite mask slightly
+        composite_mask = cv2.dilate(composite_mask, np.ones((5, 5), np.uint8), iterations=1)
+        
+        alpha = composite_mask
+        
+        # Feather the composite mask heavily for a seamless blend between UNet's 
+        # inpainted background and the original high-res background.
+        alpha = cv2.GaussianBlur(alpha, (21, 21), 0)
+        alpha = np.clip(alpha, 0.0, 1.0)
+        binary_mask = (alpha > 0.5).astype(np.uint8) * 255
+        
+        color_alpha = color_transfer_mask
+        color_alpha = cv2.GaussianBlur(color_alpha, (7, 7), 0)
+        color_alpha = np.clip(color_alpha, 0.0, 1.0)
             
         print(f" -> Dynamic mask generated. Reparse time: {time.time() - t_reparse:.2f}s")
         
