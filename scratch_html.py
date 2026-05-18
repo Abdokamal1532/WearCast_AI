@@ -1,5 +1,5 @@
 import os
-folders=['debug_7d521908-b675-42f5-9616-c722df42c841', 'debug_91af092a-1d69-4534-bd47-8664361192c4', 'debug_82111d81-801e-4444-b559-fae088a84785', 'debug_e5e8324a-1016-4077-b808-1e10304ec5e2']
+folders=['debug_7ff2fbd5-8e15-47a0-b025-ccb1e795ca92', 'debug_1673a2dc-71c3-415d-96a5-fe871f5c3207', 'debug_d3cd663b-f433-43ae-9b83-b86b20ab34e2', 'debug_f294d9e1-6870-4d4a-a16a-b9da56c2637c']
 html="<html><body style='background:black;color:white;'><h1>WearCast Debug Images</h1>\n"
 for f in folders:
     html += f"<h2>{f}</h2>\n"

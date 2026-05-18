@@ -779,7 +779,7 @@ class WearCastHD:
                 input_mask_t = torch.from_numpy(input_mask_np).unsqueeze(0).unsqueeze(0).to(self.gpu_id)
                 
                 # Dilate the hard mask to ensure we don't clip the generated sleeves
-                dilation_px = 45 if _include_arms else 7
+                dilation_px = 15 if _include_arms else 7
                 kernel_relax = torch.ones(dilation_px, dilation_px, device=self.gpu_id)
                 relaxed_mask_t = kornia.morphology.dilation(input_mask_t, kernel_relax)
                 
