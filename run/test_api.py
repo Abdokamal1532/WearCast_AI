@@ -1,3 +1,10 @@
+import warnings
+try:
+    from urllib3.exceptions import DependencyWarning
+    warnings.filterwarnings("ignore", category=DependencyWarning)
+except ImportError:
+    pass
+
 import requests
 import time
 import json
