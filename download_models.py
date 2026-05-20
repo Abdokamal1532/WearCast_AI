@@ -4,7 +4,7 @@ from huggingface_hub import hf_hub_download
 
 def download_wearcast_models():
     PROJECT_ROOT = Path(__file__).absolute().parent
-    repo_id = "levihsu/OOTDiffusion"
+    repo_id = "abdokamal/WearCast"
     
     # ADDED: model_index.json and scheduler/extractor configs
     models = [

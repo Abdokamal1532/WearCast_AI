@@ -1,5 +1,15 @@
+import os
+# Suppress TF and cuDNN C++ factory registration warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 # --- KAGGLE COMPATIBILITY PATCHES ---
 import huggingface_hub
+try:
+    import huggingface_hub.utils.logging as hf_logging
+    hf_logging.set_verbosity_error()
+except Exception:
+    pass
+
 if not hasattr(huggingface_hub, 'cached_download'):
     huggingface_hub.cached_download = huggingface_hub.hf_hub_download
 
@@ -11,9 +21,23 @@ try:
 except ImportError:
     pass
 
-import os
 import sys
 import time
+import warnings
+
+# Suppress annoying Diffusers deprecation warnings in the API log
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import transformers.utils
+if not hasattr(transformers.utils, 'FLAX_WEIGHTS_NAME'):
+    transformers.utils.FLAX_WEIGHTS_NAME = 'flax_model.msgpack'
+
+try:
+    from diffusers.utils import logging as diffusers_logging
+    diffusers_logging.set_verbosity_error()
+except ImportError:
+    pass
+
 import uuid
 import threading
 import asyncio
