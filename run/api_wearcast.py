@@ -127,6 +127,15 @@ try:
     print("[STARTUP] WearCast Engine ready.")
 except Exception as e:
     print(f"[STARTUP] ERROR: Could not initialize model: {e}")
+    print("="*70)
+    print("[STARTUP] CRITICAL: Model checkpoints are MISSING from the Kaggle environment.")
+    print("[STARTUP] The API will start but ALL /tryon requests will return HTTP 503.")
+    print("[STARTUP] FIX: In your Kaggle notebook, run a cell to copy checkpoints:")
+    print("[STARTUP]   import os")
+    print("[STARTUP]   os.makedirs('/kaggle/working/WearCast_AI/checkpoints', exist_ok=True)")
+    print("[STARTUP]   !cp -r /kaggle/input/YOUR-CHECKPOINT-DATASET/* /kaggle/working/WearCast_AI/checkpoints/")
+    print("[STARTUP] Then restart this cell.")
+    print("="*70)
     wearcast_model = None
 
 # Suppress harmless CUDA/XLA warnings
@@ -299,12 +308,32 @@ async def root_dashboard():
     """Returns the interactive FastAPI Swagger UI dashboard."""
     return get_swagger_ui_html(openapi_url="/openapi.json", title="WearCast AI API Studio")
 
+@app.get("/health")
+async def health_check():
+    """Returns the health status of the API and whether the model is loaded."""
+    model_loaded = wearcast_model is not None
+    return {
+        "status": "ok" if model_loaded else "model_not_loaded",
+        "model_loaded": model_loaded,
+        "gpu_available": torch.cuda.is_available(),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
+        "message": "WearCast engine is ready." if model_loaded else "Model checkpoints are missing. See server logs for fix instructions."
+    }
+
 @app.post("/tryon")
 async def tryon(background_tasks: BackgroundTasks, person: UploadFile = File(...), garment: UploadFile = File(...)):
     """
     Start a professional try-on task.
     Returns a task_id to track progress.
     """
+    # Guard: reject requests if the model failed to load
+    if wearcast_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="WearCast model is not loaded. The GPU checkpoints are missing from the Kaggle session. "
+                   "Please copy the checkpoint files and restart the server. See /health for more info."
+        )
+
     task_id = str(uuid.uuid4())
     
     try:
