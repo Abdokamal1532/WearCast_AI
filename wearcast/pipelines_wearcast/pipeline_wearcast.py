@@ -543,17 +543,12 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
-                    # cond = first half, uncond = second half  (see _encode_prompt)
-                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred_text_image, noise_pred_text = noise_pred.chunk(2)
                     if i == 0:
-                        print(f"[DEBUG] Guidance: cond={list(noise_pred_cond.shape)}, uncond={list(noise_pred_uncond.shape)}")
-                    guidance_vec = noise_pred_cond - noise_pred_uncond
-                    if i == 0 or i % 5 == 0:
-                        print(f"   [CFG i={i}] scale={self.image_guidance_scale:.2f}  "
-                              f"|guidance_vec|={guidance_vec.float().abs().mean().item():.5f}")
+                        print(f"[DEBUG] Guidance: chunk shapes = {list(noise_pred_text_image.shape)}, {list(noise_pred_text.shape)}")
                     noise_pred = (
-                        noise_pred_uncond
-                        + self.image_guidance_scale * guidance_vec
+                        noise_pred_text
+                        + self.image_guidance_scale * (noise_pred_text_image - noise_pred_text)
                     )
 
                 # Hack:
@@ -771,18 +766,7 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
                 attention_mask = None
 
         if do_classifier_free_guidance:
-            # ── WearCast CFG fix ─────────────────────────────────────────────
-            # Unconditional path = zero embeddings (no garment CLIP injection).
-            # Conditional path   = prompt_embeds with garment image_embeds.
-            # Concatenation order: [cond, uncond] so that when noise_pred is
-            # chunked in the denoising loop:
-            #   noise_pred_text_image (first)  = conditioned prediction
-            #   noise_pred_text       (second) = unconditioned prediction
-            # Guidance formula:
-            #   noise_pred = uncond + scale * (cond - uncond)
-            # ─────────────────────────────────────────────────────────────────
-            uncond_embeds = torch.zeros_like(prompt_embeds)  # shape [1, seq, dim]
-            prompt_embeds = torch.cat([prompt_embeds, uncond_embeds])  # [cond, uncond]
+            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds])
 
         return prompt_embeds
 
@@ -1076,5 +1060,4 @@ class WearCastPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoade
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
-        # Always True when image_guidance_scale >= 1 (which covers our entire sweep 1.0→10.0)
         return self.image_guidance_scale >= 1.0
