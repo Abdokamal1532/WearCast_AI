@@ -4,16 +4,15 @@ This repository is the official implementation of WearCast
 🤗 [Try out WearCast](https://huggingface.co/spaces/levihsu/WearCast)
 
 
-(Thanks to [ZeroGPU](https://huggingface.co/zero-gpu-explorers) for providing A100 GPUs)
 
-<!-- Or [try our own demo](https://wearcast.ibot.cn/) on RTX 4090 GPUs -->
+
 
 > **WearCast: High-Fidelity Men's Half-Body Virtual Try-On Based on Latent Diffusion**<br>
 > A highly optimized pipeline tailored specifically for Men's half-body clothing outfitting.
 
 Our model checkpoints trained on [VITON-HD](https://github.com/shadow2496/VITON-HD) (half-body) have been released
 
-* 🤗 [Hugging Face link](https://huggingface.co/levihsu/WearCast) for ***checkpoints*** (wearcast, humanparsing, and openpose)
+* 🤗 [Hugging Face link](https://huggingface.co/abdokamal/WearCast) for ***checkpoints*** (wearcast, humanparsing, and openpose)
 * 📢📢 We support ONNX for [humanparsing](https://github.com/GoGoDuck912/Self-Correction-Human-Parsing) now. Most environmental issues should have been addressed : )
 * Please also download [clip-vit-large-patch14](https://huggingface.co/openai/clip-vit-large-patch14) into ***checkpoints*** folder
 * We've only tested our code and models on Linux (Ubuntu 22.04)
@@ -25,7 +24,7 @@ Our model checkpoints trained on [VITON-HD](https://github.com/shadow2496/VITON-
 1. Clone the repository
 
 ```sh
-git clone https://github.com/levihsu/WearCast
+git clone https://github.com/Abdokamal1532/WearCast_AI
 ```
 
 2. Create a conda environment and install the required packages
@@ -66,7 +65,7 @@ python run_wearcast.py --model_path <model-image-path> --cloth_path <cloth-image
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=levihsu/OOTDiffusion&type=Date)](https://star-history.com/#levihsu/OOTDiffusion&Date)
+[![Star History Chart](https://api.star-history.com/chart?repos=Abdokamal1532/WearCast_AI&type=timeline&logscale&legend=top-left)](https://www.star-history.com/?repos=Abdokamal1532%2FWearCast_AI&type=timeline&logscale=&legend=top-left)
 
 ## TODO List
 - [x] Paper
