@@ -82,7 +82,9 @@ DIRS = {
     "phase1_parse"  : mk("phase1_human_parsing_pose"),
     "phase2_latent" : mk("phase2_latent_processing_fusion"),
     "phase3_gen"    : mk("phase3_generation_diffusion"),
+    "phase3_steps"  : mk("phase3_generation_diffusion", "step_images"),
     "phase4_post"   : mk("phase4_postprocessing"),
+    "cfg_sweep"     : mk("cfg_scale_sweep"),
     "summary"       : mk("summary"),
 }
 
@@ -258,7 +260,7 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Main presentation runner
 # ─────────────────────────────────────────────────────────────────────────────
-def run(person_path: str, garment_path: str):
+def run(person_path: str, garment_path: str, skip_cfg_sweep: bool = False):
     global_start = time.time()
     timeline = []   # list of {phase, event, t}
 
@@ -689,79 +691,126 @@ def run(person_path: str, garment_path: str):
     # ──────────────────────────────────────────────────────────────────────────
     tick("PHASE-3", "Setting up diffusion — scheduler & callback")
 
-    steps_data = []   # per-step log
-    step_latent_imgs = []
+    steps_data = []        # per-step log
+    step_latent_imgs = []  # thumbnail for the evolution strip (every step)
 
     def step_callback(step: int, t, latents):
-        """Called after every denoising step — log + optionally decode."""
+        """Called after EVERY denoising step.
+        - Logs latent stats to JSON.
+        - Decodes and saves each step as a full-res individual image.
+        - Builds a thumbnail for the contact strip.
+        """
         now = time.time()
         ts_val = int(t) if hasattr(t, "__int__") else float(t)
         entry = {
-            "step"       : step,
-            "timestep"   : ts_val,
-            "elapsed_s"  : round(now - global_start, 3),
-            "latent"     : tensor_summary(latents, f"step_{step}_latents"),
+            "step"      : step,
+            "timestep"  : ts_val,
+            "elapsed_s" : round(now - global_start, 3),
+            "latent"    : tensor_summary(latents, f"step_{step}_latents"),
         }
         steps_data.append(entry)
         log(f"   [STEP {step:3d}]  t={ts_val:4d}  "
             f"lat_mean={latents.float().mean().item():.4f}  "
             f"lat_std={latents.float().std().item():.4f}")
 
-        # Decode every 5th step (and first/last) to make an animation strip
-        if step % 5 == 0 or step == 0:
-            try:
+        # ── Decode EVERY step → individual full-size image ────────────────
+        try:
+            with torch.no_grad():
                 scaled = latents / model.pipe.vae.config.scaling_factor
-                dec = model.pipe.vae.decode(scaled.to(dtype=model.pipe.vae.dtype)).sample
-                img_np = ((dec[0].float().cpu().clamp(-1,1)+1)/2*255).byte().permute(1,2,0).numpy()
-                step_img = Image.fromarray(img_np).resize((192, 256))
-                step_img = overlay_label(step_img, f"Step {step}  t={ts_val}")
-                step_latent_imgs.append(step_img)
-            except Exception:
-                pass
+                dec = model.pipe.vae.decode(
+                    scaled.to(dtype=model.pipe.vae.dtype)
+                ).sample
+            img_np  = (
+                (dec[0].float().cpu().clamp(-1, 1) + 1) / 2 * 255
+            ).byte().permute(1, 2, 0).numpy()
+            step_full = Image.fromarray(img_np)          # full 768×1024
+            step_full = overlay_label(
+                step_full, f"Step {step:02d}/30   t={ts_val}", pos="bottom"
+            )
+            # Save individual full-res image
+            fname = f"step_{step:02d}_t{ts_val:04d}.jpg"
+            step_full.save(str(DIRS["phase3_steps"] / fname), quality=90)
+            log(f"     [STEP-IMG] saved {fname}")
 
-    # Run the full pipeline call (with output_dir pointing to Phase 3 folder)
-    tick("PHASE-3", "Running WearCast pipeline (30 denoising steps)")
+            # Thumbnail for the contact strip
+            thumb = step_full.resize((192, 256))
+            step_latent_imgs.append((step, ts_val, thumb))
+        except Exception as exc:
+            log(f"     [STEP-IMG] decode failed at step {step}: {exc}")
+
+    # Run the full pipeline call
+    tick("PHASE-3", "Running WearCast pipeline (30 denoising steps — ALL decoded)")
     t_gen_start = time.time()
     images = model(
-        model_type   = "hd",
-        category     = "upperbody",
-        image_garm   = garment_img,
-        image_vton   = person_img,
-        mask         = None,
-        image_ori    = person_img,
-        num_samples  = 1,
-        num_steps    = 30,
-        image_scale  = 2.5,
-        seed         = -1,
-        callback     = step_callback,
+        model_type     = "hd",
+        category       = "upperbody",
+        image_garm     = garment_img,
+        image_vton     = person_img,
+        mask           = None,
+        image_ori      = person_img,
+        num_samples    = 1,
+        num_steps      = 30,
+        image_scale    = 2.5,
+        seed           = -1,
+        callback       = step_callback,
         callback_steps = 1,
-        output_dir   = str(DIRS["phase3_gen"]),
+        output_dir     = str(DIRS["phase3_gen"]),
     )
     t_gen_total = time.time() - t_gen_start
     log(f"\n   Total generation time: {t_gen_total:.2f}s")
     log(f"   Steps recorded      : {len(steps_data)}")
+    log(f"   Step images saved   : {len(step_latent_imgs)}  → {DIRS['phase3_steps']}")
 
     save_json(steps_data, DIRS["phase3_gen"], "p3_per_step_latent_stats.json")
 
     gen_meta = {
-        "total_time_s"   : round(t_gen_total, 2),
-        "num_steps"      : 30,
-        "steps_recorded" : len(steps_data),
-        "avg_step_s"     : round(t_gen_total / max(1, len(steps_data)), 3),
+        "total_time_s"     : round(t_gen_total, 2),
+        "num_steps"        : 30,
+        "steps_recorded"   : len(steps_data),
+        "step_images_saved": len(step_latent_imgs),
+        "avg_step_s"       : round(t_gen_total / max(1, len(steps_data)), 3),
+        "step_images_dir"  : str(DIRS["phase3_steps"]),
     }
     save_json(gen_meta, DIRS["phase3_gen"], "p3_generation_metadata.json")
 
-    # ── Step-evolution strip ─────────────────────────────────────────────────
+    # ── 30-step contact sheet (6 columns × 5 rows) ───────────────────────────
+    tick("PHASE-3", "Building 30-step contact sheet")
     if step_latent_imgs:
-        evo_w = sum(im.width for im in step_latent_imgs) + 8*(len(step_latent_imgs)-1)
-        evo_h = step_latent_imgs[0].height + 50
-        evo_strip = Image.new("RGB", (evo_w, evo_h), (15,15,25))
+        COLS  = 6
+        ROWS  = math.ceil(len(step_latent_imgs) / COLS)
+        TW, TH = 192, 256
+        PAD   = 6
+        TITLE_H = 48
+        sheet_w = COLS * TW + (COLS + 1) * PAD
+        sheet_h = ROWS * TH + (ROWS + 1) * PAD + TITLE_H
+        sheet = Image.new("RGB", (sheet_w, sheet_h), (12, 12, 22))
+        d_sh  = ImageDraw.Draw(sheet)
+        d_sh.rectangle([0, 0, sheet_w, TITLE_H - 4], fill=(25, 25, 50))
+        d_sh.text((10, 10),
+                  f"PHASE 3 — All {len(step_latent_imgs)} Denoising Steps  "
+                  f"(Guidance Scale=2.5  |  30 steps)",
+                  fill=(180, 210, 255))
+        for idx, (stp, ts_v, thumb) in enumerate(step_latent_imgs):
+            col = idx % COLS
+            row = idx // COLS
+            x = PAD + col * (TW + PAD)
+            y = TITLE_H + PAD + row * (TH + PAD)
+            sheet.paste(thumb, (x, y))
+        save_img(sheet, DIRS["phase3_gen"], "p3_ALL30_steps_contact_sheet.jpg")
+
+        # Also a horizontal evolution strip (all steps, smaller thumbnails)
+        SH, SW = 160, 120   # smaller for the wide strip
+        evo_w  = len(step_latent_imgs) * (SW + 4) + 4
+        evo_h  = SH + 44
+        evo_strip = Image.new("RGB", (evo_w, evo_h), (15, 15, 25))
         d_evo = ImageDraw.Draw(evo_strip)
-        d_evo.text((8, 8), f"PHASE 3 — Denoising Evolution  ({len(step_latent_imgs)} snapshots)", fill=(200,220,255))
-        x = 0
-        for im in step_latent_imgs:
-            evo_strip.paste(im, (x, 40))
-            x += im.width + 8
+        d_evo.text((8, 8), f"PHASE 3 — Denoising Evolution  (all {len(step_latent_imgs)} steps)",
+                   fill=(200, 220, 255))
+        x = 4
+        for stp, ts_v, thumb in step_latent_imgs:
+            small = thumb.resize((SW, SH))
+            evo_strip.paste(small, (x, 40))
+            x += SW + 4
         save_img(evo_strip, DIRS["phase3_gen"], "p3_denoising_evolution_strip.jpg")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -826,6 +875,92 @@ def run(person_path: str, garment_path: str):
     save_img(final_strip, DIRS["phase4_post"], "PHASE4_SUMMARY.jpg")
 
     # ──────────────────────────────────────────────────────────────────────────
+    # PHASE 5 — CFG Guidance Scale Sweep  (1.0 → 10.0, step 0.5)
+    # ──────────────────────────────────────────────────────────────────────────
+    cfg_sweep_results = []   # list of (scale, image)
+
+    if not skip_cfg_sweep:
+        tick("PHASE-5", "CFG Guidance Scale Sweep  (1.0 → 10.0, step 0.5)")
+        CFG_SCALES = [round(s * 0.5, 1) for s in range(2, 21)]  # 1.0, 1.5, 2.0 … 10.0
+        log(f"   Running {len(CFG_SCALES)} inferences: {CFG_SCALES}")
+
+        for cfg_scale in CFG_SCALES:
+            log(f"\n   ─── CFG scale = {cfg_scale:.1f} ───")
+            t_cfg = time.time()
+            try:
+                cfg_images = model(
+                    model_type     = "hd",
+                    category       = "upperbody",
+                    image_garm     = garment_img,
+                    image_vton     = person_img,
+                    mask           = None,
+                    image_ori      = person_img,
+                    num_samples    = 1,
+                    num_steps      = 30,
+                    image_scale    = cfg_scale,
+                    seed           = 42,          # fixed seed for fair comparison
+                    callback       = None,
+                    callback_steps = 1,
+                    output_dir     = None,        # suppress per-run debug saves
+                )
+                cfg_img = cfg_images[0]
+                cfg_img_labeled = overlay_label(
+                    cfg_img, f"CFG = {cfg_scale:.1f}", pos="bottom",
+                    bg=(0, 0, 0, 200), fg=(255, 230, 50)
+                )
+                fname = f"cfg_{str(cfg_scale).replace('.', 'p')}_scale.jpg"
+                save_img(cfg_img_labeled, DIRS["cfg_sweep"], fname)
+                cfg_sweep_results.append((cfg_scale, cfg_img_labeled))
+                log(f"   CFG {cfg_scale:.1f} done in {time.time()-t_cfg:.1f}s")
+            except Exception as e:
+                log(f"   [ERROR] CFG {cfg_scale:.1f} failed: {e}")
+
+        # ── CFG contact sheet ─────────────────────────────────────────────────
+        if cfg_sweep_results:
+            tick("PHASE-5", "Building CFG sweep contact sheet")
+            n_cfg  = len(cfg_sweep_results)
+            COLS_C = 5    # 5 per row  →  rows of  [1.0 1.5 2.0 2.5 3.0]
+            ROWS_C = math.ceil(n_cfg / COLS_C)
+            TW_C, TH_C = 192, 256
+            PAD_C  = 8
+            TIT_C  = 52
+            cw = COLS_C * TW_C + (COLS_C + 1) * PAD_C
+            ch = ROWS_C * TH_C + (ROWS_C + 1) * PAD_C + TIT_C
+            cfg_sheet = Image.new("RGB", (cw, ch), (10, 10, 22))
+            d_cs = ImageDraw.Draw(cfg_sheet)
+            d_cs.rectangle([0, 0, cw, TIT_C - 4], fill=(20, 18, 50))
+            d_cs.text((12, 12),
+                      f"WearCast CFG Guidance Scale Sweep  "
+                      f"(1.0 → 10.0, step 0.5)  —  {n_cfg} outputs",
+                      fill=(200, 180, 255))
+            for idx, (scale, img) in enumerate(cfg_sweep_results):
+                col = idx % COLS_C
+                row = idx // COLS_C
+                x = PAD_C + col * (TW_C + PAD_C)
+                y = TIT_C + PAD_C + row * (TH_C + PAD_C)
+                cfg_sheet.paste(img.resize((TW_C, TH_C)), (x, y))
+            save_img(cfg_sheet, DIRS["cfg_sweep"], "CFG_SWEEP_CONTACT_SHEET.jpg")
+            save_img(cfg_sheet, DIRS["summary"],   "CFG_SWEEP_CONTACT_SHEET.jpg")
+
+            # ── CFG horizontal comparison strip ───────────────────────────────
+            strip_imgs = [img.resize((120, 160)) for _, img in cfg_sweep_results]
+            cfg_strip = titled_strip(
+                *strip_imgs,
+                title=f"CFG Scale Sweep: {[s for s, _ in cfg_sweep_results]}"
+            )
+            save_img(cfg_strip, DIRS["cfg_sweep"], "CFG_SWEEP_HORIZONTAL_STRIP.jpg")
+
+            # Save JSON with scale list
+            save_json(
+                {"scales": [s for s, _ in cfg_sweep_results],
+                 "count" : n_cfg,
+                 "seed"  : 42},
+                DIRS["cfg_sweep"], "cfg_sweep_metadata.json"
+            )
+    else:
+        log("\n   [SKIP] CFG sweep skipped (--no-cfg-sweep flag set)")
+
+    # ──────────────────────────────────────────────────────────────────────────
     # SUMMARY — Master collage & timeline
     # ──────────────────────────────────────────────────────────────────────────
     tick("SUMMARY", "Building master summary & timeline")
@@ -836,7 +971,7 @@ def run(person_path: str, garment_path: str):
     save_json({"total_time_s": total_time, **hw, **quality_meta},
               DIRS["summary"], "run_summary.json")
 
-    # Master 2-row collage
+    # Master 3-row collage (adds CFG sweep row if available)
     row1 = titled_strip(
         overlay_label(person_img,   "Person"),
         overlay_label(garment_img,  "Garment"),
@@ -851,10 +986,27 @@ def run(person_path: str, garment_path: str):
         overlay_label(final_image,   "✅ Final Try-on"),
         title=f"WearCast AI — Row 2: Processing & Output  [{total_time:.0f}s total]"
     )
-    target_w = max(row1.width, row2.width)
-    master = Image.new("RGB", (target_w, row1.height + row2.height + 8), (10,10,20))
-    master.paste(row1, (0, 0))
-    master.paste(row2, (0, row1.height + 8))
+    rows = [row1, row2]
+
+    if cfg_sweep_results:
+        # Take every 2nd CFG result for the summary row to keep width manageable
+        cfg_summary_imgs = [
+            overlay_label(img.resize((192, 256)), f"CFG={s:.1f}")
+            for s, img in cfg_sweep_results[::2]
+        ]
+        row3 = titled_strip(
+            *cfg_summary_imgs,
+            title="WearCast AI — Row 3: CFG Scale Sweep (every other scale)"
+        )
+        rows.append(row3)
+
+    target_w = max(r.width for r in rows)
+    master_h = sum(r.height for r in rows) + 8 * len(rows)
+    master = Image.new("RGB", (target_w, master_h), (10, 10, 20))
+    y_off = 0
+    for row in rows:
+        master.paste(row, (0, y_off))
+        y_off += row.height + 8
     save_img(master, DIRS["summary"], "MASTER_COLLAGE.jpg")
 
     # ── Step-by-step log summary ──────────────────────────────────────────────
@@ -863,6 +1015,8 @@ def run(person_path: str, garment_path: str):
     log("="*70)
     log(f"  Output folder : {OUT}")
     log(f"  Total time    : {total_time}s")
+    log(f"  Step images   : {len(step_latent_imgs)} individual files in phase3_generation_diffusion/step_images/")
+    log(f"  CFG sweep     : {len(cfg_sweep_results)} outputs in cfg_scale_sweep/")
     log("")
     log("  Folders:")
     for k, p in DIRS.items():
@@ -894,10 +1048,15 @@ if __name__ == "__main__":
         default=str(PROJECT_ROOT / "images" / "garment.jpg"),
         help="Path to the garment image"
     )
+    parser.add_argument(
+        "--no-cfg-sweep",
+        action="store_true",
+        default=False,
+        help="Skip the CFG guidance scale sweep (saves time; use if you only need Phase 1-4)"
+    )
     args = parser.parse_args()
 
     if not Path(args.person).exists():
-        # Try any jpg in project root as fallback
         fallbacks = list(PROJECT_ROOT.glob("*.jpg")) + list(PROJECT_ROOT.glob("images/*.jpg"))
         if fallbacks:
             args.person = str(fallbacks[0])
@@ -916,4 +1075,4 @@ if __name__ == "__main__":
             print("[ERROR] No garment image found. Provide --garment path")
             sys.exit(1)
 
-    run(args.person, args.garment)
+    run(args.person, args.garment, skip_cfg_sweep=args.no_cfg_sweep)
