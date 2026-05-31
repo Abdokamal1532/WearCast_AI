@@ -53,16 +53,6 @@ python run_wearcast.py --model_path <model-image-path> --cloth_path <cloth-image
 ```
 
 
-## Citation
-```
-@article{xu2024wearcast,
-  title={WearCast: Outfitting Fusion based Latent Diffusion for Controllable Virtual Try-on},
-  author={Xu, Yuhao and Gu, Tao and Chen, Weifeng and Chen, Chengcai},
-  journal={arXiv preprint arXiv:2403.01779},
-  year={2024}
-}
-```
-
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/chart?repos=Abdokamal1532/WearCast_AI&type=timeline&logscale&legend=top-left)](https://www.star-history.com/?repos=Abdokamal1532%2FWearCast_AI&type=timeline&logscale=&legend=top-left)
