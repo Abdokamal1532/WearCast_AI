@@ -3,8 +3,6 @@ This repository is the official implementation of WearCast
 
 🤗 [Try out WearCast](https://huggingface.co/spaces/levihsu/WearCast)
 
-
-
 > **WearCast: High-Fidelity Men's Half-Body Virtual Try-On Based on Latent Diffusion**<br>
 > A highly optimized pipeline tailored specifically for Men's half-body clothing outfitting.
 
